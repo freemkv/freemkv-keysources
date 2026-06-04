@@ -1,0 +1,14 @@
+[package]
+name = "freemkv-keysources"
+version = "0.27.5"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Pluggable AACS key sources (keydb, online key service, mapfile) for libfreemkv. Each source looks a disc up and hands libfreemkv a Key; the library does all derivation."
+repository = "https://github.com/freemkv/freemkv-keysources"
+keywords = ["aacs", "blu-ray", "uhd", "decryption", "keydb"]
+categories = ["multimedia"]
+
+[dependencies]
+# Path during development; the published release pins a crates.io version. The
+# crate provides the `KeySource` trait + `Key`/`DiscInputs` types these impls fill.
+libfreemkv = { version = "0.27", path = "../libfreemkv" }
