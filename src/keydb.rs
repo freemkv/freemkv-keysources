@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use libfreemkv::aacs::KeyDb;
+use libfreemkv::aacs::{HostCert, KeyDb};
 use libfreemkv::{DiscInputs, Key, KeySource, Result};
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
@@ -27,6 +27,17 @@ impl KeydbSource {
     /// A keydb source reading the given `keydb.cfg` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
+    }
+
+    /// The host certificate(s) in this keydb — the second kind of data the one
+    /// keydb file holds (alongside decryption keys). The app passes these to the
+    /// live-drive scan as `DriveCredentials` for the AACS handshake. Empty if
+    /// the keydb is missing/unreadable or carries no host cert.
+    pub fn host_certs(&self) -> Vec<HostCert> {
+        match KeyDb::load(&self.path) {
+            Ok(db) => db.host_certs,
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Build the ordered candidate list from a parsed keydb. Pure (no I/O), so
