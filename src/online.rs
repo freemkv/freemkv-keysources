@@ -132,6 +132,11 @@ impl KeySource for OnlineSource {
             }
         }
     }
+
+    /// The service validates against real ciphertext, so it needs samples.
+    fn needs_samples(&self) -> bool {
+        true
+    }
 }
 
 /// Parse a 32-char hex Unit Key into 16 bytes.
