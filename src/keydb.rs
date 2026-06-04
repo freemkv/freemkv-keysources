@@ -174,4 +174,16 @@ mod tests {
         };
         assert!(KeydbSource::candidates_from(&db, &inputs("0xaabb")).is_empty());
     }
+
+    /// No keydb (or a LibreDrive deployment) → no host credentials, not an
+    /// error. (The positive parse is NOT tested here — it would require host
+    /// key material, which must never appear in code.)
+    #[test]
+    fn host_certs_empty_when_keydb_missing() {
+        assert!(
+            KeydbSource::new("/nonexistent/path/keydb.cfg")
+                .host_certs()
+                .is_empty()
+        );
+    }
 }
