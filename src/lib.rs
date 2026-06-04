@@ -5,8 +5,8 @@
 //! implementations that do the lookup:
 //!
 //! - [`KeydbSource`] — a local `keydb.cfg` (source #1).
-//! - `OnlineSource` — a remote key service (source #2). *(added with the app wiring)*
-//! - `MapfileSource` — the persisted unit key from a rip mapfile (source #3).
+//! - [`OnlineSource`] — a remote key service (source #2).
+//! - [`MapfileSource`] — the persisted unit key from a rip mapfile (source #3).
 //!
 //! Applications (autorip, the `freemkv` CLI) choose and order the sources from
 //! their own config — the local-vs-online policy is just which impls they plug
@@ -17,8 +17,12 @@
 //! order and keeps the first that decrypts a sample ([`resolve_first`]).
 
 mod keydb;
+mod mapfile;
+mod online;
 
 pub use keydb::KeydbSource;
+pub use mapfile::MapfileSource;
+pub use online::OnlineSource;
 
 // Re-exported for downstream convenience so apps need only depend on this crate
 // for the source-side types.

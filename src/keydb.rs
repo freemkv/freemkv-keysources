@@ -93,6 +93,7 @@ mod tests {
             volume_id: [0u8; 16],
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
+            samples: Vec::new(),
         }
     }
 
