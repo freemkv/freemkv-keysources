@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use libfreemkv::{DiscInputs, Key, KeySource, Result};
+use libfreemkv::{DiscInputs, Key, KeySource};
 
 const MAX_MKB_BYTES: usize = 10 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
@@ -11,6 +11,14 @@ const TIMEOUT_SECS: u64 = 180;
 pub struct OnlineSource {
     base_url: String,
     secret: String,
+    /// The key service pre-validates server-side and returns a single UK, so it
+    /// is asked **at most once** — this flips true after the first `next_key`,
+    /// and every later ask returns `None` without re-hitting the network.
+    asked: bool,
+    /// Set when the round-trip itself failed (network down, bad response) — as
+    /// opposed to the service simply having no key. Lets the caller report
+    /// "key service unreachable" distinctly from "no key for this disc".
+    errored: bool,
 }
 
 impl OnlineSource {
@@ -18,14 +26,16 @@ impl OnlineSource {
         Self {
             base_url: base_url.into(),
             secret: secret.into(),
+            asked: false,
+            errored: false,
         }
     }
-}
 
-impl KeySource for OnlineSource {
-    fn resolve(&self, inputs: &DiscInputs) -> Result<Vec<Key>> {
+    /// The single server-resolved UK for this disc, or `None`. Runs exactly the
+    /// one network round-trip; `next_key` gates it to one call per session.
+    fn query(&mut self, inputs: &DiscInputs) -> Option<Key> {
         if self.base_url.is_empty() || inputs.mkb.len() > MAX_MKB_BYTES {
-            return Ok(Vec::new());
+            return None;
         }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
@@ -50,20 +60,42 @@ impl KeySource for OnlineSource {
         }
         let resp = match req.send_json(body) {
             Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => {
+                self.errored = true;
+                return None;
+            }
         };
         let json: serde_json::Value = match resp.into_json() {
             Ok(j) => j,
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => {
+                self.errored = true;
+                return None;
+            }
         };
-        match json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
-            Some(uk) => Ok(vec![Key::Unit(vec![(1, uk)])]),
-            None => Ok(Vec::new()),
+        json.get("UK")
+            .and_then(|u| u.as_str())
+            .and_then(parse_uk)
+            .map(|uk| Key::Unit(vec![(1, uk)]))
+    }
+}
+
+impl KeySource for OnlineSource {
+    fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
+        // One shot: the service pre-validates and returns a single UK, so a
+        // second ask has nothing new to offer — don't re-hit the network.
+        if self.asked {
+            return None;
         }
+        self.asked = true;
+        self.query(inputs)
     }
 
     fn needs_samples(&self) -> bool {
         true
+    }
+
+    fn errored(&self) -> bool {
+        self.errored
     }
 }
 

@@ -12,31 +12,35 @@
 use std::path::PathBuf;
 
 use libfreemkv::disc::mapfile::Mapfile;
-use libfreemkv::{DiscInputs, Key, KeySource, Result};
+use libfreemkv::{DiscInputs, Key, KeySource};
 
 /// A [`KeySource`] backed by a rip mapfile's persisted unit keys.
 pub struct MapfileSource {
     path: PathBuf,
+    /// The mapfile holds exactly one (terminal) UK set, so it is read once —
+    /// this flips true after the first `next_key`.
+    asked: bool,
 }
 
 impl MapfileSource {
     /// A mapfile source reading the given `*.mapfile` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            asked: false,
+        }
     }
 }
 
 impl KeySource for MapfileSource {
-    fn resolve(&self, _inputs: &DiscInputs) -> Result<Vec<Key>> {
-        // A missing/unreadable/keyless mapfile simply offers nothing.
-        let Ok(map) = Mapfile::load(&self.path) else {
-            return Ok(Vec::new());
-        };
-        let uks = map.unit_keys();
-        if uks.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(vec![Key::Unit(uks.to_vec())])
+    fn next_key(&mut self, _inputs: &DiscInputs) -> Option<Key> {
+        if self.asked {
+            return None;
         }
+        self.asked = true;
+        // A missing/unreadable/keyless mapfile simply offers nothing.
+        let map = Mapfile::load(&self.path).ok()?;
+        let uks = map.unit_keys();
+        (!uks.is_empty()).then(|| Key::Unit(uks.to_vec()))
     }
 }

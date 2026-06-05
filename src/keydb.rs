@@ -16,17 +16,24 @@
 use std::path::PathBuf;
 
 use libfreemkv::aacs::{HostCert, KeyDb};
-use libfreemkv::{DiscInputs, Key, KeySource, Result};
+use libfreemkv::{DiscInputs, Key, KeySource};
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 pub struct KeydbSource {
     path: PathBuf,
+    /// Lazily-built candidate list (UK ▸ VK ▸ MK ▸ DK ▸ …) plus its cursor —
+    /// the keydb owns the order and hands one candidate per `next_key`. `None`
+    /// until the first `next_key` parses the file.
+    cursor: Option<std::vec::IntoIter<Key>>,
 }
 
 impl KeydbSource {
     /// A keydb source reading the given `keydb.cfg` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            cursor: None,
+        }
     }
 
     /// The host certificate(s) in this keydb — the second kind of data the one
@@ -42,17 +49,28 @@ impl KeydbSource {
 
     /// Build the ordered candidate list from a parsed keydb. Pure (no I/O), so
     /// it is unit-testable without a file on disk.
+    ///
+    /// Order = cheapest + most authoritative first: **UK ▸ VK ▸ MK ▸ DK**. The
+    /// UK is the final per-CPS-unit content key — zero derivation, directly
+    /// usable — so it is tried first; the VUK needs one derivation step, an MK
+    /// two, and the device-key pool the full MKB walk (AACS-1.0-only, slowest),
+    /// so it is the last-resort fallback. Trying the UK first is also what lets a
+    /// stale/wrong per-disc VUK be skipped in favour of a good UK in the SAME
+    /// entry (`decrypt_with` rejects the VUK; the loop falls through to the UK).
     fn candidates_from(db: &KeyDb, inputs: &DiscInputs) -> Vec<Key> {
         let mut out = Vec::new();
 
         // Per-disc hit (most specific). find_disc normalizes the hash form.
         if let Some(entry) = db.find_disc(&inputs.disc_hash) {
-            if let Some(vuk) = entry.vuk {
-                out.push(Key::Volume(vuk));
-            }
+            // UK first — terminal content key, no derivation.
             if !entry.unit_keys.is_empty() {
                 out.push(Key::Unit(entry.unit_keys.clone()));
             }
+            // VK next — one step (decrypt Unit_Key_RO.inf).
+            if let Some(vuk) = entry.vuk {
+                out.push(Key::Volume(vuk));
+            }
+            // MK — two steps (derive the VUK, then the unit keys).
             if let Some(mk) = entry.media_key {
                 out.push(Key::Media(vec![mk]));
             }
@@ -80,15 +98,19 @@ impl KeydbSource {
 }
 
 impl KeySource for KeydbSource {
-    fn resolve(&self, inputs: &DiscInputs) -> Result<Vec<Key>> {
-        // A missing keydb is not an error — another source may have the key.
-        // (Parse/format problems surface as an empty/partial keydb, same as the
-        // library's own loader; this source never fails the whole resolve.)
-        let db = match KeyDb::load(&self.path) {
-            Ok(db) => db,
-            Err(_) => return Ok(Vec::new()),
-        };
-        Ok(Self::candidates_from(&db, inputs))
+    fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
+        // On the first ask, parse the keydb once and build the ordered candidate
+        // list; later asks just advance the cursor. A missing/unreadable keydb
+        // is not an error — it simply yields no candidates (another source may
+        // have the key), the same as the library's own loader.
+        if self.cursor.is_none() {
+            let cands = match KeyDb::load(&self.path) {
+                Ok(db) => Self::candidates_from(&db, inputs),
+                Err(_) => Vec::new(),
+            };
+            self.cursor = Some(cands.into_iter());
+        }
+        self.cursor.as_mut().and_then(Iterator::next)
     }
 }
 
@@ -147,6 +169,32 @@ mod tests {
         assert!(
             cands.iter().any(|k| matches!(k, Key::Device(_))),
             "the universal device-key pool is still offered as a fallback"
+        );
+    }
+
+    #[test]
+    fn per_disc_uk_ranks_before_vuk() {
+        // An entry with BOTH a UK and a VUK (the Being There shape) must hand the
+        // terminal UK out first, so a stale/wrong VUK never pre-empts a good UK.
+        let mut entries = HashMap::new();
+        let mut e = entry_with_vuk("0xaabb", [0x11u8; 16]);
+        e.unit_keys = vec![(1, [0x22u8; 16])];
+        entries.insert("0xaabb".into(), e);
+        let db = KeyDb {
+            device_keys: Vec::new(),
+            processing_keys: Vec::new(),
+            host_certs: Vec::new(),
+            disc_entries: entries,
+        };
+
+        let cands = KeydbSource::candidates_from(&db, &inputs("0xaabb"));
+        assert!(
+            matches!(cands.first(), Some(Key::Unit(_))),
+            "the terminal UK must be the first candidate"
+        );
+        assert!(
+            matches!(cands.get(1), Some(Key::Volume(v)) if *v == [0x11u8; 16]),
+            "the VUK follows the UK"
         );
     }
 
