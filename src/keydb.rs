@@ -127,6 +127,7 @@ mod tests {
             mkb: Vec::new(),
             unit_key_ro: Vec::new(),
             samples: Vec::new(),
+            volume_label: None,
         }
     }
 

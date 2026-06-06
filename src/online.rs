@@ -54,6 +54,13 @@ impl OnlineSource {
                     .collect(),
             );
         }
+        // The disc's own title (UDF/ISO volume id), plain text. The key service
+        // catalogs it by disc_hash (its disc-titles.json) — independent of keydb.
+        if let Some(label) = inputs.volume_label.as_deref().map(str::trim) {
+            if !label.is_empty() {
+                body["title"] = serde_json::Value::String(label.to_string());
+            }
+        }
         let mut req = ureq::post(&self.base_url).timeout(Duration::from_secs(TIMEOUT_SECS));
         if !self.secret.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", self.secret));
