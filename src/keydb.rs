@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn per_disc_uk_ranks_before_vuk() {
-        // An entry with BOTH a UK and a VUK (the Being There shape) must hand the
+        // An entry with BOTH a UK and a VUK (the dual-key shape) must hand the
         // terminal UK out first, so a stale/wrong VUK never pre-empts a good UK.
         let mut entries = HashMap::new();
         let mut e = entry_with_vuk("0xaabb", [0x11u8; 16]);
