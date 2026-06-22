@@ -107,10 +107,29 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, String> {
     if host.is_empty() {
         return Err("URL has no host".into());
     }
-    let addrs: Vec<SocketAddr> = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("could not resolve host: {e}"))?
-        .collect();
+    // `to_socket_addrs` is a BLOCKING DNS lookup that can hang for the OS
+    // resolver timeout (tens of seconds) and freeze the rip thread that called
+    // query(). Run it on a spawned thread and join with a bounded deadline;
+    // on timeout return Err so query() yields None and the rip proceeds
+    // (mirrors the bounded-resolve in autorip/libfreemkv).
+    let addrs: Vec<SocketAddr> = {
+        use std::sync::mpsc;
+        const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+        let host = host.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<SocketAddr>>());
+            // Receiver may be gone after the timeout — ignore the send error.
+            let _ = tx.send(res);
+        });
+        match rx.recv_timeout(DNS_TIMEOUT) {
+            Ok(Ok(addrs)) => addrs,
+            Ok(Err(e)) => return Err(format!("could not resolve host: {e}")),
+            Err(_) => return Err("DNS resolution timed out".into()),
+        }
+    };
     if addrs.is_empty() {
         return Err("host did not resolve to any address".into());
     }
@@ -163,7 +182,15 @@ impl OnlineSource {
     /// The single server-resolved UK for this disc, or `None`. Runs exactly the
     /// one network round-trip; `next_key` gates it to one call per session.
     fn query(&mut self, inputs: &DiscInputs) -> Option<Key> {
-        if self.base_url.is_empty() || inputs.mkb.len() > MAX_MKB_BYTES {
+        // No configured service: a clean None ("no service"), not an error.
+        if self.base_url.is_empty() {
+            return None;
+        }
+        // An over-cap MKB is a real failure to resolve THIS disc, not "no
+        // service" — flag it so the caller reports it distinctly (and a later
+        // ask doesn't conflate it with a missing key).
+        if inputs.mkb.len() > MAX_MKB_BYTES {
+            self.errored = true;
             return None;
         }
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -284,6 +311,12 @@ fn parse_uk(hex: &str) -> Option<[u8; 16]> {
     if hex.len() != 32 {
         return None;
     }
+    // Reject any non-hex byte up front. `u8::from_str_radix` on a 2-char
+    // window otherwise accepts sign prefixes (e.g. "+5", "-A"), letting a
+    // signed/whitespace-tainted string slip through as a valid key.
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
         *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
@@ -379,5 +412,24 @@ mod tests {
             resolve_and_guard("http://1.1.1.1:8080/keys").expect("public IP with port accepted");
         assert!(!addrs.is_empty());
         assert_eq!(addrs[0].port(), 8080);
+    }
+
+    /// Finding #9 regression: parse_uk must reject any non-hex byte up front so
+    /// sign prefixes / whitespace can't slip through the windowed 2-char parse
+    /// (`u8::from_str_radix` accepts "+5", "-A", etc.).
+    #[test]
+    fn parse_uk_rejects_non_hex_bytes() {
+        // Valid 32-char hex parses.
+        assert_eq!(
+            parse_uk("000102030405060708090a0b0c0d0e0f"),
+            Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        );
+        // Sign-prefixed window: "+5" / "-A" would parse via from_str_radix.
+        assert!(parse_uk("+5000102030405060708090a0b0c0d0e").is_none());
+        assert!(parse_uk("-A000102030405060708090a0b0c0d0e").is_none());
+        // Embedded whitespace.
+        assert!(parse_uk("00 0102030405060708090a0b0c0d0e0f").is_none());
+        // Wrong length is still rejected.
+        assert!(parse_uk("00").is_none());
     }
 }
