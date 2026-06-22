@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-keysources"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -11,7 +11,7 @@ categories = ["multimedia"]
 
 [dependencies]
 # The crate provides the `KeySource` trait + `Key`/`DiscInputs` types these impls fill.
-libfreemkv = "1.0.0-rc.2"
+libfreemkv = "1.0.0-rc.3"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
