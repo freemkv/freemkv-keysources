@@ -35,10 +35,10 @@ jobs:
       # published at this version — the release script enforces that ordering.
       - run: cargo test
 
-  # NOTE: the crates.io publish is driven by the release script
-  # (freemkv-private/scripts/release.sh) from local credentials, not from CI —
-  # this repo has no CARGO_REGISTRY_TOKEN secret. CI here only verifies the
-  # version/tag match, runs tests, and cuts the GitHub Release.
+  # NOTE: the crates.io publish is driven by the maintainer's release tooling
+  # from local credentials, not from CI — this repo has no CARGO_REGISTRY_TOKEN
+  # secret. CI here only verifies the version/tag match, runs tests, and cuts
+  # the GitHub Release.
 
   release:
     needs: test
