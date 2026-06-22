@@ -7,3 +7,4 @@ scratch/
 # internal agent context — never publish (leak-guard blocks both)
 CLAUDE.md
 .claude/
+.cargo/config.toml

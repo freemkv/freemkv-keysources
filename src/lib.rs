@@ -125,7 +125,14 @@ pub fn read_sample_units(
                 break;
             }
             let units_this = CHUNK_UNITS.min(total_units - unit);
-            let lba = ext.start_lba + unit * UNIT_SECTORS;
+            // Saturate: start_lba comes from attacker-controlled UDF/MPLS
+            // extents; a malformed extent near u32::MAX would otherwise panic
+            // (debug) or wrap to a wrong LBA (release). Matches the hardened
+            // pattern in mux/disc.rs and verify.rs; an over-capacity LBA then
+            // fails cleanly via the read_sectors().is_err() break below.
+            let lba = ext
+                .start_lba
+                .saturating_add(unit.saturating_mul(UNIT_SECTORS));
             let count = (units_this * UNIT_SECTORS) as u16;
             let mut buf = vec![0u8; count as usize * 2048];
             // `false` = no recovery retries; the reader is the raw drive/file
