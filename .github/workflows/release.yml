@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          if [ "$CARGO_VER" != "${{ github.ref_name }}" ]; then
+            echo "::error::Cargo.toml says $CARGO_VER but tag is ${{ github.ref_name }}"
+            exit 1
+          fi
+          echo "Version match: $CARGO_VER"
+
+  test:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+      # freemkv-keysources is a library — Cargo.lock isn't tracked, so --locked
+      # would always fail (no lockfile to lock against on a fresh runner). Its
+      # libfreemkv dep resolves from crates.io (the dev .cargo/config.toml patch
+      # is gitignored and absent on the runner), so libfreemkv must already be
+      # published at this version — the release script enforces that ordering.
+      - run: cargo test
+
+  # NOTE: the crates.io publish is driven by the release script
+  # (freemkv-private/scripts/release.sh) from local credentials, not from CI —
+  # this repo has no CARGO_REGISTRY_TOKEN secret. CI here only verifies the
+  # version/tag match, runs tests, and cuts the GitHub Release.
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
