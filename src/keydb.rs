@@ -98,6 +98,14 @@ impl KeydbSource {
 }
 
 impl KeySource for KeydbSource {
+    /// Expose the keydb's host certs through the trait — the OEM/AACS cert-auth
+    /// route collects them across every source via this method. Delegates to the
+    /// inherent [`KeydbSource::host_certs`] (same `| HC |`/`| HC2 |` rows parsed
+    /// by libfreemkv's keydb parser); no new parsing.
+    fn host_certs(&self) -> Vec<HostCert> {
+        KeydbSource::host_certs(self)
+    }
+
     fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
         // On the first ask, parse the keydb once and build the ordered candidate
         // list; later asks just advance the cursor. A missing/unreadable keydb
@@ -234,5 +242,41 @@ mod tests {
                 .host_certs()
                 .is_empty()
         );
+    }
+
+    /// The KeySource TRAIT method exposes the keydb's host cert(s) — this is the
+    /// path the OEM/AACS cert-auth route collects certs through. A keydb with a
+    /// `| HC |` row must surface a HostCert via `KeySource::host_certs`, so the
+    /// handshake (which iterates `opts.key_sources[..].host_certs()`) finds it.
+    /// Placeholder all-zero material (never a real key) — same convention as
+    /// libfreemkv's own `parse_host_cert` test.
+    #[test]
+    fn trait_host_certs_returns_keydb_hc_row() {
+        let dir = std::env::temp_dir().join(format!("fmk_hc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keydb.cfg");
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(20),
+            "00".repeat(92)
+        );
+        std::fs::write(&path, line).unwrap();
+
+        let src = KeydbSource::new(&path);
+        // Consult through the TRAIT, exactly as the OEM route does.
+        let certs = KeySource::host_certs(&src);
+        assert_eq!(certs.len(), 1, "trait host_certs must surface the HC row");
+        assert_eq!(certs[0].certificate.len(), 92);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Zero certs from a (missing) keydb through the TRAIT method — the OEM route
+    /// sees an empty vec here and, with no other source supplying a cert, fails
+    /// gracefully with `AacsNoHostCert` rather than panicking.
+    #[test]
+    fn trait_host_certs_empty_when_keydb_missing() {
+        let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
+        assert!(KeySource::host_certs(&src).is_empty());
     }
 }

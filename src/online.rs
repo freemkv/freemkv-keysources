@@ -305,6 +305,16 @@ impl KeySource for OnlineSource {
     fn errored(&self) -> bool {
         self.errored
     }
+
+    fn host_certs(&self) -> Vec<libfreemkv::aacs::HostCert> {
+        // NO-OP STUB. The online service does not serve host certs today: there
+        // is no client-side fetch and no server-side endpoint for them. Returning
+        // empty makes the OEM cert route fall back to whatever other source
+        // (e.g. the keydb) supplies — and fail gracefully if none does. No
+        // network is touched here.
+        // TODO(owner): online host-cert serving — design when 0x83 cert is recovered
+        Vec::new()
+    }
 }
 
 fn parse_uk(hex: &str) -> Option<[u8; 16]> {
@@ -379,6 +389,20 @@ mod tests {
         assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
         ))));
+    }
+
+    /// The online source serves NO host certs today (no fetch, no endpoint).
+    /// `host_certs()` must return empty WITHOUT touching the network, so the OEM
+    /// route falls back to whatever else (the keydb) supplies. Uses a non-empty
+    /// base URL to prove the empty result isn't merely "no service configured" —
+    /// it's the deliberate no-op stub.
+    #[test]
+    fn host_certs_is_noop_empty_no_network() {
+        let src = OnlineSource::new("http://example.invalid/keys", "secret");
+        assert!(
+            KeySource::host_certs(&src).is_empty(),
+            "online host_certs must be an empty no-op (no network)"
+        );
     }
 
     // ── resolve_and_guard ──────────────────────────────────────────────────
