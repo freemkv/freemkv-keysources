@@ -37,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
   # NOTE: the crates.io publish is driven by the maintainer's release tooling
