@@ -319,6 +319,10 @@ impl KeySource for OnlineSource {
         true
     }
 
+    fn label(&self) -> &'static str {
+        "online"
+    }
+
     fn errored(&self) -> bool {
         self.errored
     }

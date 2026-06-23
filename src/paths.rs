@@ -183,13 +183,13 @@ mod tests {
     #[test]
     fn unix_default_is_home_dotconfig() {
         with_env(
-            &[("HOME", Some("/home/matt")), ("XDG_CONFIG_HOME", None)],
+            &[("HOME", Some("/u/me")), ("XDG_CONFIG_HOME", None)],
             || {
                 let paths = keydb_search_paths();
                 assert_eq!(paths.len(), 1, "just the $HOME/.config default");
                 assert_eq!(
                     paths[0],
-                    PathBuf::from("/home/matt")
+                    PathBuf::from("/u/me")
                         .join(".config")
                         .join("freemkv")
                         .join("keydb.cfg"),
@@ -205,15 +205,15 @@ mod tests {
     fn unix_honours_xdg_config_home_first() {
         with_env(
             &[
-                ("XDG_CONFIG_HOME", Some("/home/matt/.cfg")),
-                ("HOME", Some("/home/matt")),
+                ("XDG_CONFIG_HOME", Some("/u/me/.cfg")),
+                ("HOME", Some("/u/me")),
             ],
             || {
                 let paths = keydb_search_paths();
                 assert_eq!(paths.len(), 2, "XDG dir + $HOME/.config fallback");
                 assert_eq!(
                     paths[0],
-                    PathBuf::from("/home/matt/.cfg")
+                    PathBuf::from("/u/me/.cfg")
                         .join("freemkv")
                         .join("keydb.cfg"),
                     "XDG_CONFIG_HOME, when set, is searched before ~/.config"
