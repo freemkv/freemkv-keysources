@@ -22,26 +22,34 @@ jobs:
           fi
           echo "Version match: $CARGO_VER"
 
+  # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
+  # release job does NOT `needs:` this job. The tag decision was already gated by
+  # the local precommit (same Rust 1.86, same commit).
+  #
+  # freemkv-keysources is a library — Cargo.lock isn't tracked, so --locked
+  # would always fail (no lockfile to lock against on a fresh runner). Its
+  # libfreemkv dep resolves from crates.io (the dev .cargo/config.toml patch is
+  # gitignored and absent on the runner), so libfreemkv must already be published
+  # at this version — the release script enforces that ordering before tagging.
   test:
     needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.86.0
-      # freemkv-keysources is a library — Cargo.lock isn't tracked, so --locked
-      # would always fail (no lockfile to lock against on a fresh runner). Its
-      # libfreemkv dep resolves from crates.io (the dev .cargo/config.toml patch
-      # is gitignored and absent on the runner), so libfreemkv must already be
-      # published at this version — the release script enforces that ordering.
       - run: cargo test
 
   # NOTE: the crates.io publish is driven by the maintainer's release tooling
   # from local credentials, not from CI — this repo has no CARGO_REGISTRY_TOKEN
-  # secret. CI here only verifies the version/tag match, runs tests, and cuts
-  # the GitHub Release.
+  # secret. release.sh runs `cargo publish --no-verify` locally. CI here only
+  # verifies the version/tag match, runs tests (tripwire), and cuts the GitHub
+  # Release. The binaries git-tag-pin keysources, so they don't wait on the
+  # crates.io publish — it serves external consumers in parallel.
 
   release:
-    needs: test
+    # Only needs `verify`; the GitHub Release is cut as soon as the version
+    # check passes, in parallel with the test tripwire.
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
