@@ -23,10 +23,12 @@
 mod keydb;
 mod mapfile;
 mod online;
+mod paths;
 
 pub use keydb::KeydbSource;
 pub use mapfile::MapfileSource;
-pub use online::OnlineSource;
+pub use online::{OnlineSource, validate_keyserver_url};
+pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 
 // Re-exported for downstream convenience so apps need only depend on this crate
 // for the source-side types.

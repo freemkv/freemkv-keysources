@@ -144,6 +144,23 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, String> {
     Ok(addrs)
 }
 
+/// Validate a key-service base URL before it is handed to [`OnlineSource`].
+/// Requires an `http(s)` scheme, extracts the host, and rejects any host that
+/// is — or resolves to — a loopback / link-local (incl. the 169.254.169.254
+/// cloud-metadata endpoint) / RFC1918 / ULA / other non-public address (SSRF /
+/// metadata-exfiltration guard). Returns `Ok(())` on success so a caller can
+/// gate `OnlineSource` construction; the error string explains the rejection.
+///
+/// This is the *config-time* check. [`OnlineSource`] independently re-resolves
+/// and re-guards the host immediately before each POST (and pins the validated
+/// addresses), so a DNS rebind between this check and the request can't redirect
+/// the key material. The two share the SAME `is_blocked_ip` classifier and the
+/// SAME bounded-resolve, so their verdicts never diverge — the reason this lives
+/// here, in the key-source crate, rather than being re-rolled per application.
+pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
+    resolve_and_guard(url).map(|_| ())
+}
+
 /// Build a ureq agent that follows zero redirects (so a public URL can't
 /// 30x-redirect to an internal host) and pins DNS resolution to `pinned`
 /// (the addresses already validated by [`resolve_and_guard`]).
@@ -230,8 +247,8 @@ impl OnlineSource {
         };
         let agent = hardened_agent(pinned);
         let mut req = agent.post(&self.base_url);
-        if !self.secret.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", self.secret));
+        if let Some(value) = bearer_header(&self.secret) {
+            req = req.set("Authorization", &value);
         }
         // Begin/end around the keyserver round-trip — a slow or unresponsive
         // service is the suspected DVD-scan hang. The agent is built with a
@@ -314,6 +331,18 @@ impl KeySource for OnlineSource {
         // network is touched here.
         // TODO(owner): online host-cert serving — design when 0x83 cert is recovered
         Vec::new()
+    }
+}
+
+/// The `Authorization` header value for a key-service request, or `None` when no
+/// secret/token is configured (the request then goes out unauthenticated). The
+/// token — passed as `--key-auth` on the CLI or `keyserver_secret` in autorip —
+/// is sent verbatim as an HTTP Bearer credential.
+fn bearer_header(secret: &str) -> Option<String> {
+    if secret.is_empty() {
+        None
+    } else {
+        Some(format!("Bearer {secret}"))
     }
 }
 
@@ -436,6 +465,34 @@ mod tests {
             resolve_and_guard("http://1.1.1.1:8080/keys").expect("public IP with port accepted");
         assert!(!addrs.is_empty());
         assert_eq!(addrs[0].port(), 8080);
+    }
+
+    // ── bearer_header ──────────────────────────────────────────────────────
+
+    #[test]
+    fn bearer_header_formats_token_and_omits_when_empty() {
+        // A configured token becomes a Bearer credential, sent verbatim.
+        assert_eq!(
+            bearer_header("s3cr3t-token"),
+            Some("Bearer s3cr3t-token".to_string())
+        );
+        // No token → no Authorization header (request goes out unauthenticated).
+        assert_eq!(bearer_header(""), None);
+    }
+
+    // ── validate_keyserver_url ─────────────────────────────────────────────
+
+    #[test]
+    fn validate_keyserver_url_rejects_internal_and_bad_scheme() {
+        // Mirrors resolve_and_guard: the public wrapper rejects the same hosts.
+        assert!(validate_keyserver_url("http://127.0.0.1/keys").is_err());
+        assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_keyserver_url(&format!("http://{}.{}.{}.{}/k", 10, 0, 0, 5)).is_err());
+        assert!(validate_keyserver_url("http://[::1]:9000/keys").is_err());
+        assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
+        assert!(validate_keyserver_url("").is_err());
+        // A public literal IP passes (no DNS needed, deterministic).
+        assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
     }
 
     /// Finding #9 regression: parse_uk must reject any non-hex byte up front so
