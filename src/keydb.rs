@@ -106,6 +106,21 @@ impl KeySource for KeydbSource {
         KeydbSource::host_certs(self)
     }
 
+    /// The keydb can hand out a per-disc **terminal** `Key::Unit` (a UK entry
+    /// keyed on `disc_hash` alone — see `candidates_from`). Unlike a derived key
+    /// (Device/Processing/Media/Volume), a terminal UK is applied as-is by
+    /// `Disc::decrypt_with`: it is NOT re-derived through the MKB-verified AACS
+    /// resolver, so a UK entry whose hash matches the disc but whose key bytes
+    /// are wrong would commit and mux undecryptable video as "success". The only
+    /// thing that disproves a wrong UK is descrambling real ciphertext, so this
+    /// source requires content samples — without them `decrypt_with` skips
+    /// validation and the wrong UK is taken. Returning `true` makes every
+    /// consumer (autorip resume/mux-worker AND the CLI) sample units before
+    /// resolving, so a keydb UK is ciphertext-validated on every path.
+    fn needs_samples(&self) -> bool {
+        true
+    }
+
     fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
         // On the first ask, parse the keydb once and build the ordered candidate
         // list; later asks just advance the cursor. A missing/unreadable keydb
@@ -230,6 +245,22 @@ mod tests {
             disc_entries: HashMap::new(),
         };
         assert!(KeydbSource::candidates_from(&db, &inputs("0xaabb")).is_empty());
+    }
+
+    /// Regression: a keydb can hand out a per-disc terminal `Key::Unit` that
+    /// `Disc::decrypt_with` applies WITHOUT re-deriving through the MKB-verified
+    /// AACS resolver. The only thing that disproves a wrong UK is descrambling
+    /// ciphertext, so the source MUST request content samples — otherwise the
+    /// autorip resume/mux-worker path (which only samples when some source
+    /// reports `needs_samples()`) resolves with empty samples and commits a
+    /// wrong UK as success. Was `false` (inherited default); must be `true`.
+    #[test]
+    fn keydb_source_needs_samples() {
+        let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
+        assert!(
+            src.needs_samples(),
+            "keydb emits terminal Key::Unit entries that need ciphertext validation"
+        );
     }
 
     /// No keydb (or a LibreDrive deployment) → no host credentials, not an
