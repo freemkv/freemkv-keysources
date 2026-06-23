@@ -121,6 +121,10 @@ impl KeySource for KeydbSource {
         true
     }
 
+    fn label(&self) -> &'static str {
+        "keydb"
+    }
+
     fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
         // On the first ask, parse the keydb once and build the ordered candidate
         // list; later asks just advance the cursor. A missing/unreadable keydb
