@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# freemkv-keysources depends on libfreemkv from crates.io (see Cargo.toml).
+# No sibling-repo checkout is needed.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: clippy, rustfmt
+      # Cache ~/.cargo/registry + target/ across runs. Saves ~30-60s
+      # of crates.io index download per job; incremental compilation
+      # helps on re-runs that don't bump Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-keysources-ci
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-keysources-ci
+      - run: cargo test --locked
