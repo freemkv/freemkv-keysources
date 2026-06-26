@@ -5,7 +5,9 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use base64::Engine;
-use libfreemkv::{DiscInputs, Key, KeySource};
+use libfreemkv::aacs::{UnitKey, Vuk, uk_from_vuk};
+use libfreemkv::keysource::ResolveCtx;
+use libfreemkv::{Error, KeySource};
 
 const MAX_MKB_BYTES: usize = 10 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
@@ -176,14 +178,6 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 pub struct OnlineSource {
     base_url: String,
     secret: String,
-    /// The key service pre-validates server-side and returns a single UK, so it
-    /// is asked **at most once** — this flips true after the first `next_key`,
-    /// and every later ask returns `None` without re-hitting the network.
-    asked: bool,
-    /// Set when the round-trip itself failed (network down, bad response) — as
-    /// opposed to the service simply having no key. Lets the caller report
-    /// "key service unreachable" distinctly from "no key for this disc".
-    errored: bool,
 }
 
 impl OnlineSource {
@@ -191,45 +185,52 @@ impl OnlineSource {
         Self {
             base_url: base_url.into(),
             secret: secret.into(),
-            asked: false,
-            errored: false,
         }
     }
 
-    /// The single server-resolved UK for this disc, or `None`. Runs exactly the
-    /// one network round-trip; `next_key` gates it to one call per session.
-    fn query(&mut self, inputs: &DiscInputs) -> Option<Key> {
-        // No configured service: a clean None ("no service"), not an error.
+    /// The server-resolved Unit Keys for this disc, or an empty `Vec`. Runs
+    /// exactly one network round-trip. The service returns either a terminal
+    /// `UK` (used directly) or a `VUK` (derived to Unit Keys locally via the
+    /// disc's encrypted title keys from `ctx`). Any failure — no service,
+    /// over-cap MKB, network/parse error, or no key for this disc — yields an
+    /// empty `Vec` (the resolver tries the next source). `&self`: one-shot is
+    /// the resolver's contract (each source's `get_uk` is called once), so no
+    /// per-call latch is needed.
+    fn query(&self, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+        // No configured service: nothing to resolve.
         if self.base_url.is_empty() {
-            return None;
+            return Vec::new();
         }
-        // An over-cap MKB is a real failure to resolve THIS disc, not "no
-        // service" — flag it so the caller reports it distinctly (and a later
-        // ask doesn't conflate it with a missing key).
-        if inputs.mkb.len() > MAX_MKB_BYTES {
-            self.errored = true;
-            return None;
+        let mkb = ctx.mkb().unwrap_or(&[]);
+        // An over-cap MKB cannot be forwarded — bound the body.
+        if mkb.len() > MAX_MKB_BYTES {
+            return Vec::new();
         }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
-            "inf_b64": b64.encode(&inputs.unit_key_ro),
-            "mkb_b64": b64.encode(&inputs.mkb),
+            // Raw Unit_Key_RO.inf, verbatim — the server does its own parse /
+            // derivation, so it needs the unparsed blob (not enc_title_keys).
+            "inf_b64": b64.encode(ctx.unit_key_ro()),
+            "mkb_b64": b64.encode(mkb),
         });
-        if inputs.volume_id != [0u8; 16] {
-            body["vid_b64"] = serde_json::Value::String(b64.encode(inputs.volume_id));
+        if let Some(vid) = ctx.vid() {
+            body["vid_b64"] = serde_json::Value::String(b64.encode(vid.0));
         }
-        if !inputs.samples.is_empty() {
-            body["units_b64"] = serde_json::Value::Array(
-                inputs
-                    .samples
-                    .iter()
-                    .map(|u| serde_json::Value::String(b64.encode(u)))
-                    .collect(),
-            );
+        // Up to a generous cap of encrypted content samples for server-side
+        // ciphertext validation.
+        if let Ok(samples) = ctx.samples(64) {
+            if !samples.is_empty() {
+                body["units_b64"] = serde_json::Value::Array(
+                    samples
+                        .iter()
+                        .map(|u| serde_json::Value::String(b64.encode(u)))
+                        .collect(),
+                );
+            }
         }
         // The disc's own title (UDF/ISO volume id), plain text. The key service
         // catalogs it by disc_hash (its disc-titles.json) — independent of keydb.
-        if let Some(label) = inputs.volume_label.as_deref().map(str::trim) {
+        if let Some(label) = ctx.title().map(str::trim) {
             if !label.is_empty() {
                 body["title"] = serde_json::Value::String(label.to_string());
             }
@@ -240,10 +241,7 @@ impl OnlineSource {
         // request (and the bearer token) to an internal/metadata host.
         let pinned = match resolve_and_guard(&self.base_url) {
             Ok(addrs) => addrs,
-            Err(_) => {
-                self.errored = true;
-                return None;
-            }
+            Err(_) => return Vec::new(),
         };
         let agent = hardened_agent(pinned);
         let mut req = agent.post(&self.base_url);
@@ -267,8 +265,7 @@ impl OnlineSource {
                     elapsed_ms = post_t0.elapsed().as_millis() as u64,
                     "keyserver request failed (timeout, network, or HTTP error)"
                 );
-                self.errored = true;
-                return None;
+                return Vec::new();
             }
         };
         tracing::info!(
@@ -287,55 +284,41 @@ impl OnlineSource {
             .is_err()
             || buf.len() > MAX_RESPONSE_BYTES
         {
-            self.errored = true;
-            return None;
+            return Vec::new();
         }
         let json: serde_json::Value = match serde_json::from_slice(&buf) {
             Ok(j) => j,
-            Err(_) => {
-                self.errored = true;
-                return None;
-            }
+            Err(_) => return Vec::new(),
         };
-        json.get("UK")
-            .and_then(|u| u.as_str())
-            .and_then(parse_uk)
-            .map(|uk| Key::Unit(vec![(1, uk)]))
+        // A terminal UK is used directly (CPS unit 0 → committed cps 1, matching
+        // the old `Key::Unit(vec![(1, uk)])`).
+        if let Some(uk) = json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
+            return vec![UnitKey { idx: 0, key: uk }];
+        }
+        // A VUK is derived to the terminal keys locally, via the disc's
+        // encrypted title keys from the context — the library owns the crypto.
+        if let Some(vuk) = json.get("VUK").and_then(|u| u.as_str()).and_then(parse_uk) {
+            if let Ok(enc) = ctx.enc_title_keys() {
+                return uk_from_vuk(Vuk(vuk), enc);
+            }
+        }
+        Vec::new()
     }
 }
 
 impl KeySource for OnlineSource {
-    fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
-        // One shot: the service pre-validates and returns a single UK, so a
-        // second ask has nothing new to offer — don't re-hit the network.
-        if self.asked {
-            return None;
-        }
-        self.asked = true;
-        self.query(inputs)
-    }
-
-    fn needs_samples(&self) -> bool {
-        true
+    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        Ok(self.query(ctx))
     }
 
     fn label(&self) -> &'static str {
         "online"
     }
 
-    fn errored(&self) -> bool {
-        self.errored
-    }
-
-    fn host_certs(&self) -> Vec<libfreemkv::aacs::HostCert> {
-        // NO-OP STUB. The online service does not serve host certs today: there
-        // is no client-side fetch and no server-side endpoint for them. Returning
-        // empty makes the OEM cert route fall back to whatever other source
-        // (e.g. the keydb) supplies — and fail gracefully if none does. No
-        // network is touched here.
-        // TODO(owner): online host-cert serving — design when 0x83 cert is recovered
-        Vec::new()
-    }
+    // host_certs: the no-op default. The online service does not serve host
+    // certs today (no client-side fetch, no server-side endpoint), so the OEM
+    // cert route falls back to whatever other source (e.g. the keydb) supplies.
+    // No network is touched. (Future task: online host-cert serving.)
 }
 
 /// The `Authorization` header value for a key-service request, or `None` when no
@@ -433,8 +416,12 @@ mod tests {
     fn host_certs_is_noop_empty_no_network() {
         let src = OnlineSource::new("http://example.invalid/keys", "secret");
         assert!(
-            KeySource::host_certs(&src).is_empty(),
+            KeySource::host_certs(&src, None).is_empty(),
             "online host_certs must be an empty no-op (no network)"
+        );
+        assert!(
+            KeySource::host_certs(&src, Some(68)).is_empty(),
+            "still empty regardless of the MKB generation"
         );
     }
 

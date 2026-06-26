@@ -1,160 +1,214 @@
 //! `keydb.cfg` key source (source #1).
 //!
-//! Parses a local `keydb.cfg` and enumerates the material it holds for a disc
-//! as candidate [`Key`]s, most-specific first. It does NO derivation — picking
-//! which device key applies, or which media key verifies, is the MKB walk, and
-//! that lives in libfreemkv (`Disc::decrypt_with`). The candidate order lets
-//! the library try each path the keydb could satisfy:
+//! Parses a local `keydb.cfg`, looks the disc up by hash, and derives the
+//! disc's terminal **Unit Keys** itself by driving libfreemkv's boil-down
+//! primitives ([`uk_from_vuk`] / [`vuk_from_mk`] / [`mk_from_dk`]) — never
+//! re-implementing AES. The path it picks mirrors the OLD candidate order
+//! (which libfreemkv's resolver used to walk) EXACTLY, cheapest-first:
 //!
-//! 1. per-disc VUK (hash hit)        → `Key::Volume`
-//! 2. per-disc unit keys (hash hit)  → `Key::Unit`
-//! 3. per-disc media key (hash hit)  → `Key::Media`
-//! 4. device-key pool (universal)    → `Key::Device`  (lib walks the MKB)
-//! 5. processing-key pool            → `Key::Processing`
-//! 6. media-key pool (all entries)   → `Key::Media`   (lib brutes vs the MKB)
+//! 1. per-disc **Unit Keys** (hash hit)  → returned terminal, no derivation.
+//! 2. per-disc **VUK** (hash hit)        → [`uk_from_vuk`] over the disc's
+//!    encrypted title keys.
+//! 3. per-disc **Media Key** (hash hit), or one derived from the device-key
+//!    pool via [`mk_from_dk`] → needs a VID. The VID is the unlocker's physical
+//!    VID ([`ResolveCtx::vid`]) when present, else the keydb entry's OWN stored
+//!    VID (the `I` field, `disc_id`) for the non-physical / ISO path. With no
+//!    VID from either source the MK path cannot complete — return nothing. Then
+//!    [`vuk_from_mk`] → [`uk_from_vuk`].
+//!
+//! The library still OWNS the crypto; this source owns only which primitive to
+//! call with which material. Returning an empty `Vec` is a genuine "no key for
+//! this disc here".
 
 use std::path::PathBuf;
 
-use libfreemkv::aacs::{HostCert, KeyDb};
-use libfreemkv::{DiscInputs, Key, KeySource};
+use libfreemkv::aacs::{
+    HostCert, MediaKey, UnitKey, Vid, Vuk, mk_from_dk, uk_from_vuk, vuk_from_mk,
+};
+use libfreemkv::keysource::ResolveCtx;
+use libfreemkv::{Error, KeySource};
+
+use crate::keydb_format::KeyDb;
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 pub struct KeydbSource {
     path: PathBuf,
-    /// Lazily-built candidate list (UK ▸ VK ▸ MK ▸ DK ▸ …) plus its cursor —
-    /// the keydb owns the order and hands one candidate per `next_key`. `None`
-    /// until the first `next_key` parses the file.
-    cursor: Option<std::vec::IntoIter<Key>>,
 }
 
 impl KeydbSource {
     /// A keydb source reading the given `keydb.cfg` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            cursor: None,
-        }
+        Self { path: path.into() }
     }
 
     /// The host certificate(s) in this keydb — the second kind of data the one
     /// keydb file holds (alongside decryption keys). The app passes these to the
     /// live-drive scan as `DriveCredentials` for the AACS handshake. Empty if
     /// the keydb is missing/unreadable or carries no host cert.
+    ///
+    /// Inherent, no-MKB form: this is used by the **scan-options** builder,
+    /// which runs before the disc's MKB generation is known, so no revocation
+    /// filtering is applied (passes `None`). The [`KeySource::host_certs`] TRAIT
+    /// method wires the real MKB generation through for revocation filtering.
     pub fn host_certs(&self) -> Vec<HostCert> {
         match KeyDb::load(&self.path) {
-            Ok(db) => db.host_certs,
+            Ok(db) => db.host_certs(None),
             Err(_) => Vec::new(),
         }
     }
 
-    /// Build the ordered candidate list from a parsed keydb. Pure (no I/O), so
-    /// it is unit-testable without a file on disk.
+    /// Derive this disc's terminal Unit Keys from a parsed keydb. Pure (no I/O),
+    /// so it is unit-testable against an in-memory `KeyDb` without a file on
+    /// disk. Empty `Vec` = no key for this disc from this keydb.
     ///
-    /// Order = cheapest + most authoritative first: **UK ▸ VK ▸ MK ▸ DK**. The
-    /// UK is the final per-CPS-unit content key — zero derivation, directly
-    /// usable — so it is tried first; the VUK needs one derivation step, an MK
-    /// two, and the device-key pool the full MKB walk (AACS-1.0-only, slowest),
-    /// so it is the last-resort fallback. Trying the UK first is also what lets a
-    /// stale/wrong per-disc VUK be skipped in favour of a good UK in the SAME
-    /// entry (`decrypt_with` rejects the VUK; the loop falls through to the UK).
-    fn candidates_from(db: &KeyDb, inputs: &DiscInputs) -> Vec<Key> {
-        let mut out = Vec::new();
+    /// CPS-unit numbering: a returned [`UnitKey::idx`] is the POSITIONAL index
+    /// libfreemkv's `resolve_and_apply` turns into the canonical CPS-unit number
+    /// `idx + 1`. For the terminal per-disc unit-key path we therefore map the
+    /// keydb's stored CPS number `num` to `idx = num - 1`, so the committed
+    /// number is byte-identical to the keydb's `num` (and to what the OLD
+    /// `Key::Unit(entry.unit_keys)` path committed). For the VUK / MK paths the
+    /// boil primitive already yields 0-based positional indices, matching
+    /// `parse_unit_key_ro`'s `(i + 1)` after the resolver's `+ 1`.
+    fn unit_keys_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+        // Per-disc hit (most specific). find_disc normalizes the hash form. With
+        // no entry there is nothing this keydb can resolve for the disc — the
+        // OLD universal DK/PK/MK pools only ever completed through `mk_from_dk`,
+        // which has no in-tree integrator KCD and always errs, so they never
+        // produced a key for a real disc; mirror that with "nothing".
+        let Some(entry) = db.find_disc(ctx.disc_hash()) else {
+            return Vec::new();
+        };
 
-        // Per-disc hit (most specific). find_disc normalizes the hash form.
-        if let Some(entry) = db.find_disc(&inputs.disc_hash) {
-            // UK first — terminal content key, no derivation.
-            if !entry.unit_keys.is_empty() {
-                out.push(Key::Unit(entry.unit_keys.clone()));
-            }
-            // VK next — one step (decrypt Unit_Key_RO.inf).
-            if let Some(vuk) = entry.vuk {
-                out.push(Key::Volume(vuk));
-            }
-            // MK — two steps (derive the VUK, then the unit keys).
-            if let Some(mk) = entry.media_key {
-                out.push(Key::Media(vec![mk]));
-            }
+        // 1. Terminal Unit Keys — directly usable, no derivation. Preserve the
+        //    keydb's CPS numbering through the resolver's `+ 1` (idx = num - 1).
+        if !entry.unit_keys.is_empty() {
+            return entry
+                .unit_keys
+                .iter()
+                .map(|(num, key)| UnitKey {
+                    idx: num.saturating_sub(1),
+                    key: *key,
+                })
+                .collect();
         }
 
-        // Universal material — the library walks/brutes it against this disc's
-        // MKB and VID.
-        if !db.device_keys.is_empty() {
-            out.push(Key::Device(db.device_keys.clone()));
-        }
-        if !db.processing_keys.is_empty() {
-            out.push(Key::Processing(db.processing_keys.clone()));
+        // The disc's encrypted title keys (from Unit_Key_RO.inf) — what every
+        // VUK-or-deeper path decrypts into the terminal keys. Empty when the
+        // scan captured no Unit_Key_RO.inf, in which case nothing can derive.
+        let enc_title_keys = match ctx.enc_title_keys() {
+            Ok(k) => k,
+            Err(_) => return Vec::new(),
+        };
+
+        // 2. Per-disc VUK — one step, no VID needed (it directly decrypts the
+        //    encrypted title keys).
+        if let Some(vuk) = entry.vuk {
+            return uk_from_vuk(Vuk(vuk), enc_title_keys);
         }
 
-        // Media-key pool across every entry: an MK is MKB-scoped, so a sibling
-        // disc's MK may verify against this disc (the path-2.5 brute). Hand the
-        // whole pool; the library picks the one that verifies.
-        let mk_pool: Vec<[u8; 16]> = db.iter_disc_entries().filter_map(|e| e.media_key).collect();
-        if !mk_pool.is_empty() {
-            out.push(Key::Media(mk_pool));
-        }
+        // 3. Media Key path. Take the disc's stored MK, else derive one from the
+        //    device-key pool via `mk_from_dk` (the universal AACS-1.0 walk; it
+        //    needs the MKB and a VID, and has no in-tree integrator KCD so it
+        //    errs for real discs today — kept for faithfulness). EITHER way the
+        //    final `vuk_from_mk` needs a VID. The locked VID-per-path rule:
+        //    physical (unlocker) VID first, else the keydb entry's stored VID
+        //    (`I` field) for the ISO / non-physical path, else cannot derive.
+        let vid = ctx.vid().or_else(|| entry.disc_id.map(Vid));
 
-        out
+        let mk: Option<MediaKey> = if let Some(mk) = entry.media_key {
+            Some(MediaKey(mk))
+        } else if !db.device_keys.is_empty() {
+            let mkb = ctx.mkb().unwrap_or(&[]);
+            // mk_from_dk folds the VID into the variant walk; it needs the same
+            // VID the VUK step will use.
+            vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok())
+        } else {
+            None
+        };
+
+        let Some(mk) = mk else {
+            return Vec::new();
+        };
+        let Some(vid) = vid else {
+            // Locked VID-per-path rule: an MK with no VID from either source
+            // cannot derive a VUK — never guess.
+            return Vec::new();
+        };
+
+        uk_from_vuk(vuk_from_mk(mk, vid), enc_title_keys)
     }
 }
 
 impl KeySource for KeydbSource {
-    /// Expose the keydb's host certs through the trait — the OEM/AACS cert-auth
-    /// route collects them across every source via this method. Delegates to the
-    /// inherent [`KeydbSource::host_certs`] (same `| HC |`/`| HC2 |` rows parsed
-    /// by libfreemkv's keydb parser); no new parsing.
-    fn host_certs(&self) -> Vec<HostCert> {
-        KeydbSource::host_certs(self)
+    /// Resolve this disc's terminal Unit Keys from the keydb. A missing /
+    /// unreadable keydb is not an error — it simply yields no keys (another
+    /// source may have them), the same as the library's own loader.
+    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        match KeyDb::load(&self.path) {
+            Ok(db) => Ok(Self::unit_keys_from(&db, ctx)),
+            Err(_) => Ok(Vec::new()),
+        }
     }
 
-    /// The keydb can hand out a per-disc **terminal** `Key::Unit` (a UK entry
-    /// keyed on `disc_hash` alone — see `candidates_from`). Unlike a derived key
-    /// (Device/Processing/Media/Volume), a terminal UK is applied as-is by
-    /// `Disc::decrypt_with`: it is NOT re-derived through the MKB-verified AACS
-    /// resolver, so a UK entry whose hash matches the disc but whose key bytes
-    /// are wrong would commit and mux undecryptable video as "success". The only
-    /// thing that disproves a wrong UK is descrambling real ciphertext, so this
-    /// source requires content samples — without them `decrypt_with` skips
-    /// validation and the wrong UK is taken. Returning `true` makes every
-    /// consumer (autorip resume/mux-worker AND the CLI) sample units before
-    /// resolving, so a keydb UK is ciphertext-validated on every path.
-    fn needs_samples(&self) -> bool {
-        true
+    /// Expose the keydb's host certs through the trait — the OEM/AACS cert-auth
+    /// route collects them across every source via this method. Wires the disc's
+    /// MKB generation through for revocation filtering (the keydb parser's
+    /// `; Revoked in MKBv<N>` annotation): a cert revoked at generation `R` is
+    /// withheld once the disc's generation reaches `R`.
+    fn host_certs(&self, mkb: Option<u32>) -> Vec<HostCert> {
+        match KeyDb::load(&self.path) {
+            Ok(db) => db.host_certs(mkb),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn label(&self) -> &'static str {
         "keydb"
-    }
-
-    fn next_key(&mut self, inputs: &DiscInputs) -> Option<Key> {
-        // On the first ask, parse the keydb once and build the ordered candidate
-        // list; later asks just advance the cursor. A missing/unreadable keydb
-        // is not an error — it simply yields no candidates (another source may
-        // have the key), the same as the library's own loader.
-        if self.cursor.is_none() {
-            let cands = match KeyDb::load(&self.path) {
-                Ok(db) => Self::candidates_from(&db, inputs),
-                Err(_) => Vec::new(),
-            };
-            self.cursor = Some(cands.into_iter());
-        }
-        self.cursor.as_mut().and_then(Iterator::next)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libfreemkv::aacs::{DeviceKey, DiscEntry};
+    use crate::keydb_format::DiscEntry;
+    use libfreemkv::aacs::{DeviceKey, derive_vuk};
     use std::collections::HashMap;
 
-    fn inputs(hash: &str) -> DiscInputs {
-        DiscInputs {
+    // ── A test ResolveCtx, so get_uk's path selection can be exercised without
+    //    a real Disc. Each accessor returns exactly what a case needs. ──────────
+    struct MockCtx {
+        disc_hash: String,
+        vid: Option<Vid>,
+        mkb: Vec<u8>,
+        enc_title_keys: Vec<[u8; 16]>,
+    }
+    impl ResolveCtx for MockCtx {
+        fn disc_hash(&self) -> &str {
+            &self.disc_hash
+        }
+        fn title(&self) -> Option<&str> {
+            None
+        }
+        fn vid(&self) -> Option<Vid> {
+            self.vid
+        }
+        fn mkb(&self) -> Result<&[u8], Error> {
+            Ok(&self.mkb)
+        }
+        fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+            Ok(&self.enc_title_keys)
+        }
+        fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn ctx(hash: &str, enc: Vec<[u8; 16]>, vid: Option<Vid>) -> MockCtx {
+        MockCtx {
             disc_hash: hash.into(),
-            volume_id: [0u8; 16],
+            vid,
             mkb: Vec::new(),
-            unit_key_ro: Vec::new(),
-            samples: Vec::new(),
-            volume_label: None,
+            enc_title_keys: enc,
         }
     }
 
@@ -167,124 +221,227 @@ mod tests {
         }
     }
 
-    fn entry_with_vuk(hash: &str, vuk: [u8; 16]) -> DiscEntry {
+    fn blank_entry(hash: &str) -> DiscEntry {
         DiscEntry {
             disc_hash: hash.into(),
             title: String::new(),
             media_key: None,
             disc_id: None,
-            vuk: Some(vuk),
+            vuk: None,
             unit_keys: Vec::new(),
+            mkb_version: None,
+            volume_size: None,
+            is_uhd: false,
         }
     }
 
-    #[test]
-    fn per_disc_vuk_ranks_before_device_pool() {
+    fn db_with(entry: DiscEntry, device_keys: Vec<DeviceKey>) -> KeyDb {
         let mut entries = HashMap::new();
-        entries.insert("0xaabb".into(), entry_with_vuk("0xaabb", [0x11u8; 16]));
-        let db = KeyDb {
-            device_keys: vec![dk()],
+        entries.insert(entry.disc_hash.clone(), entry);
+        KeyDb {
+            device_keys,
             processing_keys: Vec::new(),
             host_certs: Vec::new(),
             disc_entries: entries,
-        };
+        }
+    }
 
-        let cands = KeydbSource::candidates_from(&db, &inputs("0xaabb"));
-        assert!(
-            matches!(cands.first(), Some(Key::Volume(v)) if *v == [0x11u8; 16]),
-            "the disc's own VUK must be the first (most specific) candidate"
-        );
-        assert!(
-            cands.iter().any(|k| matches!(k, Key::Device(_))),
-            "the universal device-key pool is still offered as a fallback"
+    /// The committed `(cps, key)` pairs libfreemkv's `resolve_and_apply` derives
+    /// from a source's Unit Keys: positional `idx` → canonical CPS number
+    /// `idx + 1`. The KATs compare against THIS to prove byte-identical parity
+    /// with the OLD `Key::Unit` / resolver-derived commit.
+    fn committed(uks: &[UnitKey]) -> Vec<(u32, [u8; 16])> {
+        uks.iter()
+            .map(|u| (u.idx.saturating_add(1), u.key))
+            .collect()
+    }
+
+    const HASH: &str = "0xaabb";
+
+    // ── KAT (a): disc with terminal Unit Keys ─────────────────────────────────
+    /// A hash hit carrying terminal unit keys is returned as-is — the committed
+    /// `(cps, key)` pairs are byte-identical to the keydb's stored numbering,
+    /// exactly what the OLD `Key::Unit(entry.unit_keys)` path committed.
+    #[test]
+    fn kat_a_disc_with_unit_keys_is_terminal_and_preserves_cps_numbering() {
+        let mut e = blank_entry(HASH);
+        e.unit_keys = vec![(1, [0xA0u8; 16]), (2, [0xB1u8; 16])];
+        // Even with a VUK present, the terminal UK must win (cheapest path).
+        e.vuk = Some([0x11u8; 16]);
+        let db = db_with(e, Vec::new());
+
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, Vec::new(), None));
+        assert_eq!(
+            committed(&got),
+            vec![(1u32, [0xA0u8; 16]), (2u32, [0xB1u8; 16])],
+            "terminal keydb unit keys must commit byte-identically to the stored (cps, key) pairs"
         );
     }
 
+    // ── KAT (b): disc with VUK ────────────────────────────────────────────────
+    /// A hash hit with only a VUK derives the terminal keys via `uk_from_vuk`
+    /// over the disc's encrypted title keys — byte-identical to the OLD
+    /// `Key::Volume(vuk)` → resolver path (which called the same primitive).
     #[test]
-    fn per_disc_uk_ranks_before_vuk() {
-        // An entry with BOTH a UK and a VUK (the dual-key shape) must hand the
-        // terminal UK out first, so a stale/wrong VUK never pre-empts a good UK.
-        let mut entries = HashMap::new();
-        let mut e = entry_with_vuk("0xaabb", [0x11u8; 16]);
-        e.unit_keys = vec![(1, [0x22u8; 16])];
-        entries.insert("0xaabb".into(), e);
+    fn kat_b_disc_with_vuk_derives_via_uk_from_vuk() {
+        let vuk = [0x5Au8; 16];
+        // Two encrypted title keys (arbitrary ciphertext; both sides decrypt the
+        // SAME bytes, which is the parity claim).
+        let enc = vec![[0x31u8; 16], [0xCDu8; 16]];
+
+        let mut e = blank_entry(HASH);
+        e.vuk = Some(vuk);
+        let db = db_with(e, Vec::new());
+
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), None));
+        // Reference: the boil primitive directly — the OLD derivation.
+        let expect = uk_from_vuk(Vuk(vuk), &enc);
+        assert_eq!(
+            got, expect,
+            "VUK path must equal uk_from_vuk(vuk, enc_title_keys)"
+        );
+        // And the committed numbering is 1-based positional.
+        assert_eq!(
+            committed(&got).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    // ── KAT (c): disc with MK + physical (unlock) VID ─────────────────────────
+    /// A hash hit with a Media Key and a physical VID (from the unlocker) derives
+    /// `MK → VUK → UK`. The PHYSICAL VID must be used in preference to the keydb's
+    /// stored VID — proven by giving the entry a DIFFERENT stored VID and showing
+    /// the result tracks the physical one.
+    #[test]
+    fn kat_c_disc_with_mk_uses_physical_vid_over_keydb_vid() {
+        let mk = [0x77u8; 16];
+        let vid_phys = [0x42u8; 16];
+        let vid_keydb = [0x99u8; 16]; // deliberately different — must NOT be used
+        let enc = vec![[0x10u8; 16]];
+
+        let mut e = blank_entry(HASH);
+        e.media_key = Some(mk);
+        e.disc_id = Some(vid_keydb);
+        let db = db_with(e, Vec::new());
+
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), Some(Vid(vid_phys))));
+        // Reference uses the PHYSICAL VID.
+        let expect = uk_from_vuk(vuk_from_mk(MediaKey(mk), Vid(vid_phys)), &enc);
+        assert_eq!(got, expect, "MK path must use the physical (unlock) VID");
+        // Sanity: it must NOT match the keydb-VID derivation (different VID →
+        // different VUK → different keys), proving the right VID was selected.
+        let wrong = uk_from_vuk(vuk_from_mk(MediaKey(mk), Vid(vid_keydb)), &enc);
+        assert_ne!(
+            got, wrong,
+            "must not derive with the keydb VID when a physical VID exists"
+        );
+    }
+
+    // ── KAT (d): disc with MK + keydb VID (ISO path, no physical VID) ──────────
+    /// A hash hit with a Media Key but NO physical VID falls back to the keydb
+    /// entry's stored VID (`disc_id`, the `I` field) — the non-physical / ISO
+    /// path — and derives `MK → VUK → UK` against it.
+    #[test]
+    fn kat_d_disc_with_mk_falls_back_to_keydb_vid() {
+        let mk = [0x77u8; 16];
+        let vid_keydb = [0x99u8; 16];
+        let enc = vec![[0x10u8; 16], [0x20u8; 16]];
+
+        let mut e = blank_entry(HASH);
+        e.media_key = Some(mk);
+        e.disc_id = Some(vid_keydb);
+        let db = db_with(e, Vec::new());
+
+        // ctx.vid() == None → ISO path.
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), None));
+        let expect = uk_from_vuk(vuk_from_mk(MediaKey(mk), Vid(vid_keydb)), &enc);
+        assert_eq!(
+            got, expect,
+            "MK path must use the keydb VID when no physical VID is present"
+        );
+    }
+
+    // ── KAT (e): disc with MK + NO VID anywhere → empty ───────────────────────
+    /// A hash hit with a Media Key but neither a physical VID nor a stored keydb
+    /// VID cannot derive a VUK — the locked VID-per-path rule. It must return
+    /// EMPTY, never a guessed/zero-VID key (wrong-keys safety).
+    #[test]
+    fn kat_e_disc_with_mk_no_vid_returns_empty() {
+        let mut e = blank_entry(HASH);
+        e.media_key = Some([0x77u8; 16]);
+        e.disc_id = None; // no keydb VID
+        let db = db_with(e, Vec::new());
+
+        // ctx.vid() == None and no keydb VID → cannot derive.
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, vec![[0x10u8; 16]], None));
+        assert!(
+            got.is_empty(),
+            "MK with no VID source must yield no keys, never a guess"
+        );
+    }
+
+    /// `vuk_from_mk` anchor: the VUK the MK path derives equals the library's own
+    /// `derive_vuk(mk, vid)` (the pre-boil primitive) — pinning that the boil
+    /// chain this source drives is the audited math, not a re-implementation.
+    #[test]
+    fn mk_path_vuk_matches_library_derive_vuk() {
+        let mk = [0x3Cu8; 16];
+        let vid = [0xA5u8; 16];
+        assert_eq!(vuk_from_mk(MediaKey(mk), Vid(vid)).0, derive_vuk(&mk, &vid));
+    }
+
+    /// No per-disc entry → no key, even with a universal device-key pool present
+    /// (the pool only completes through `mk_from_dk`, which has no in-tree KCD
+    /// and errs, so it never produced a key for a real disc — mirrored here).
+    #[test]
+    fn no_disc_hit_yields_no_key() {
+        let db = db_with(blank_entry("0xother"), vec![dk()]);
+        let got =
+            KeydbSource::unit_keys_from(&db, &ctx(HASH, vec![[0x10u8; 16]], Some(Vid([1u8; 16]))));
+        assert!(
+            got.is_empty(),
+            "a hash miss resolves nothing from the keydb"
+        );
+    }
+
+    /// Empty keydb resolves nothing.
+    #[test]
+    fn empty_keydb_yields_no_key() {
         let db = KeyDb {
             device_keys: Vec::new(),
             processing_keys: Vec::new(),
             host_certs: Vec::new(),
-            disc_entries: entries,
-        };
-
-        let cands = KeydbSource::candidates_from(&db, &inputs("0xaabb"));
-        assert!(
-            matches!(cands.first(), Some(Key::Unit(_))),
-            "the terminal UK must be the first candidate"
-        );
-        assert!(
-            matches!(cands.get(1), Some(Key::Volume(v)) if *v == [0x11u8; 16]),
-            "the VUK follows the UK"
-        );
-    }
-
-    #[test]
-    fn no_disc_hit_offers_only_universal_material() {
-        let db = KeyDb {
-            device_keys: vec![dk()],
-            processing_keys: Vec::new(),
-            host_certs: Vec::new(),
             disc_entries: HashMap::new(),
         };
-        // A disc with no per-disc entry: no Volume/Unit candidate, just the pool.
-        let cands = KeydbSource::candidates_from(&db, &inputs("0xdeadbeef"));
-        assert!(cands.iter().all(|k| matches!(k, Key::Device(_))));
-        assert_eq!(cands.len(), 1);
+        assert!(KeydbSource::unit_keys_from(&db, &ctx(HASH, Vec::new(), None)).is_empty());
     }
 
+    /// A missing keydb file is silent (Ok empty), never an error.
     #[test]
-    fn empty_keydb_offers_nothing() {
-        let db = KeyDb {
-            device_keys: Vec::new(),
-            processing_keys: Vec::new(),
-            host_certs: Vec::new(),
-            disc_entries: HashMap::new(),
-        };
-        assert!(KeydbSource::candidates_from(&db, &inputs("0xaabb")).is_empty());
-    }
-
-    /// Regression: a keydb can hand out a per-disc terminal `Key::Unit` that
-    /// `Disc::decrypt_with` applies WITHOUT re-deriving through the MKB-verified
-    /// AACS resolver. The only thing that disproves a wrong UK is descrambling
-    /// ciphertext, so the source MUST request content samples — otherwise the
-    /// autorip resume/mux-worker path (which only samples when some source
-    /// reports `needs_samples()`) resolves with empty samples and commits a
-    /// wrong UK as success. Was `false` (inherited default); must be `true`.
-    #[test]
-    fn keydb_source_needs_samples() {
+    fn get_uk_missing_keydb_is_ok_empty() {
         let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
-        assert!(
-            src.needs_samples(),
-            "keydb emits terminal Key::Unit entries that need ciphertext validation"
-        );
+        let got = src
+            .get_uk(&ctx(HASH, Vec::new(), None))
+            .expect("missing keydb is not an error");
+        assert!(got.is_empty());
     }
 
-    /// No keydb (or a LibreDrive deployment) → no host credentials, not an
-    /// error. (The positive parse is NOT tested here — it would require host
-    /// key material, which must never appear in code.)
+    #[test]
+    fn label_is_keydb() {
+        assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
+    }
+
+    /// No keydb → no host credentials, not an error (inherent and trait forms).
     #[test]
     fn host_certs_empty_when_keydb_missing() {
-        assert!(
-            KeydbSource::new("/nonexistent/path/keydb.cfg")
-                .host_certs()
-                .is_empty()
-        );
+        let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
+        assert!(src.host_certs().is_empty());
+        assert!(KeySource::host_certs(&src, None).is_empty());
+        assert!(KeySource::host_certs(&src, Some(68)).is_empty());
     }
 
-    /// The KeySource TRAIT method exposes the keydb's host cert(s) — this is the
-    /// path the OEM/AACS cert-auth route collects certs through. A keydb with a
-    /// `| HC |` row must surface a HostCert via `KeySource::host_certs`, so the
-    /// handshake (which iterates `opts.key_sources[..].host_certs()`) finds it.
-    /// Placeholder all-zero material (never a real key) — same convention as
-    /// libfreemkv's own `parse_host_cert` test.
+    /// The TRAIT `host_certs` surfaces a `| HC |` row and now wires the MKB
+    /// generation through. Placeholder all-zero material (never a real key).
     #[test]
     fn trait_host_certs_returns_keydb_hc_row() {
         let dir = std::env::temp_dir().join(format!("fmk_hc_{}", std::process::id()));
@@ -298,20 +455,11 @@ mod tests {
         std::fs::write(&path, line).unwrap();
 
         let src = KeydbSource::new(&path);
-        // Consult through the TRAIT, exactly as the OEM route does.
-        let certs = KeySource::host_certs(&src);
+        // A cert with no revocation annotation is returned for ANY mkb arg.
+        let certs = KeySource::host_certs(&src, Some(70));
         assert_eq!(certs.len(), 1, "trait host_certs must surface the HC row");
         assert_eq!(certs[0].certificate.len(), 92);
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Zero certs from a (missing) keydb through the TRAIT method — the OEM route
-    /// sees an empty vec here and, with no other source supplying a cert, fails
-    /// gracefully with `AacsNoHostCert` rather than panicking.
-    #[test]
-    fn trait_host_certs_empty_when_keydb_missing() {
-        let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
-        assert!(KeySource::host_certs(&src).is_empty());
     }
 }
