@@ -2,19 +2,27 @@
 //!
 //! Parses a local `keydb.cfg`, looks the disc up by hash, and derives the
 //! disc's terminal **Unit Keys** itself by driving libfreemkv's boil-down
-//! primitives ([`uk_from_vuk`] / [`vuk_from_mk`] / [`mk_from_dk`]) — never
-//! re-implementing AES. The path it picks mirrors the OLD candidate order
-//! (which libfreemkv's resolver used to walk) EXACTLY, cheapest-first:
+//! primitives ([`uk_from_vuk`] / [`vuk_from_mk`] / [`mk_from_pk`] /
+//! [`mk_from_dk`]) — never re-implementing AES. The path it picks mirrors the
+//! OLD candidate order (which libfreemkv's resolver used to walk) EXACTLY,
+//! cheapest-first:
 //!
 //! 1. per-disc **Unit Keys** (hash hit)  → returned terminal, no derivation.
 //! 2. per-disc **VUK** (hash hit)        → [`uk_from_vuk`] over the disc's
 //!    encrypted title keys.
-//! 3. per-disc **Media Key** (hash hit), or one derived from the device-key
-//!    pool via [`mk_from_dk`] → needs a VID. The VID is the unlocker's physical
-//!    VID ([`ResolveCtx::vid`]) when present, else the keydb entry's OWN stored
-//!    VID (the `I` field, `disc_id`) for the non-physical / ISO path. With no
-//!    VID from either source the MK path cannot complete — return nothing. Then
-//!    [`vuk_from_mk`] → [`uk_from_vuk`].
+//! 3. a **Media Key**, then [`vuk_from_mk`] → [`uk_from_vuk`]. The MK comes
+//!    from, in order: the disc's stored MK (hash hit); the keydb's
+//!    **Processing Key** pool walked against THIS disc's MKB via [`mk_from_pk`];
+//!    or the device-key pool via [`mk_from_dk`]. The PK and DK pools resolve the
+//!    Media Key WITHOUT a VID; the final [`vuk_from_mk`] still needs one. The
+//!    VID is the unlocker's physical VID ([`ResolveCtx::vid`]) when present, else
+//!    the keydb entry's OWN stored VID (the `I` field, `disc_id`) for the
+//!    non-physical / ISO path. With no VID from either source the MK path cannot
+//!    complete — return nothing.
+//!
+//! The cross-disc MK-pool brute (trying OTHER discs' stored media keys against
+//! this disc) stays RETIRED: every MK path here is anchored to the matched
+//! disc's own MKB or stored material.
 //!
 //! The library still OWNS the crypto; this source owns only which primitive to
 //! call with which material. Returning an empty `Vec` is a genuine "no key for
@@ -23,7 +31,7 @@
 use std::path::PathBuf;
 
 use libfreemkv::aacs::{
-    HostCert, MediaKey, UnitKey, Vid, Vuk, mk_from_dk, uk_from_vuk, vuk_from_mk,
+    HostCert, MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk,
 };
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
@@ -70,11 +78,13 @@ impl KeydbSource {
     /// boil primitive already yields 0-based positional indices, matching
     /// `parse_unit_key_ro`'s `(i + 1)` after the resolver's `+ 1`.
     fn unit_keys_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
-        // Per-disc hit (most specific). find_disc normalizes the hash form. With
-        // no entry there is nothing this keydb can resolve for the disc — the
-        // OLD universal DK/PK/MK pools only ever completed through `mk_from_dk`,
-        // which has no in-tree integrator KCD and always errs, so they never
-        // produced a key for a real disc; mirror that with "nothing".
+        // Per-disc hit (most specific). find_disc normalizes the hash form.
+        // Without a matched entry this keydb has no per-disc material (Unit Keys
+        // / VUK / Media Key / stored VID) to anchor a derivation for the disc, so
+        // it resolves nothing. (The PK and DK pools are global, but the
+        // cross-disc MK-pool brute — trying OTHER discs' media keys against this
+        // disc — stays retired; a PK/DK pool only ever resolves a disc reached
+        // through its own matched entry below.)
         let Some(entry) = db.find_disc(ctx.disc_hash()) else {
             return Vec::new();
         };
@@ -106,25 +116,31 @@ impl KeydbSource {
             return uk_from_vuk(Vuk(vuk), enc_title_keys);
         }
 
-        // 3. Media Key path. Take the disc's stored MK, else derive one from the
-        //    device-key pool via `mk_from_dk` (the universal AACS-1.0 walk; it
-        //    needs the MKB and a VID, and has no in-tree integrator KCD so it
-        //    errs for real discs today — kept for faithfulness). EITHER way the
-        //    final `vuk_from_mk` needs a VID. The locked VID-per-path rule:
-        //    physical (unlocker) VID first, else the keydb entry's stored VID
-        //    (`I` field) for the ISO / non-physical path, else cannot derive.
+        // 3. Media Key path. Resolve a Media Key for THIS disc, then derive the
+        //    VUK + Unit Keys from it. Source order, cheapest-first:
+        //      a. the disc's stored MK (hash hit) — already the Media Key.
+        //      b. the keydb's Processing Key pool walked against this disc's MKB
+        //         via `mk_from_pk` (Subset-Difference cvalue walk; no VID). This
+        //         is the restored PK path — a leaked/precomputed PK resolves the
+        //         Media Key directly for real discs.
+        //      c. the device-key pool via `mk_from_dk` (the AACS-1.0 variant
+        //         walk; needs the MKB and a VID, and has no in-tree integrator
+        //         KCD so it errs for real discs today — kept for faithfulness).
+        //    The MK itself (a/b) carries no VID, but the final `vuk_from_mk`
+        //    needs one. Locked VID-per-path rule: physical (unlocker) VID first,
+        //    else the keydb entry's stored VID (`I` field) for the ISO /
+        //    non-physical path, else cannot derive.
         let vid = ctx.vid().or_else(|| entry.disc_id.map(Vid));
+        let mkb = ctx.mkb().unwrap_or(&[]);
 
-        let mk: Option<MediaKey> = if let Some(mk) = entry.media_key {
-            Some(MediaKey(mk))
-        } else if !db.device_keys.is_empty() {
-            let mkb = ctx.mkb().unwrap_or(&[]);
-            // mk_from_dk folds the VID into the variant walk; it needs the same
-            // VID the VUK step will use.
-            vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok())
-        } else {
-            None
-        };
+        let mk: Option<MediaKey> = entry
+            .media_key
+            .map(MediaKey)
+            // PK pool: validated against this disc's own MKB, no VID needed here.
+            .or_else(|| mk_from_pk(&db.processing_keys, mkb).ok())
+            // DK pool: mk_from_dk folds the VID into the variant walk; it needs
+            // the same VID the VUK step will use.
+            .or_else(|| vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok()));
 
         let Some(mk) = mk else {
             return Vec::new();
@@ -380,6 +396,124 @@ mod tests {
         );
     }
 
+    /// Build a 4-byte MKB record header (type + 3-byte big-endian total length,
+    /// header included) and append `body`. No crypto — just the record framing
+    /// libfreemkv's MKB parser expects.
+    fn mkb_record(rec_type: u8, body: &[u8]) -> Vec<u8> {
+        let total = 4 + body.len();
+        let mut rec = vec![
+            rec_type,
+            ((total >> 16) & 0xFF) as u8,
+            ((total >> 8) & 0xFF) as u8,
+            (total & 0xFF) as u8,
+        ];
+        rec.extend_from_slice(body);
+        rec
+    }
+
+    // ── KAT (f): disc with NO per-disc MK, resolved via the keydb PK pool ──────
+    /// Owner decision #1 (AACS): a keydb Processing Key must be walked against
+    /// the matched disc's own MKB to recover the Media Key, then driven down the
+    /// full chain `PK → MK → VUK → UK`. The disc entry carries NO stored MK/VUK/
+    /// UK — the only key material is a global `PK` row — and the result must be
+    /// the real Unit Keys, byte-identical to deriving from the recovered MK.
+    ///
+    /// The MKB + PK use a known-answer construction (a planted PK whose derived
+    /// MK satisfies the synthetic verify record); the constants are precomputed
+    /// AES vectors so this crate needs no AES primitive of its own. They mirror
+    /// libfreemkv's `boil::mk_from_pk_drives_full_chain_to_uks` KAT.
+    #[test]
+    fn kat_f_disc_with_pk_pool_yields_uks() {
+        // Planted PK and the MK it resolves to (see libfreemkv boil.rs KAT).
+        let pk: [u8; 16] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ];
+        let mk: [u8; 16] = [
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD,
+            0xAE, 0xAF,
+        ];
+        // cvalue = AES-E(pk, mk_raw); verify = AES-E(mk, magic||pad); SD uv.
+        let cv: [u8; 16] = [
+            0x72, 0x23, 0x96, 0x80, 0xB5, 0xC5, 0x2B, 0x9D, 0x63, 0xE9, 0xEC, 0x92, 0xCF, 0xAF,
+            0xDE, 0x1B,
+        ];
+        let mk_dv: [u8; 16] = [
+            0x05, 0xA7, 0x4C, 0xC9, 0xD0, 0x2E, 0x9F, 0x4B, 0x42, 0xDF, 0x2C, 0x0A, 0xAD, 0x79,
+            0x58, 0xF4,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+
+        // Synthetic MKB: type/version (0x10), verify (0x86), one-entry SD index
+        // (0x04 = [u_mask_shift=0][uv]), one-entry cvalue table (0x05).
+        let mut sd = vec![0u8];
+        sd.extend_from_slice(&uv);
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&mkb_record(0x86, &mk_dv));
+        mkb.extend_from_slice(&mkb_record(0x04, &sd));
+        mkb.extend_from_slice(&mkb_record(0x05, &cv));
+
+        // Disc entry with NO stored MK/VUK/UK — only the global PK pool can resolve.
+        let e = blank_entry(HASH);
+        let mut db = db_with(e, Vec::new());
+        db.processing_keys = vec![pk];
+
+        let enc = vec![[0x10u8; 16], [0x20u8; 16]];
+        let vid_phys = [0x42u8; 16];
+        let ctx = MockCtx {
+            disc_hash: HASH.into(),
+            vid: Some(Vid(vid_phys)),
+            mkb,
+            enc_title_keys: enc.clone(),
+        };
+
+        let got = KeydbSource::unit_keys_from(&db, &ctx);
+        assert!(!got.is_empty(), "PK pool must yield Unit Keys for the disc");
+        // Byte-identical to deriving from the recovered MK via the public chain.
+        let expect = uk_from_vuk(vuk_from_mk(MediaKey(mk), Vid(vid_phys)), &enc);
+        assert_eq!(
+            got, expect,
+            "PK path must equal MK → VUK → UK from the recovered Media Key"
+        );
+    }
+
+    /// A PK pool that does NOT resolve the disc's MKB yields nothing — never a
+    /// wrong key. (Same MKB as KAT (f) but a corrupt PK.)
+    #[test]
+    fn pk_pool_that_does_not_validate_yields_no_key() {
+        let mk_dv: [u8; 16] = [
+            0x05, 0xA7, 0x4C, 0xC9, 0xD0, 0x2E, 0x9F, 0x4B, 0x42, 0xDF, 0x2C, 0x0A, 0xAD, 0x79,
+            0x58, 0xF4,
+        ];
+        let cv: [u8; 16] = [
+            0x72, 0x23, 0x96, 0x80, 0xB5, 0xC5, 0x2B, 0x9D, 0x63, 0xE9, 0xEC, 0x92, 0xCF, 0xAF,
+            0xDE, 0x1B,
+        ];
+        let uv: [u8; 4] = [0x00, 0x00, 0x04, 0x00];
+        let mut sd = vec![0u8];
+        sd.extend_from_slice(&uv);
+        let mut mkb = Vec::new();
+        mkb.extend_from_slice(&mkb_record(0x10, &[0, 0, 0, 0x20, 0, 0, 0, 0x52]));
+        mkb.extend_from_slice(&mkb_record(0x86, &mk_dv));
+        mkb.extend_from_slice(&mkb_record(0x04, &sd));
+        mkb.extend_from_slice(&mkb_record(0x05, &cv));
+
+        let mut db = db_with(blank_entry(HASH), Vec::new());
+        db.processing_keys = vec![[0x00u8; 16]]; // does not validate
+
+        let ctx = MockCtx {
+            disc_hash: HASH.into(),
+            vid: Some(Vid([0x42u8; 16])),
+            mkb,
+            enc_title_keys: vec![[0x10u8; 16]],
+        };
+        assert!(
+            KeydbSource::unit_keys_from(&db, &ctx).is_empty(),
+            "a non-validating PK pool must resolve nothing, never a wrong key"
+        );
+    }
+
     /// `vuk_from_mk` anchor: the VUK the MK path derives equals the library's own
     /// `derive_vuk(mk, vid)` (the pre-boil primitive) — pinning that the boil
     /// chain this source drives is the audited math, not a re-implementation.
@@ -390,9 +524,9 @@ mod tests {
         assert_eq!(vuk_from_mk(MediaKey(mk), Vid(vid)).0, derive_vuk(&mk, &vid));
     }
 
-    /// No per-disc entry → no key, even with a universal device-key pool present
-    /// (the pool only completes through `mk_from_dk`, which has no in-tree KCD
-    /// and errs, so it never produced a key for a real disc — mirrored here).
+    /// No per-disc entry → no key, even with a universal device-key pool present.
+    /// Without a matched entry there is no per-disc anchor, so the global pools
+    /// are never consulted (the cross-disc MK-pool brute stays retired).
     #[test]
     fn no_disc_hit_yields_no_key() {
         let db = db_with(blank_entry("0xother"), vec![dk()]);

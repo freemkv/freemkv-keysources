@@ -38,7 +38,7 @@ pub use libfreemkv::{DiscInputs, KeySource};
 /// An ordered composition of key sources, driven as one. [`MultiSource::get_uk`]
 /// tries each inner source in order and returns the first non-empty Unit Key
 /// set. **The caller supplies the list AND the order** — local-first `[Keydb,
-/// Online]`, online-first `[Online, Keydb]`, resume `[Mapfile, Keydb]`, etc. —
+/// Online]`, online-first `[Online, Keydb]`, etc. —
 /// so the "which sources, in what order" policy lives entirely with the
 /// application, not the library. `MultiSource` is itself a [`KeySource`], so it
 /// nests and composes.
