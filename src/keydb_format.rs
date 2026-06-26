@@ -231,6 +231,13 @@ impl KeyDb {
                     if let Some(hc) = db.host_certs.last_mut() {
                         hc.cert.private_key_v2 = Some(pk);
                         hc.cert.certificate_v2 = Some(cert);
+                        // The `; Revoked in MKBv<N>` annotation can live on the
+                        // HC2 line rather than the preceding HC line; carry it
+                        // onto the combined cert if the HC line had none, so the
+                        // revocation isn't silently dropped.
+                        if hc.revoked_at_mkb.is_none() {
+                            hc.revoked_at_mkb = revoked_at_mkb;
+                        }
                     } else {
                         db.host_certs.push(KeydbHostCert {
                             cert: HostCert {
@@ -278,7 +285,9 @@ impl KeyDb {
     /// check the parsed contents.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         // Stat-and-cap before reading so a hostile/corrupt file can't force an
-        // unbounded allocation. A file at or over the cap is rejected outright.
+        // unbounded allocation. A file strictly over the cap is rejected (a
+        // file exactly at MAX_KEYDB_BYTES is accepted, matching the `>` guard
+        // and libfreemkv's original at-cap-is-allowed semantics).
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > MAX_KEYDB_BYTES {
                 return Err(std::io::Error::new(
@@ -301,7 +310,10 @@ impl KeyDb {
             .to_lowercase()
             .trim_start_matches("0x")
             .to_string();
-        // Try with 0x prefix and without
+        // Try with 0x prefix and without. parse_disc_entry only stores keys
+        // from lines that began with "0x", so every stored key carries the
+        // prefix and the no-prefix fallback is currently unreachable; it is
+        // retained as a defensive match for the prefix-agnostic lookup contract.
         self.disc_entries
             .get(&format!("0x{hash}"))
             .or_else(|| self.disc_entries.get(&hash))
@@ -315,6 +327,9 @@ impl KeyDb {
             .to_lowercase()
             .trim_start_matches("0x")
             .to_string();
+        // The no-prefix fallback below is currently unreachable (every stored
+        // key carries the "0x" prefix, see find_vuk); kept as a defensive
+        // match for the prefix-agnostic lookup contract.
         self.disc_entries
             .get(&format!("0x{hash}"))
             .or_else(|| self.disc_entries.get(&hash))
@@ -1098,6 +1113,32 @@ mod tests {
         assert_eq!(db.host_certs(Some(99)).len(), 1);
         assert_eq!(db.host_certs(Some(1)).len(), 1);
         assert_eq!(db.host_certs(None).len(), 1);
+    }
+
+    #[test]
+    fn hc2_revocation_propagates_when_hc_has_none() {
+        // The HC line carries no annotation; the revocation lives on the HC2
+        // line. The combined cert must still be filtered by that generation
+        // rather than being treated as never-revoked.
+        let cfg = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n| HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{} ; Revoked in MKBv72\n",
+            "00".repeat(20),
+            "00".repeat(92),
+            "00".repeat(32),
+            "00".repeat(132),
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 1, "HC2 augments the preceding HC");
+        assert_eq!(db.host_certs[0].revoked_at_mkb, Some(72));
+        assert!(
+            db.host_certs(Some(72)).is_empty(),
+            "combined cert revoked in MKBv72 must be excluded at gen 72"
+        );
+        assert_eq!(
+            db.host_certs(Some(71)).len(),
+            1,
+            "still usable below gen 72"
+        );
     }
 
     // ── Standalone accessors: get_vid / get_uk / get_uks ────────────────────

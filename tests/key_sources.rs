@@ -234,6 +234,8 @@ fn online_source_metadata() {
 fn validate_keyserver_url_gates_scheme_and_ssrf() {
     assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
     assert!(validate_keyserver_url("http://127.0.0.1/keys").is_err());
+    // SSRF blocking is IP-based, not scheme-gated: https://<private-IP> is rejected too.
+    assert!(validate_keyserver_url("https://127.0.0.1/keys").is_err());
     assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data/").is_err());
     assert!(validate_keyserver_url("http://[::1]:9000/keys").is_err());
     assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
