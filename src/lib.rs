@@ -25,7 +25,7 @@ mod keydb_format;
 mod online;
 mod paths;
 
-pub use keydb::KeydbSource;
+pub use keydb::{KeydbSource, UpdateResult};
 pub use online::{OnlineSource, validate_keyserver_url};
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 

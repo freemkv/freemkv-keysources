@@ -2,6 +2,11 @@
 
 ## [1.1.0-beta.1] — UNRELEASED
 
+### Added
+
+- `KeydbSource` now owns keydb save + update (atomic write to the source's own
+  path); honors the caller-supplied location.
+
 ### Fixed
 
 - **Processing-Key decryption restored.** A keydb Processing Key is again driven
