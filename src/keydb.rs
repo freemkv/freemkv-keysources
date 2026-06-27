@@ -28,7 +28,8 @@
 //! call with which material. Returning an empty `Vec` is a genuine "no key for
 //! this disc here".
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use libfreemkv::aacs::{
     HostCert, MediaKey, UnitKey, Vid, Vuk, mk_from_dk, mk_from_pk, uk_from_vuk, vuk_from_mk,
@@ -37,6 +38,19 @@ use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
 
 use crate::keydb_format::KeyDb;
+
+/// Upper bound on decompressed keydb size. The published keydb is a few MiB;
+/// 64 MiB is a generous ceiling that still caps a decompression bomb (a tiny
+/// zip/gz can otherwise inflate to GiB and OOM the daily refresh thread).
+const MAX_KEYDB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Result of a KEYDB save/update -- path written, entry count, and byte size.
+#[derive(Debug)]
+pub struct UpdateResult {
+    pub path: PathBuf,
+    pub entries: usize,
+    pub bytes: usize,
+}
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 pub struct KeydbSource {
@@ -47,6 +61,69 @@ impl KeydbSource {
     /// A keydb source reading the given `keydb.cfg` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
+    }
+
+    /// Validate, decompress, and crash-safely persist raw keydb bytes (plain
+    /// text, `.zip`, or `.gz`) to THIS source's own [`path`](Self::path).
+    ///
+    /// The bytes are decompressed (zip / gz / plain), the result is checked for
+    /// at least one recognisable keydb entry, then atomically written to the
+    /// source's path (sibling-temp + fsync + rename + parent-dir fsync). The
+    /// decompressed size is capped at [`MAX_KEYDB_BYTES`] so a decompression
+    /// bomb can't OOM the caller (e.g. the daily-refresh thread). Writing to the
+    /// source's own path — not a hardcoded default — means the caller decides
+    /// the destination (CLI `--keydb`, the autorip service path, …).
+    pub fn save(&self, bytes: &[u8]) -> Result<UpdateResult, Error> {
+        let text = if bytes.starts_with(b"PK\x03\x04") {
+            extract_zip(bytes)?
+        } else if bytes.starts_with(&[0x1f, 0x8b]) {
+            read_capped_to_string(flate2::read::GzDecoder::new(bytes))?
+        } else {
+            // Plain-text body: route through the same capped reader as the
+            // gz/zip branches so an oversized uncompressed upload can't bypass
+            // MAX_KEYDB_BYTES.
+            read_capped_to_string(std::io::Cursor::new(bytes))?
+        };
+
+        let entries = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.starts_with("0x")
+                    || t.starts_with("| DK")
+                    || t.starts_with("| PK")
+                    || t.starts_with("| HC")
+            })
+            .count();
+
+        if entries == 0 {
+            return Err(Error::KeydbInvalid);
+        }
+
+        write_atomic(&self.path, &text)?;
+
+        Ok(UpdateResult {
+            path: self.path.clone(),
+            entries,
+            bytes: text.len(),
+        })
+    }
+
+    /// Fetch keydb bytes from `url` via the caller-supplied `fetch` transport,
+    /// then validate + save them to this source's path.
+    ///
+    /// The transport is INJECTED: this crate stays transport-agnostic on the
+    /// update path so the application supplies its own TLS / SSRF-guarded fetch
+    /// (the `freemkv` CLI passes its `keydb_fetch::fetch`). `fetch` returns the
+    /// raw response body (plain text, `.zip`, or `.gz`); [`save`](Self::save)
+    /// does the verify + atomic write.
+    pub fn update(
+        &self,
+        fetch: impl Fn(&str) -> Result<Vec<u8>, Error>,
+        url: &str,
+    ) -> Result<UpdateResult, Error> {
+        let bytes = fetch(url)?;
+        self.save(&bytes)
     }
 
     /// The host certificate(s) in this keydb — the second kind of data the one
@@ -153,6 +230,101 @@ impl KeydbSource {
 
         uk_from_vuk(vuk_from_mk(mk, vid), enc_title_keys)
     }
+}
+
+/// Read a decompressed stream into a `String` with a hard size ceiling.
+/// Returns [`Error::KeydbInvalid`] if the input exceeds the cap, or
+/// [`Error::KeydbParse`] if the bytes are not valid UTF-8.
+fn read_capped_to_string<R: Read>(reader: R) -> Result<String, Error> {
+    let mut buf = Vec::new();
+    // Read one byte past the cap so an exactly-at-cap stream is accepted but
+    // anything larger is rejected.
+    reader
+        .take(MAX_KEYDB_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| Error::KeydbParse)?;
+    if buf.len() as u64 > MAX_KEYDB_BYTES {
+        return Err(Error::KeydbInvalid);
+    }
+    String::from_utf8(buf).map_err(|_| Error::KeydbParse)
+}
+
+/// Extract the first `*.cfg` member of a zip archive as a capped `String`.
+fn extract_zip(data: &[u8]) -> Result<String, Error> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|_| Error::KeydbParse)?;
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).map_err(|_| Error::KeydbParse)?;
+        if file.name().ends_with(".cfg") || file.name().ends_with(".CFG") {
+            return read_capped_to_string(file);
+        }
+    }
+
+    Err(Error::KeydbInvalid)
+}
+
+/// Write `text` to `path` crash-safely (create parent dir, write a sibling temp
+/// file, fsync, then atomic rename, then fsync the parent dir).
+///
+/// keydb.cfg is the single source of AACS truth, and save/update run unattended
+/// (first-boot download + daily-refresh thread, with a container restart on
+/// every release). A bare in-place `fs::write` truncates the file before
+/// writing, so a SIGKILL (docker stop's grace window), OOM-kill, power loss, or
+/// ENOSPC mid-write would leave the keydb half-written — the prior good copy
+/// already gone. A truncated keydb doesn't error at write time; it silently
+/// breaks key resolution on every later AACS rip. Writing to a temp file then
+/// renaming (POSIX rename is atomic within a filesystem) means an interrupted
+/// update leaves the previous keydb fully intact.
+///
+/// The fsync MUST succeed before the rename: a `sync_all` failure (ENOSPC,
+/// ESTALE on the bind-mounted volume) means the kernel never guaranteed the
+/// bytes reached stable storage, so publishing them via rename would defeat
+/// crash-safety. The temp name is unique per call (pid + monotonic counter) so a
+/// concurrent update can't share a fixed temp path and rename a mangled file
+/// over the keydb.
+fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
+    let werr = || Error::KeydbWrite {
+        path: path.display().to_string(),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "keydb dir create failed");
+            werr()
+        })?;
+    }
+    let tmp = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, path = %path.display(), "keydb write/fsync failed; keydb unchanged");
+        return Err(werr());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, path = %path.display(), "keydb rename failed; keydb unchanged");
+        return Err(werr());
+    }
+    // Durably commit the new dirent: on POSIX filesystems (ext2, some NFS) a
+    // crash right after the rename can lose the directory entry even though the
+    // rename returned. Best-effort (swallowed on failure); no-op on Windows.
+    if let Some(dir) = path.parent() {
+        libfreemkv::io::fsync::dir(dir);
+    }
+    Ok(())
 }
 
 impl KeySource for KeydbSource {
@@ -595,5 +767,175 @@ mod tests {
         assert_eq!(certs[0].certificate.len(), 92);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── save / update (moved from libfreemkv::keydb) ──────────────────────────
+
+    // Per project convention, tests never touch /tmp (wiped on reboot). Anchor
+    // scratch under the crate's target/ (gitignored), not /tmp.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("keydb-save-{}-{}-{}", std::process::id(), tag, n));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The headline behaviour of the move: `save` writes to the SOURCE'S OWN
+    /// path, never a hardcoded default. Creates the parent dir, reports the
+    /// destination, and round-trips the content.
+    #[test]
+    fn save_writes_to_the_sources_own_path() {
+        let dir = scratch("save-path");
+        let target = dir.join("nested").join("mykeys.cfg");
+        let src = KeydbSource::new(&target);
+
+        let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF\n";
+        let result = src.save(body).expect("save must succeed");
+
+        assert_eq!(
+            result.path, target,
+            "save must write to the source's own path, not a default"
+        );
+        assert_eq!(result.entries, 1, "one 0x entry");
+        assert!(target.exists(), "keydb file must exist at the source path");
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap()
+                .contains("0xDEADBEEF"),
+            "content must round-trip"
+        );
+    }
+
+    /// `update` runs the injected fetch, then saves the returned bytes to the
+    /// source's path — the transport is supplied by the caller, never built
+    /// here.
+    #[test]
+    fn update_uses_injected_fetch_then_saves_to_path() {
+        let dir = scratch("update-path");
+        let target = dir.join("k.cfg");
+        let src = KeydbSource::new(&target);
+
+        let body = b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD\n".to_vec();
+        let result = src
+            .update(|_url| Ok(body.clone()), "http://example.invalid/keydb.zip")
+            .expect("update must succeed with a good fetch");
+
+        assert_eq!(result.path, target, "update must save to the source's path");
+        assert_eq!(result.entries, 1);
+        assert!(target.exists());
+    }
+
+    /// A failing injected fetch propagates as-is; nothing is written.
+    #[test]
+    fn update_propagates_fetch_error_and_writes_nothing() {
+        let dir = scratch("update-err");
+        let target = dir.join("k.cfg");
+        let src = KeydbSource::new(&target);
+
+        let result = src.update(
+            |_| {
+                Err(Error::KeydbConnect {
+                    host: "x".to_string(),
+                })
+            },
+            "http://x/",
+        );
+        assert!(matches!(result, Err(Error::KeydbConnect { .. })));
+        assert!(!target.exists(), "a fetch failure must write no keydb");
+    }
+
+    /// `save` rejects bytes with no recognisable keydb entries.
+    #[test]
+    fn save_rejects_empty_text() {
+        let dir = scratch("save-empty");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        let garbage = b"this is not a keydb\njust random text\n";
+        assert!(matches!(src.save(garbage), Err(Error::KeydbInvalid)));
+    }
+
+    /// `save` recognises gzip magic (0x1f 0x8b) and routes to the gz decoder; a
+    /// truncated gzip is a parse/invalid error, never a plain-text UTF-8 error.
+    #[test]
+    fn save_recognises_gzip_magic() {
+        let dir = scratch("save-gz");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        let bad_gz = [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03];
+        match src.save(&bad_gz).unwrap_err() {
+            Error::KeydbParse | Error::KeydbInvalid => {}
+            e => panic!("wrong error kind for truncated gzip: {e:?}"),
+        }
+    }
+
+    /// `save` recognises ZIP magic (PK\x03\x04) and routes to extract_zip; a
+    /// truncated zip is a parse/invalid error, never a plain-text UTF-8 error.
+    #[test]
+    fn save_recognises_zip_magic() {
+        let dir = scratch("save-zip");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        let bad_zip = b"PK\x03\x04garbage that is not a real zip";
+        match src.save(bad_zip).unwrap_err() {
+            Error::KeydbParse | Error::KeydbInvalid => {}
+            e => panic!("wrong error for bad zip: {e:?}"),
+        }
+    }
+
+    /// `read_capped_to_string` rejects input over the cap (decompression-bomb
+    /// guard) and accepts exactly at the cap.
+    #[test]
+    fn read_capped_to_string_enforces_size_cap() {
+        let too_big = vec![b'A'; (MAX_KEYDB_BYTES + 1) as usize];
+        assert!(matches!(
+            read_capped_to_string(std::io::Cursor::new(too_big)),
+            Err(Error::KeydbInvalid)
+        ));
+        let at_cap = vec![b'A'; MAX_KEYDB_BYTES as usize];
+        assert!(read_capped_to_string(std::io::Cursor::new(at_cap)).is_ok());
+        // Non-UTF-8 is a parse error, not the size error.
+        assert!(matches!(
+            read_capped_to_string(std::io::Cursor::new(vec![0xFFu8, 0xFE])),
+            Err(Error::KeydbParse)
+        ));
+    }
+
+    /// `write_atomic` replaces an existing file in place and leaves no stray
+    /// temp sibling.
+    #[test]
+    fn write_atomic_replaces_existing_and_leaves_no_temp() {
+        let dir = scratch("atomic");
+        let path = dir.join("freemkv").join("keydb.cfg");
+
+        write_atomic(&path, "0xAAAA = old\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xAAAA = old\n");
+        write_atomic(&path, "0xBBBB = new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
+
+    /// A failed write (parent path is a file → ENOTDIR on create_dir_all) leaves
+    /// the prior keydb intact and surfaces KeydbWrite.
+    #[test]
+    fn write_atomic_failure_preserves_prior_keydb() {
+        let dir = scratch("preserve");
+        let good = dir.join("keydb.cfg");
+        write_atomic(&good, "0xGOOD = keep\n").unwrap();
+
+        let doomed = good.join("freemkv").join("keydb.cfg");
+        assert!(matches!(
+            write_atomic(&doomed, "0xBAD = partial\n"),
+            Err(Error::KeydbWrite { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "0xGOOD = keep\n");
     }
 }
