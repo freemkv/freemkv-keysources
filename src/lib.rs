@@ -21,11 +21,15 @@
 //! here.
 
 mod keydb;
-mod keydb_format;
+/// The `keydb.cfg` parser (`KeyDb`, `DiscEntry`, …). Public: parsing the keydb
+/// is not secret — freemkv uses it, and so do tools that build a disc registry
+/// from it (e.g. a per-disc Volume-ID index).
+pub mod keydb_format;
 mod online;
 mod paths;
 
 pub use keydb::{KeydbSource, UpdateResult};
+pub use keydb_format::{DiscEntry, KeyDb};
 pub use online::{OnlineSource, validate_keyserver_url};
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 
