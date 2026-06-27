@@ -643,19 +643,23 @@ impl KeyDb {
         // UHD flag: literal "(UHD)" anywhere in the comment.
         let is_uhd = comment.contains("(UHD)");
 
-        // Extract title (before first |)
-        let title_part = rest.split(" | ").next().unwrap_or("").trim();
-        // Clean title: "TITLE_NAME (Display Title)" → use display title if
-        // present. keydb.cfg is untrusted third-party content, so a title with
-        // ')' before '(' (e.g. "FILM) (X") would make start+1 > end; guard the
-        // slice and fall back to the whole title.
-        let title = match (title_part.find('('), title_part.rfind(')')) {
-            (Some(start), Some(end)) => title_part
-                .get(start + 1..end)
-                .map(str::to_string)
-                .unwrap_or_else(|| title_part.to_string()),
-            _ => title_part.to_string(),
-        };
+        // Title = everything between `= ` and the first ` | ` field (or the
+        // trailing `;` comment), kept VERBATIM (trimmed). This is a FAITHFUL copy
+        // of the keydb title, so it must round-trip exactly: a previous version
+        // extracted a `(...)` substring as a "display title", but that TRUNCATED
+        // real titles that legitimately contain parentheses ("Lawrence of Arabia
+        // (Restored Version) – Disc 2 …" → "Restored Version") and broke
+        // serialize→parse idempotence. Display prettification, if wanted, belongs
+        // in the title-display layer, NOT this codec.
+        let before_fields = rest.split(" | ").next().unwrap_or("");
+        // A title-only entry (no key fields) carries its `;` comment on the same
+        // chunk — strip it so the comment doesn't leak into the title.
+        let title = before_fields
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         // Parse fields by tag
         let mut media_key = None;
@@ -664,7 +668,11 @@ impl KeyDb {
         let mut unit_keys = Vec::new();
 
         let parts: Vec<&str> = rest.split(" | ").collect();
-        let mut i = 0;
+        // Field scan starts at index 1: `parts[0]` is ALWAYS the title chunk and
+        // must be excluded, otherwise a disc whose title happens to be a field tag
+        // letter ("M", "I", "V", "U", "D") — e.g. `= M | M | 0x…` — would have the
+        // title eaten as a tag and shadow the real field. (Broke round-trip.)
+        let mut i = 1;
         while i < parts.len() {
             match parts[i].trim() {
                 "M" => {
@@ -732,16 +740,26 @@ mod tests {
     /// internal key forms (e.g. the `0x`-prefixed disc-hash) match by construction.
     #[test]
     fn to_keydb_cfg_round_trips_through_parse() {
-        let h = |b: u8, n: usize| std::iter::repeat(format!("{b:02x}")).take(n).collect::<String>();
+        let h = |b: u8, n: usize| {
+            std::iter::repeat(format!("{b:02x}"))
+                .take(n)
+                .collect::<String>()
+        };
         let cert = h(0x99, 92); // AACS 1.0 host cert is 92 bytes
         let src = format!(
             "| HC | HOST_PRIV_KEY 0x{priv20} | HOST_CERT 0x{cert} ; Revoked in MKBv72\n\
              | DK | DEVICE_KEY 0x{k16} | DEVICE_NODE 0x0a00 | KEY_UV 0x00000e23 | KEY_U_MASK_SHIFT 0x0b\n\
              | PK | 0x{pk16}\n\
              0x422eb284b8d755e2a96a2781e95998caad0b1290 = Dunkirk | M | 0x{mk16} | I | 0x{id16} | V | 0x{vuk16} | U | 1-0x{u1} 2-0x{u2} ; MKBv76 VolumeSize: 81309007872 (UHD)\n",
-            priv20 = h(0x88, 20), cert = cert, k16 = h(0x66, 16), pk16 = h(0x77, 16),
-            mk16 = h(0x11, 16), id16 = h(0x22, 16), vuk16 = h(0x33, 16),
-            u1 = h(0x44, 16), u2 = h(0x55, 16),
+            priv20 = h(0x88, 20),
+            cert = cert,
+            k16 = h(0x66, 16),
+            pk16 = h(0x77, 16),
+            mk16 = h(0x11, 16),
+            id16 = h(0x22, 16),
+            vuk16 = h(0x33, 16),
+            u1 = h(0x44, 16),
+            u2 = h(0x55, 16),
         );
         let a = KeyDb::parse(&src);
         let b = KeyDb::parse(&a.to_keydb_cfg());
@@ -775,10 +793,56 @@ mod tests {
         assert_eq!(a.processing_keys, b.processing_keys);
         assert_eq!(a.host_certs.len(), 1);
         assert_eq!(b.host_certs.len(), 1);
-        assert_eq!(a.host_certs[0].cert.private_key, b.host_certs[0].cert.private_key);
-        assert_eq!(a.host_certs[0].cert.certificate, b.host_certs[0].cert.certificate);
-        assert_eq!(a.host_certs[0].revoked_at_mkb, b.host_certs[0].revoked_at_mkb);
+        assert_eq!(
+            a.host_certs[0].cert.private_key,
+            b.host_certs[0].cert.private_key
+        );
+        assert_eq!(
+            a.host_certs[0].cert.certificate,
+            b.host_certs[0].cert.certificate
+        );
+        assert_eq!(
+            a.host_certs[0].revoked_at_mkb,
+            b.host_certs[0].revoked_at_mkb
+        );
         assert_eq!(b.host_certs[0].revoked_at_mkb, Some(72));
+    }
+
+    /// REAL-DATA IDEMPOTENCE — the "load + serialize back-to-back" check.
+    ///
+    /// Parse the full keydb → serialize (S1) → parse S1 → serialize again (S2).
+    /// S1 MUST equal S2 byte-for-byte. This is the right invariant: a raw
+    /// keydb.cfg has formatting variance (whitespace, optional fields, comment
+    /// style) that our CANONICAL serializer normalizes, so `text == to_keydb_cfg`
+    /// is NOT expected — but once normalized, a re-load+re-serialize must be
+    /// stable. Idempotence here proves `parse` is lossless on its own output and
+    /// `to_keydb_cfg` is deterministic. Also asserts no rows are dropped.
+    /// Skipped unless `KEYDB_PATH` points at a real keydb.cfg.
+    #[test]
+    fn to_keydb_cfg_is_idempotent_on_real_keydb() {
+        let path = match keydb_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let db1 = KeyDb::load(&path).unwrap();
+        let s1 = db1.to_keydb_cfg();
+        let db2 = KeyDb::parse(&s1);
+        let s2 = db2.to_keydb_cfg();
+        assert_eq!(s1.len(), s2.len(), "serialized byte length drifted");
+        assert!(s1 == s2, "to_keydb_cfg is NOT idempotent (S1 != S2)");
+        // No rows lost crossing the round trip.
+        assert_eq!(
+            db1.disc_entries.len(),
+            db2.disc_entries.len(),
+            "disc-entry count drift"
+        );
+        assert_eq!(db1.device_keys.len(), db2.device_keys.len(), "DK drift");
+        assert_eq!(
+            db1.processing_keys.len(),
+            db2.processing_keys.len(),
+            "PK drift"
+        );
+        assert_eq!(db1.host_certs.len(), db2.host_certs.len(), "HC drift");
     }
 
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
@@ -796,7 +860,7 @@ mod tests {
             "0x{z40} = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x{z32} | I | 0x{z32} | V | 0x{z32} | U | 1-0x{z32} ; MKBv77"
         );
         let entry = KeyDb::parse_disc_entry(&line).unwrap();
-        assert_eq!(entry.title, "Sample Film");
+        assert_eq!(entry.title, "SAMPLE_FILM (Sample Film)"); // faithful, verbatim
         assert!(entry.media_key.is_some());
         assert!(entry.vuk.is_some());
         assert_eq!(entry.unit_keys.len(), 1);
@@ -1035,11 +1099,13 @@ mod tests {
     }
 
     #[test]
-    fn disc_entry_title_uses_display_in_parens() {
-        // "RAW_NAME (Display Name)" → title is the parenthesised display name.
+    fn disc_entry_title_kept_verbatim_even_with_parens() {
+        // Faithful copy: the title is kept VERBATIM, parens and all — NOT reduced
+        // to the parenthesised substring (which truncated real multi-paren titles
+        // and broke serialize→parse idempotence).
         let line = "0x00 = RAW_NAME (Display Name) | M | 0x".to_string() + &"00".repeat(16);
         let e = KeyDb::parse_disc_entry(&line).unwrap();
-        assert_eq!(e.title, "Display Name");
+        assert_eq!(e.title, "RAW_NAME (Display Name)");
     }
 
     #[test]
