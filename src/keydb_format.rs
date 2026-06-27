@@ -10,7 +10,7 @@
 // even though this crate's consumer (`keydb.rs`) only exercises a subset
 // (`load`, `find_disc`, `iter_disc_entries`, and the public fields read by
 // `candidates_from`/`host_certs`). The unused items — `empty`, `find_vuk`,
-// `DiscEntry::{title, disc_id}` — are part of the faithful copy and are
+// `DiscEntry::{title, vid}` — are part of the faithful copy and are
 // retained rather than pruned; allow dead_code so the byte-for-byte copy
 // compiles clean without diverging from the libfreemkv original.
 #![allow(dead_code)]
@@ -72,8 +72,10 @@ pub struct DiscEntry {
     pub title: String,
     /// Media Key (16 bytes) — from MKB processing
     pub media_key: Option<[u8; 16]>,
-    /// Disc ID (16 bytes)
-    pub disc_id: Option<[u8; 16]>,
+    /// Volume ID — the AACS VID (the keydb `I` token), 16 bytes. NOT the disc's
+    /// identity (that's `disc_hash`); this is the per-disc Volume ID used to
+    /// derive the VUK.
+    pub vid: Option<[u8; 16]>,
     /// Volume Unique Key (16 bytes) — decrypts title keys
     pub vuk: Option<[u8; 16]>,
     /// Unit keys (title keys) indexed by CPS unit number
@@ -364,7 +366,7 @@ impl KeyDb {
     /// looked up by the same disc-hash form [`Self::find_disc`] accepts. Pure
     /// file lookup; no crypto/derivation.
     pub fn get_vid(&self, disc_hash: &str) -> Option<[u8; 16]> {
-        self.find_disc(disc_hash).and_then(|e| e.disc_id)
+        self.find_disc(disc_hash).and_then(|e| e.vid)
     }
 
     /// Standalone keydb accessor: the disc's stored unit (title) keys, cloned.
@@ -383,6 +385,115 @@ impl KeyDb {
             .filter(|e| !e.unit_keys.is_empty())
             .map(|e| (e.disc_hash.clone(), e.unit_keys.clone()))
             .collect()
+    }
+
+    /// Serialize back to keydb.cfg text — the INVERSE of [`Self::parse`], so the
+    /// keydb wire format lives in ONE place (parse + emit together). Emits, in a
+    /// deterministic order: host certs, device keys, processing keys, then one
+    /// line per disc entry (sorted by hash). `parse(to_keydb_cfg(kd))` reproduces
+    /// every field (see `round_trips_through_parse`). Used by the keyupdater to
+    /// export a complete keydb.cfg (keys + host certs + VIDs).
+    ///
+    /// The trailing `; <comment>` (MKB version / volume size / UHD) is emitted
+    /// ONLY after a `U` (unit-keys) field — that is the one place the parser
+    /// splits the value on `;`. Gluing a comment onto an `M`/`I`/`V` value would
+    /// make `parse_hex16` reject the whole field, so a comment-bearing entry that
+    /// has no unit keys drops its comment (keys always survive; the metadata is a
+    /// derivable hint). Real per-disc rows that carry metadata also carry keys.
+    pub fn to_keydb_cfg(&self) -> String {
+        fn hx(b: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(b.len() * 2);
+            for x in b {
+                let _ = write!(s, "{x:02x}");
+            }
+            s
+        }
+        let mut out = String::new();
+
+        // Host certs (AACS 1.0): | HC | HOST_PRIV_KEY 0x.. | HOST_CERT 0x.. ; Revoked in MKBv<N>
+        for hc in &self.host_certs {
+            out.push_str("| HC | HOST_PRIV_KEY 0x");
+            out.push_str(&hx(&hc.cert.private_key));
+            out.push_str(" | HOST_CERT 0x");
+            out.push_str(&hx(&hc.cert.certificate));
+            if let Some(n) = hc.revoked_at_mkb {
+                out.push_str(" ; Revoked in MKBv");
+                out.push_str(&n.to_string());
+            }
+            out.push('\n');
+        }
+
+        // Device keys: | DK | DEVICE_KEY 0x.. | DEVICE_NODE 0x.. | KEY_UV 0x.. | KEY_U_MASK_SHIFT 0x..
+        for dk in &self.device_keys {
+            out.push_str("| DK | DEVICE_KEY 0x");
+            out.push_str(&hx(&dk.key));
+            out.push_str(&format!(
+                " | DEVICE_NODE 0x{:04x} | KEY_UV 0x{:08x} | KEY_U_MASK_SHIFT 0x{:02x}\n",
+                dk.node, dk.uv, dk.u_mask_shift
+            ));
+        }
+
+        // Processing keys: | PK | 0x..
+        for pk in &self.processing_keys {
+            out.push_str("| PK | 0x");
+            out.push_str(&hx(pk));
+            out.push('\n');
+        }
+
+        // Per-disc entries, sorted by hash for a deterministic, diff-friendly file.
+        let mut hashes: Vec<&String> = self.disc_entries.keys().collect();
+        hashes.sort();
+        for h in hashes {
+            let d = &self.disc_entries[h];
+            // `parse` keeps the `hash_part` verbatim, so the stored `disc_hash`
+            // already carries its `0x` prefix — emit it as-is (prefixing another
+            // `0x` would double it on re-parse).
+            out.push_str(h);
+            out.push_str(" = ");
+            // Parse stores the display title (inside parens) or the whole string
+            // when there are none; emitting the stored title bare round-trips
+            // (no parens → parser keeps it verbatim). Empty → "Unknown".
+            if d.title.is_empty() {
+                out.push_str("Unknown");
+            } else {
+                out.push_str(&d.title);
+            }
+            if let Some(mk) = d.media_key {
+                out.push_str(" | M | 0x");
+                out.push_str(&hx(&mk));
+            }
+            if let Some(id) = d.vid {
+                out.push_str(" | I | 0x");
+                out.push_str(&hx(&id));
+            }
+            if let Some(vuk) = d.vuk {
+                out.push_str(" | V | 0x");
+                out.push_str(&hx(&vuk));
+            }
+            if !d.unit_keys.is_empty() {
+                out.push_str(" | U |");
+                for (n, k) in &d.unit_keys {
+                    out.push_str(&format!(" {}-0x{}", n, hx(k)));
+                }
+                // Comment only after U (the one ;-split field) so it can't corrupt
+                // a preceding hex value on re-parse.
+                if d.mkb_version.is_some() || d.volume_size.is_some() || d.is_uhd {
+                    out.push_str(" ;");
+                    if let Some(v) = d.mkb_version {
+                        out.push_str(&format!(" MKBv{v}"));
+                    }
+                    if let Some(sz) = d.volume_size {
+                        out.push_str(&format!(" VolumeSize: {sz}"));
+                    }
+                    if d.is_uhd {
+                        out.push_str(" (UHD)");
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -548,7 +659,7 @@ impl KeyDb {
 
         // Parse fields by tag
         let mut media_key = None;
-        let mut disc_id = None;
+        let mut vid = None;
         let mut vuk = None;
         let mut unit_keys = Vec::new();
 
@@ -564,7 +675,7 @@ impl KeyDb {
                 }
                 "I" => {
                     if i + 1 < parts.len() {
-                        disc_id = parse_hex16(parts[i + 1].trim());
+                        vid = parse_hex16(parts[i + 1].trim());
                         i += 1;
                     }
                 }
@@ -600,7 +711,7 @@ impl KeyDb {
             disc_hash,
             title,
             media_key,
-            disc_id,
+            vid,
             vuk,
             unit_keys,
             mkb_version,
@@ -613,6 +724,62 @@ impl KeyDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `to_keydb_cfg` is the exact inverse of `parse`: parse a known line set,
+    /// serialize it, re-parse, and every field survives — device key, processing
+    /// key, host cert (priv key + cert + revocation), and the per-disc M/I(vid)/V/U
+    /// keys plus the MKBv/UHD comment metadata. Both sides go through `parse`, so
+    /// internal key forms (e.g. the `0x`-prefixed disc-hash) match by construction.
+    #[test]
+    fn to_keydb_cfg_round_trips_through_parse() {
+        let h = |b: u8, n: usize| std::iter::repeat(format!("{b:02x}")).take(n).collect::<String>();
+        let cert = h(0x99, 92); // AACS 1.0 host cert is 92 bytes
+        let src = format!(
+            "| HC | HOST_PRIV_KEY 0x{priv20} | HOST_CERT 0x{cert} ; Revoked in MKBv72\n\
+             | DK | DEVICE_KEY 0x{k16} | DEVICE_NODE 0x0a00 | KEY_UV 0x00000e23 | KEY_U_MASK_SHIFT 0x0b\n\
+             | PK | 0x{pk16}\n\
+             0x422eb284b8d755e2a96a2781e95998caad0b1290 = Dunkirk | M | 0x{mk16} | I | 0x{id16} | V | 0x{vuk16} | U | 1-0x{u1} 2-0x{u2} ; MKBv76 VolumeSize: 81309007872 (UHD)\n",
+            priv20 = h(0x88, 20), cert = cert, k16 = h(0x66, 16), pk16 = h(0x77, 16),
+            mk16 = h(0x11, 16), id16 = h(0x22, 16), vuk16 = h(0x33, 16),
+            u1 = h(0x44, 16), u2 = h(0x55, 16),
+        );
+        let a = KeyDb::parse(&src);
+        let b = KeyDb::parse(&a.to_keydb_cfg());
+
+        // Per-disc entry: every field round-trips.
+        assert_eq!(a.disc_entries.len(), 1);
+        assert_eq!(b.disc_entries.len(), 1);
+        let ea = a.disc_entries.values().next().unwrap();
+        let eb = b.disc_entries.values().next().unwrap();
+        assert_eq!(ea.disc_hash, eb.disc_hash);
+        assert_eq!(ea.title, eb.title, "title");
+        assert_eq!(ea.media_key, eb.media_key, "M");
+        assert_eq!(ea.vid, eb.vid, "I/vid");
+        assert_eq!(ea.vuk, eb.vuk, "V");
+        assert_eq!(ea.unit_keys, eb.unit_keys, "U");
+        assert_eq!(ea.mkb_version, eb.mkb_version, "MKBv");
+        assert_eq!(ea.is_uhd, eb.is_uhd, "UHD");
+        // Concrete values (not just self-consistency).
+        assert_eq!(ea.vid, Some([0x22u8; 16]));
+        assert_eq!(ea.vuk, Some([0x33u8; 16]));
+        assert_eq!(ea.unit_keys, vec![(1, [0x44u8; 16]), (2, [0x55u8; 16])]);
+        assert_eq!(ea.mkb_version, Some(76));
+        assert!(ea.is_uhd);
+
+        // Device key, processing key, host cert all survive byte-for-byte.
+        assert_eq!(a.device_keys.len(), b.device_keys.len());
+        assert_eq!(a.device_keys[0].key, b.device_keys[0].key);
+        assert_eq!(a.device_keys[0].node, b.device_keys[0].node);
+        assert_eq!(a.device_keys[0].uv, b.device_keys[0].uv);
+        assert_eq!(a.device_keys[0].u_mask_shift, b.device_keys[0].u_mask_shift);
+        assert_eq!(a.processing_keys, b.processing_keys);
+        assert_eq!(a.host_certs.len(), 1);
+        assert_eq!(b.host_certs.len(), 1);
+        assert_eq!(a.host_certs[0].cert.private_key, b.host_certs[0].cert.private_key);
+        assert_eq!(a.host_certs[0].cert.certificate, b.host_certs[0].cert.certificate);
+        assert_eq!(a.host_certs[0].revoked_at_mkb, b.host_certs[0].revoked_at_mkb);
+        assert_eq!(b.host_certs[0].revoked_at_mkb, Some(72));
+    }
 
     /// Get KEYDB path from KEYDB_PATH environment variable. Returns None if not set or not found.
     fn keydb_path() -> Option<std::path::PathBuf> {
@@ -901,7 +1068,7 @@ mod tests {
         let line = format!("0xAA = T | M | 0x{m} | I | 0x{i} | V | 0x{v} | U | 2-0x{u}");
         let e = KeyDb::parse_disc_entry(&line).unwrap();
         assert_eq!(e.media_key, Some([0x11u8; 16]));
-        assert_eq!(e.disc_id, Some([0x22u8; 16]));
+        assert_eq!(e.vid, Some([0x22u8; 16]));
         assert_eq!(e.vuk, Some([0x33u8; 16]));
         assert_eq!(e.unit_keys, vec![(2, [0x44u8; 16])]);
     }
@@ -1063,7 +1230,7 @@ mod tests {
         assert!(!e.is_uhd);
         // Unchanged field parsing.
         assert_eq!(e.media_key, Some([0x11u8; 16]));
-        assert_eq!(e.disc_id, Some([0x22u8; 16]));
+        assert_eq!(e.vid, Some([0x22u8; 16]));
         assert_eq!(e.vuk, Some([0x33u8; 16]));
         assert_eq!(e.unit_keys, vec![(2, [0x44u8; 16])]);
     }
@@ -1204,15 +1371,15 @@ mod tests {
 
         let db = KeyDb::load(&path).unwrap();
 
-        // Find a disc with both MK, disc_id, and VUK so we can verify derivation
+        // Find a disc with both MK, vid, and VUK so we can verify derivation
         let entry = db
             .disc_entries
             .values()
-            .find(|e| e.media_key.is_some() && e.disc_id.is_some() && e.vuk.is_some())
+            .find(|e| e.media_key.is_some() && e.vid.is_some() && e.vuk.is_some())
             .expect("No disc with MK + VID + VUK");
 
         let mk = entry.media_key.unwrap();
-        let vid = entry.disc_id.unwrap();
+        let vid = entry.vid.unwrap();
         let expected_vuk = entry.vuk.unwrap();
 
         let derived = libfreemkv::aacs::derive_vuk(&mk, &vid);
@@ -1296,13 +1463,13 @@ mod tests {
         let entry = db
             .disc_entries
             .values()
-            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.disc_id.is_some());
+            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.vid.is_some());
         if entry.is_none() {
             return;
         }
         let entry = entry.unwrap();
         let vuk = entry.vuk.unwrap();
-        let vid = entry.disc_id.unwrap();
+        let vid = entry.vid.unwrap();
         let hash_hex = format!("0x{}", entry.disc_hash.trim_start_matches("0x"));
 
         // We need the actual Unit_Key_RO.inf from the disc to compute disc hash.
