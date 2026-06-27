@@ -16,7 +16,7 @@
 //!    or the device-key pool via [`mk_from_dk`]. The PK and DK pools resolve the
 //!    Media Key WITHOUT a VID; the final [`vuk_from_mk`] still needs one. The
 //!    VID is the unlocker's physical VID ([`ResolveCtx::vid`]) when present, else
-//!    the keydb entry's OWN stored VID (the `I` field, `disc_id`) for the
+//!    the keydb entry's OWN stored VID (the `I` field, `vid`) for the
 //!    non-physical / ISO path. With no VID from either source the MK path cannot
 //!    complete — return nothing.
 //!
@@ -207,7 +207,7 @@ impl KeydbSource {
         //    needs one. Locked VID-per-path rule: physical (unlocker) VID first,
         //    else the keydb entry's stored VID (`I` field) for the ISO /
         //    non-physical path, else cannot derive.
-        let vid = ctx.vid().or_else(|| entry.disc_id.map(Vid));
+        let vid = ctx.vid().or_else(|| entry.vid.map(Vid));
         let mkb = ctx.mkb().unwrap_or(&[]);
 
         let mk: Option<MediaKey> = entry
@@ -414,7 +414,7 @@ mod tests {
             disc_hash: hash.into(),
             title: String::new(),
             media_key: None,
-            disc_id: None,
+            vid: None,
             vuk: None,
             unit_keys: Vec::new(),
             mkb_version: None,
@@ -509,7 +509,7 @@ mod tests {
 
         let mut e = blank_entry(HASH);
         e.media_key = Some(mk);
-        e.disc_id = Some(vid_keydb);
+        e.vid = Some(vid_keydb);
         let db = db_with(e, Vec::new());
 
         let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), Some(Vid(vid_phys))));
@@ -527,7 +527,7 @@ mod tests {
 
     // ── KAT (d): disc with MK + keydb VID (ISO path, no physical VID) ──────────
     /// A hash hit with a Media Key but NO physical VID falls back to the keydb
-    /// entry's stored VID (`disc_id`, the `I` field) — the non-physical / ISO
+    /// entry's stored VID (`vid`, the `I` field) — the non-physical / ISO
     /// path — and derives `MK → VUK → UK` against it.
     #[test]
     fn kat_d_disc_with_mk_falls_back_to_keydb_vid() {
@@ -537,7 +537,7 @@ mod tests {
 
         let mut e = blank_entry(HASH);
         e.media_key = Some(mk);
-        e.disc_id = Some(vid_keydb);
+        e.vid = Some(vid_keydb);
         let db = db_with(e, Vec::new());
 
         // ctx.vid() == None → ISO path.
@@ -557,7 +557,7 @@ mod tests {
     fn kat_e_disc_with_mk_no_vid_returns_empty() {
         let mut e = blank_entry(HASH);
         e.media_key = Some([0x77u8; 16]);
-        e.disc_id = None; // no keydb VID
+        e.vid = None; // no keydb VID
         let db = db_with(e, Vec::new());
 
         // ctx.vid() == None and no keydb VID → cannot derive.
