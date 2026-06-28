@@ -391,8 +391,8 @@ impl KeyDb {
     /// keydb wire format lives in ONE place (parse + emit together). Emits, in a
     /// deterministic order: host certs, device keys, processing keys, then one
     /// line per disc entry (sorted by hash). `parse(to_keydb_cfg(kd))` reproduces
-    /// every field (see `round_trips_through_parse`). Used by the keyupdater to
-    /// export a complete keydb.cfg (keys + host certs + VIDs).
+    /// every field (see `round_trips_through_parse`). Used by the key-import tool
+    /// to export a complete keydb.cfg (keys + host certs + VIDs).
     ///
     /// The trailing `; <comment>` (MKB version / volume size / UHD) is emitted
     /// ONLY after a `U` (unit-keys) field — that is the one place the parser
@@ -750,7 +750,8 @@ mod tests {
             "| HC | HOST_PRIV_KEY 0x{priv20} | HOST_CERT 0x{cert} ; Revoked in MKBv72\n\
              | DK | DEVICE_KEY 0x{k16} | DEVICE_NODE 0x0a00 | KEY_UV 0x00000e23 | KEY_U_MASK_SHIFT 0x0b\n\
              | PK | 0x{pk16}\n\
-             0x422eb284b8d755e2a96a2781e95998caad0b1290 = Dunkirk | M | 0x{mk16} | I | 0x{id16} | V | 0x{vuk16} | U | 1-0x{u1} 2-0x{u2} ; MKBv76 VolumeSize: 81309007872 (UHD)\n",
+             0x{hash20} = TestDisc | M | 0x{mk16} | I | 0x{id16} | V | 0x{vuk16} | U | 1-0x{u1} 2-0x{u2} ; MKBv76 VolumeSize: 81309007872 (UHD)\n",
+            hash20 = h(0xab, 20),
             priv20 = h(0x88, 20),
             cert = cert,
             k16 = h(0x66, 16),
