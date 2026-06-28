@@ -166,69 +166,61 @@ impl KeydbSource {
             return Vec::new();
         };
 
-        // 1. Terminal Unit Keys — directly usable, no derivation. Preserve the
-        //    keydb's CPS numbering through the resolver's `+ 1` (idx = num - 1).
-        if !entry.unit_keys.is_empty() {
-            return entry
-                .unit_keys
-                .iter()
-                .map(|(num, key)| UnitKey {
-                    idx: num.saturating_sub(1),
-                    key: *key,
-                })
-                .collect();
+        // UNION every source of terminal keys, then dedup — never first-hit. A
+        // stored `unit_keys` list can be PARTIAL (the keyupdater only ever sampled
+        // the CPS units reachable from a playlist, so an orphan unit's key may be
+        // missing), while the per-disc VUK boils EVERY declared CPS unit. Taking
+        // the stored list alone (the old return-at-first-path) would shadow the
+        // VUK and silently drop the orphan unit's key. So gather both and keep a
+        // unique-by-key list: the read path tries every key per unit, so an extra
+        // or stale key is harmless — only a MISSING key hurts.
+        let mut keys: Vec<UnitKey> = Vec::new();
+
+        // 1. Terminal Unit Keys stored in the entry — directly usable, no
+        //    derivation. Preserve the keydb's CPS numbering (idx = num - 1).
+        for (num, key) in &entry.unit_keys {
+            keys.push(UnitKey {
+                idx: num.saturating_sub(1),
+                key: *key,
+            });
         }
 
         // The disc's encrypted title keys (from Unit_Key_RO.inf) — what every
-        // VUK-or-deeper path decrypts into the terminal keys. Empty when the
-        // scan captured no Unit_Key_RO.inf, in which case nothing can derive.
-        let enc_title_keys = match ctx.enc_title_keys() {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
-
-        // 2. Per-disc VUK — one step, no VID needed (it directly decrypts the
-        //    encrypted title keys).
-        if let Some(vuk) = entry.vuk {
-            return uk_from_vuk(Vuk(vuk), enc_title_keys);
+        // VUK-or-deeper path decrypts into the terminal keys. Empty when the scan
+        // captured no Unit_Key_RO.inf, in which case only the stored list (1)
+        // contributes.
+        let enc_title_keys = ctx.enc_title_keys().unwrap_or(&[]);
+        if !enc_title_keys.is_empty() {
+            // 2. Per-disc VUK — one step, no VID needed; boils ALL declared units.
+            //    3. Else a Media Key path (stored MK / PK pool / DK pool) → VUK →
+            //       all declared units. The MK itself carries no VID, but the
+            //       final `vuk_from_mk` needs one: physical (unlocker) VID first,
+            //       else the entry's stored VID (`I` field), else cannot derive.
+            //       Either branch yields the COMPLETE declared set, so we take the
+            //       first that resolves (VUK preferred — cheapest).
+            let derived = if let Some(vuk) = entry.vuk {
+                uk_from_vuk(Vuk(vuk), enc_title_keys)
+            } else {
+                let vid = ctx.vid().or_else(|| entry.vid.map(Vid));
+                let mkb = ctx.mkb().unwrap_or(&[]);
+                let mk: Option<MediaKey> = entry
+                    .media_key
+                    .map(MediaKey)
+                    .or_else(|| mk_from_pk(&db.processing_keys, mkb).ok())
+                    .or_else(|| vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok()));
+                match (mk, vid) {
+                    (Some(mk), Some(vid)) => uk_from_vuk(vuk_from_mk(mk, vid), enc_title_keys),
+                    // Locked VID-per-path rule: an MK with no VID cannot derive.
+                    _ => Vec::new(),
+                }
+            };
+            keys.extend(derived);
         }
 
-        // 3. Media Key path. Resolve a Media Key for THIS disc, then derive the
-        //    VUK + Unit Keys from it. Source order, cheapest-first:
-        //      a. the disc's stored MK (hash hit) — already the Media Key.
-        //      b. the keydb's Processing Key pool walked against this disc's MKB
-        //         via `mk_from_pk` (Subset-Difference cvalue walk; no VID). This
-        //         is the restored PK path — a leaked/precomputed PK resolves the
-        //         Media Key directly for real discs.
-        //      c. the device-key pool via `mk_from_dk` (the AACS-1.0 variant
-        //         walk; needs the MKB and a VID, and has no in-tree integrator
-        //         KCD so it errs for real discs today — kept for faithfulness).
-        //    The MK itself (a/b) carries no VID, but the final `vuk_from_mk`
-        //    needs one. Locked VID-per-path rule: physical (unlocker) VID first,
-        //    else the keydb entry's stored VID (`I` field) for the ISO /
-        //    non-physical path, else cannot derive.
-        let vid = ctx.vid().or_else(|| entry.vid.map(Vid));
-        let mkb = ctx.mkb().unwrap_or(&[]);
-
-        let mk: Option<MediaKey> = entry
-            .media_key
-            .map(MediaKey)
-            // PK pool: validated against this disc's own MKB, no VID needed here.
-            .or_else(|| mk_from_pk(&db.processing_keys, mkb).ok())
-            // DK pool: mk_from_dk folds the VID into the variant walk; it needs
-            // the same VID the VUK step will use.
-            .or_else(|| vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok()));
-
-        let Some(mk) = mk else {
-            return Vec::new();
-        };
-        let Some(vid) = vid else {
-            // Locked VID-per-path rule: an MK with no VID from either source
-            // cannot derive a VUK — never guess.
-            return Vec::new();
-        };
-
-        uk_from_vuk(vuk_from_mk(mk, vid), enc_title_keys)
+        // Unique by key value, first occurrence wins (stored numbering kept).
+        let mut seen = std::collections::HashSet::new();
+        keys.retain(|u| seen.insert(u.key));
+        keys
     }
 }
 
@@ -446,15 +438,16 @@ mod tests {
 
     const HASH: &str = "0xaabb";
 
-    // ── KAT (a): disc with terminal Unit Keys ─────────────────────────────────
-    /// A hash hit carrying terminal unit keys is returned as-is — the committed
-    /// `(cps, key)` pairs are byte-identical to the keydb's stored numbering,
-    /// exactly what the OLD `Key::Unit(entry.unit_keys)` path committed.
+    // ── KAT (a): disc with terminal Unit Keys, no enc_title_keys ──────────────
+    /// Stored terminal unit keys are returned with their CPS numbering preserved.
+    /// Here `enc_title_keys` is empty, so the VUK can't derive anything — only the
+    /// stored list contributes, and it commits byte-identically to the stored
+    /// `(cps, key)` pairs.
     #[test]
     fn kat_a_disc_with_unit_keys_is_terminal_and_preserves_cps_numbering() {
         let mut e = blank_entry(HASH);
         e.unit_keys = vec![(1, [0xA0u8; 16]), (2, [0xB1u8; 16])];
-        // Even with a VUK present, the terminal UK must win (cheapest path).
+        // VUK present but no enc_title_keys → nothing to boil, stored stands.
         e.vuk = Some([0x11u8; 16]);
         let db = db_with(e, Vec::new());
 
@@ -463,6 +456,38 @@ mod tests {
             committed(&got),
             vec![(1u32, [0xA0u8; 16]), (2u32, [0xB1u8; 16])],
             "terminal keydb unit keys must commit byte-identically to the stored (cps, key) pairs"
+        );
+    }
+
+    /// Orphan-unit completeness (the real keydb bug): an entry stores only `uk1`
+    /// (the keyupdater sampled one reachable CPS unit) but ALSO carries the VUK,
+    /// which boils BOTH declared units. The old return-at-first-path handed back
+    /// just `[uk1]`, shadowing the VUK and silently dropping the orphan unit. The
+    /// union must return BOTH — the stored uk1 AND the VUK-derived second unit.
+    #[test]
+    fn union_partial_stored_plus_vuk_yields_all_declared_units() {
+        let vuk = [0x5Au8; 16];
+        let enc = vec![[0x31u8; 16], [0xCDu8; 16]]; // two declared CPS units
+        let derived = uk_from_vuk(Vuk(vuk), &enc); // [d0, d1]
+
+        let mut e = blank_entry(HASH);
+        e.unit_keys = vec![(1, [0xA0u8; 16])]; // PARTIAL: only uk1 stored
+        e.vuk = Some(vuk);
+        let db = db_with(e, Vec::new());
+
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), None));
+        let got_keys: Vec<[u8; 16]> = got.iter().map(|u| u.key).collect();
+        assert!(
+            got_keys.contains(&[0xA0u8; 16]),
+            "the stored uk1 is kept"
+        );
+        assert!(
+            got_keys.contains(&derived[1].key),
+            "the VUK-derived SECOND CPS unit is added, not shadowed by the partial stored list"
+        );
+        assert!(
+            got.len() >= 2,
+            "a partial stored list must no longer shadow the complete VUK"
         );
     }
 
