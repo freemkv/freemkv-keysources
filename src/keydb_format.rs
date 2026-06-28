@@ -1475,7 +1475,7 @@ mod tests {
         let original = std::fs::read(&unit_path).unwrap();
         assert_eq!(original.len(), libfreemkv::aacs::ALIGNED_UNIT_LEN);
         assert!(
-            libfreemkv::aacs::is_aacs_scrambled(&original),
+            libfreemkv::aacs::ts_sync_destroyed(&original),
             "Unit should be encrypted"
         );
 
