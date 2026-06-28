@@ -167,8 +167,8 @@ impl KeydbSource {
         };
 
         // UNION every source of terminal keys, then dedup — never first-hit. A
-        // stored `unit_keys` list can be PARTIAL (the keyupdater only ever sampled
-        // the CPS units reachable from a playlist, so an orphan unit's key may be
+        // stored `unit_keys` list can be PARTIAL (the key-import tool only ever
+        // sampled the CPS units reachable from a playlist, so an orphan unit's key may be
         // missing), while the per-disc VUK boils EVERY declared CPS unit. Taking
         // the stored list alone (the old return-at-first-path) would shadow the
         // VUK and silently drop the orphan unit's key. So gather both and keep a
@@ -460,7 +460,7 @@ mod tests {
     }
 
     /// Orphan-unit completeness (the real keydb bug): an entry stores only `uk1`
-    /// (the keyupdater sampled one reachable CPS unit) but ALSO carries the VUK,
+    /// (the key-import tool sampled one reachable CPS unit) but ALSO carries the VUK,
     /// which boils BOTH declared units. The old return-at-first-path handed back
     /// just `[uk1]`, shadowing the VUK and silently dropping the orphan unit. The
     /// union must return BOTH — the stored uk1 AND the VUK-derived second unit.
@@ -477,10 +477,7 @@ mod tests {
 
         let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, enc.clone(), None));
         let got_keys: Vec<[u8; 16]> = got.iter().map(|u| u.key).collect();
-        assert!(
-            got_keys.contains(&[0xA0u8; 16]),
-            "the stored uk1 is kept"
-        );
+        assert!(got_keys.contains(&[0xA0u8; 16]), "the stored uk1 is kept");
         assert!(
             got_keys.contains(&derived[1].key),
             "the VUK-derived SECOND CPS unit is added, not shadowed by the partial stored list"
