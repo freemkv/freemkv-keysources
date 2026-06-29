@@ -95,18 +95,8 @@ pub struct DiscEntry {
 /// codepoint) must not panic on a mid-codepoint slice. Any non-hex
 /// byte yields `None`.
 pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
+    // The one workspace hex parser (strips an optional 0x/0X, byte-based).
+    libfreemkv::hex::parse_hex_bytes(s)
 }
 
 /// Read the run of consecutive ASCII decimal digits immediately following the
@@ -147,23 +137,11 @@ fn parse_revoked_at_mkb(line: &str) -> Option<u32> {
 
 /// Parse hex into a fixed-size array.
 pub(crate) fn parse_hex16(s: &str) -> Option<[u8; 16]> {
-    let v = parse_hex(s)?;
-    if v.len() != 16 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&v);
-    Some(out)
+    libfreemkv::hex::parse_hex_fixed::<16>(s)
 }
 
 pub(crate) fn parse_hex20(s: &str) -> Option<[u8; 20]> {
-    let v = parse_hex(s)?;
-    if v.len() != 20 {
-        return None;
-    }
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&v);
-    Some(out)
+    libfreemkv::hex::parse_hex_fixed::<20>(s)
 }
 
 impl KeyDb {
