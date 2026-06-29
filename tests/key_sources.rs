@@ -60,6 +60,7 @@ fn inputs(hash: &str) -> DiscInputs {
     DiscInputs {
         disc_hash: hash.into(),
         volume_id: [0u8; 16],
+        version: libfreemkv::aacs::AACS_MAJOR_UHD,
         mkb: Vec::new(),
         unit_key_ro: Vec::new(),
         samples: Vec::new(),
@@ -69,7 +70,7 @@ fn inputs(hash: &str) -> DiscInputs {
 
 /// Resolve a source through the public trait over a `DiscInputsCtx`.
 fn resolve(src: &dyn KeySource, inp: &DiscInputs) -> Vec<UnitKey> {
-    let ctx = DiscInputsCtx::new(inp, 2);
+    let ctx = DiscInputsCtx::new(inp);
     src.get_uk(&ctx)
         .expect("get_uk must not error for these fixtures")
 }
@@ -127,7 +128,7 @@ fn keydb_source_missing_file_is_silent_ok_empty() {
     // source in the chain can still supply them.
     let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
     let inp = inputs(DISC_HASH);
-    let ctx = DiscInputsCtx::new(&inp, 2);
+    let ctx = DiscInputsCtx::new(&inp);
     assert!(
         src.get_uk(&ctx)
             .expect("missing keydb is Ok, not Err")
