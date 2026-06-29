@@ -346,20 +346,9 @@ fn bearer_header(secret: &str) -> Option<String> {
 }
 
 fn parse_uk(hex: &str) -> Option<[u8; 16]> {
-    if hex.len() != 32 {
-        return None;
-    }
-    // Reject any non-hex byte up front. `u8::from_str_radix` on a 2-char
-    // window otherwise accepts sign prefixes (e.g. "+5", "-A"), letting a
-    // signed/whitespace-tainted string slip through as a valid key.
-    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
+    // The one workspace hex parser: byte-based (rejects sign chars / multi-byte),
+    // 32 hex digits → [u8; 16], with an optional 0x/0X prefix tolerated.
+    libfreemkv::hex::parse_hex_fixed::<16>(hex)
 }
 
 #[cfg(test)]
