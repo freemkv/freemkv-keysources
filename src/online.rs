@@ -9,7 +9,11 @@ use libfreemkv::aacs::{UnitKey, Vuk, uk_from_vuk};
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
 
-const MAX_MKB_BYTES: usize = 10 * 1024 * 1024;
+// Upper bound on the MKB forwarded to the key service — kept in lockstep with
+// libfreemkv's `read_mkb_content` MAX_BYTES (64 MiB) so an MKB the library is
+// willing to capture is never silently un-forwardable here (a trimmed MKB
+// record stream is normally a few MiB; this is headroom, not an expected size).
+const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
 /// Hard cap on the key-service response body. A real unit-key reply is a few
 /// hundred bytes; bound the read so a malicious/compromised server can't drive
@@ -202,8 +206,16 @@ impl OnlineSource {
             return Vec::new();
         }
         let mkb = ctx.mkb().unwrap_or(&[]);
-        // An over-cap MKB cannot be forwarded — bound the body.
+        // An over-cap MKB cannot be forwarded — bound the body. Log it: a silent
+        // empty return here is indistinguishable from "no key", so surface the
+        // real cause (the cap is 64 MiB, far above any real trimmed MKB).
         if mkb.len() > MAX_MKB_BYTES {
+            tracing::warn!(
+                target: "freemkv::keysource",
+                mkb_len = mkb.len(),
+                cap = MAX_MKB_BYTES,
+                "MKB exceeds the key-service forward cap; skipping the online source for this disc (no key from online)"
+            );
             return Vec::new();
         }
         let b64 = base64::engine::general_purpose::STANDARD;
