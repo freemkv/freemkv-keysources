@@ -8,9 +8,15 @@ description = "Pluggable AACS key sources (keydb, online key service) for libfre
 repository = "https://github.com/freemkv/freemkv-keysources"
 keywords = ["aacs", "blu-ray", "uhd", "decryption", "keydb"]
 categories = ["multimedia"]
+# OFF crates.io: depends on libfreemkv, which is now git-only (it git-deps the
+# firmware crate). A crates.io crate can't carry a git dep, so keysources is
+# consumed by git tag too. Clients git-tag-pin it.
+publish = false
 
 [dependencies]
 # The crate provides the `KeySource` trait + `Key`/`DiscInputs` types these impls fill.
+# libfreemkv is git-only now; the committed [patch.crates-io] below redirects this
+# bare version req to the libfreemkv git tag (local dev overrides it to a path).
 libfreemkv = "1.2"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
 ureq = { version = "2", features = ["json"] }
@@ -27,3 +33,11 @@ tracing = "0.1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# libfreemkv is git-only (off crates.io). Redirect the bare `libfreemkv = "1.2"`
+# req above to the git tag — committed and CI-visible. The release script
+# rewrites this tag to the new version before regenerating Cargo.lock. Local dev
+# overrides it with a path patch via the gitignored .cargo/config.toml (a
+# config-level [patch.crates-io] wins over this manifest one for the same crate).
+[patch.crates-io]
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.2.0" }
