@@ -207,7 +207,9 @@ impl KeydbSource {
                     .media_key
                     .map(MediaKey)
                     .or_else(|| mk_from_pk(&db.processing_keys, mkb).ok())
-                    .or_else(|| vid.and_then(|v| mk_from_dk(&db.device_keys, mkb, v).ok()));
+                    // DK pool: the real Subset-Difference MKB walk. No VID at the MK
+                    // step (it enters at the VUK step below); the VID guard follows.
+                    .or_else(|| mk_from_dk(&db.device_keys, mkb).ok());
                 match (mk, vid) {
                     (Some(mk), Some(vid)) => uk_from_vuk(vuk_from_mk(mk, vid), enc_title_keys),
                     // Locked VID-per-path rule: an MK with no VID cannot derive.
