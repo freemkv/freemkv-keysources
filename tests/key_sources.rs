@@ -60,7 +60,7 @@ fn inputs(hash: &str) -> DiscInputs {
     DiscInputs {
         disc_hash: hash.into(),
         volume_id: [0u8; 16],
-        version: libfreemkv::aacs::AACS_MAJOR_UHD,
+        version: libfreemkv::aacs::mkb::AACS_MAJOR_UHD,
         mkb: Vec::new(),
         unit_key_ro: Vec::new(),
         samples: Vec::new(),

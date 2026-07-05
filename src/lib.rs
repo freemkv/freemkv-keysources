@@ -35,9 +35,24 @@ pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 
 // Re-exported for downstream convenience so apps need only depend on this crate
 // for the source-side types.
-pub use libfreemkv::aacs::UnitKey;
+pub use libfreemkv::aacs::types::UnitKey;
 pub use libfreemkv::keysource::ResolveCtx;
 pub use libfreemkv::{DiscInputs, KeySource};
+
+/// VUK → the disc's terminal Unit Keys (positional index), one AES-ECB-decrypt
+/// per encrypted title key. Composes the raw `aacs::derive::decrypt_unit_key`
+/// primitive directly — replaces the removed libfreemkv `aacs::boil::uk_from_vuk`
+/// wrapper (that veneer is gone; libfreemkv owns only the AES).
+pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<UnitKey> {
+    enc_title_keys
+        .iter()
+        .enumerate()
+        .map(|(i, e)| UnitKey {
+            idx: i as u32,
+            key: libfreemkv::aacs::derive::decrypt_unit_key(vuk, e),
+        })
+        .collect()
+}
 
 /// An ordered composition of key sources, driven as one. [`MultiSource::get_uk`]
 /// tries each inner source in order and returns the first non-empty Unit Key
@@ -76,7 +91,7 @@ impl KeySource for MultiSource {
     /// UNION every inner source's host certs (filtered at the given MKB
     /// generation). Without this a composed source would hide an inner source's
     /// cert from the OEM cert-auth route — the gap this fixes.
-    fn host_certs(&self, mkb: Option<u32>) -> Vec<libfreemkv::aacs::HostCert> {
+    fn host_certs(&self, mkb: Option<u32>) -> Vec<libfreemkv::aacs::types::HostCert> {
         self.sources
             .iter()
             .flat_map(|s| s.host_certs(mkb))

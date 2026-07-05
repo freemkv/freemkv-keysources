@@ -4,8 +4,9 @@ use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::uks_from_vuk;
 use base64::Engine;
-use libfreemkv::aacs::{UnitKey, Vuk, uk_from_vuk};
+use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
 
@@ -311,7 +312,7 @@ impl OnlineSource {
         // encrypted title keys from the context — the library owns the crypto.
         if let Some(vuk) = json.get("VUK").and_then(|u| u.as_str()).and_then(parse_uk) {
             if let Ok(enc) = ctx.enc_title_keys() {
-                return uk_from_vuk(Vuk(vuk), enc);
+                return uks_from_vuk(&vuk, enc);
             }
         }
         Vec::new()
