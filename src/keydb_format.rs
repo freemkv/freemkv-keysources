@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use libfreemkv::aacs::{DeviceKey, HostCert};
+use libfreemkv::aacs::types::{DeviceKey, HostCert};
 
 /// A keydb per-disc unit key: the CPS-unit number paired with its 16-byte key.
 pub type NumberedUnitKey = (u32, [u8; 16]);
@@ -1427,7 +1427,7 @@ mod tests {
         let vid = entry.vid.unwrap();
         let expected_vuk = entry.vuk.unwrap();
 
-        let derived = libfreemkv::aacs::derive_vuk(&mk, &vid);
+        let derived = libfreemkv::aacs::derive::derive_vuk(&mk, &vid);
         assert_eq!(
             derived, expected_vuk,
             "VUK derivation failed for disc: {} (hash {})",
@@ -1452,9 +1452,9 @@ mod tests {
         }
 
         let original = std::fs::read(&unit_path).unwrap();
-        assert_eq!(original.len(), libfreemkv::aacs::ALIGNED_UNIT_LEN);
+        assert_eq!(original.len(), libfreemkv::aacs::content::ALIGNED_UNIT_LEN);
         assert!(
-            libfreemkv::aacs::ts_sync_destroyed(&original),
+            libfreemkv::aacs::content::ts_sync_destroyed(&original),
             "Unit should be encrypted"
         );
 
@@ -1478,7 +1478,7 @@ mod tests {
             let keys: Vec<[u8; 16]> = entry.unit_keys.iter().map(|(_, k)| *k).collect();
             let mut unit = original.clone();
 
-            if let Some(res) = libfreemkv::aacs::decrypt_unit_try_keys(&mut unit, &keys) {
+            if let Some(res) = libfreemkv::aacs::content::decrypt_unit_try_keys(&mut unit, &keys) {
                 eprintln!(
                     "SUCCESS: Decrypted with entry {} ({res:?})",
                     entry.disc_hash
@@ -1526,7 +1526,7 @@ mod tests {
 
         // Verify VUK derivation if we have MK + VID
         if let Some(mk) = entry.media_key {
-            let derived = libfreemkv::aacs::derive_vuk(&mk, &vid);
+            let derived = libfreemkv::aacs::derive::derive_vuk(&mk, &vid);
             assert_eq!(derived, vuk, "VUK derivation mismatch");
             eprintln!("VUK derivation verified");
         }
