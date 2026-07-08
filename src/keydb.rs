@@ -90,7 +90,11 @@ impl KeydbSource {
             .lines()
             .filter(|l| {
                 let t = l.trim();
-                t.starts_with("0x")
+                // Mirror KeyDb::parse's disc-entry rule EXACTLY (keydb_format.rs:
+                // a "0x" line is only an entry if it also contains " = "), so
+                // save() never validates + persists content that parses to zero
+                // usable entries (e.g. a stray "0xDEADBEEF" comment line).
+                (t.starts_with("0x") && t.contains(" = "))
                     || t.starts_with("| DK")
                     || t.starts_with("| PK")
                     || t.starts_with("| HC")
@@ -814,7 +818,7 @@ mod tests {
         let target = dir.join("nested").join("mykeys.cfg");
         let src = KeydbSource::new(&target);
 
-        let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF\n";
+        let body = b"0xDEADBEEFDEADBEEFDEADBEEFDEADBEEF = Test\n";
         let result = src.save(body).expect("save must succeed");
 
         assert_eq!(
@@ -840,7 +844,7 @@ mod tests {
         let target = dir.join("k.cfg");
         let src = KeydbSource::new(&target);
 
-        let body = b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD\n".to_vec();
+        let body = b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD = Test\n".to_vec();
         let result = src
             .update(|_url| Ok(body.clone()), "http://example.invalid/keydb.zip")
             .expect("update must succeed with a good fetch");
