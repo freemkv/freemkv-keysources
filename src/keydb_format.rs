@@ -390,6 +390,8 @@ impl KeyDb {
         let mut out = String::new();
 
         // Host certs (AACS 1.0): | HC | HOST_PRIV_KEY 0x.. | HOST_CERT 0x.. ; Revoked in MKBv<N>
+        // AACS 2.0 credentials ride a sibling `| HC2 |` line; emit it too so a
+        // round-trip through `to_keydb_cfg` never silently drops v2 host certs.
         for hc in &self.host_certs {
             out.push_str("| HC | HOST_PRIV_KEY 0x");
             out.push_str(&hx(&hc.cert.private_key));
@@ -400,6 +402,17 @@ impl KeyDb {
                 out.push_str(&n.to_string());
             }
             out.push('\n');
+            // AACS 2.0 (HC2): inverse of `parse_host_cert_v2`.
+            if let (Some(pk2), Some(cert2)) = (
+                hc.cert.private_key_v2.as_ref(),
+                hc.cert.certificate_v2.as_ref(),
+            ) {
+                out.push_str("| HC2 | HOST_PRIV_KEY 0x");
+                out.push_str(&hx(pk2));
+                out.push_str(" | HOST_CERT 0x");
+                out.push_str(&hx(cert2));
+                out.push('\n');
+            }
         }
 
         // Device keys: | DK | DEVICE_KEY 0x.. | DEVICE_NODE 0x.. | KEY_UV 0x.. | KEY_U_MASK_SHIFT 0x..
@@ -429,9 +442,8 @@ impl KeyDb {
             // `0x` would double it on re-parse).
             out.push_str(h);
             out.push_str(" = ");
-            // Parse stores the display title (inside parens) or the whole string
-            // when there are none; emitting the stored title bare round-trips
-            // (no parens → parser keeps it verbatim). Empty → "Unknown".
+            // Parse stores the title VERBATIM (parens and all), so emitting it
+            // bare round-trips through parse. Empty → "Unknown".
             if d.title.is_empty() {
                 out.push_str("Unknown");
             } else {
@@ -1096,8 +1108,8 @@ mod tests {
 
     #[test]
     fn disc_entry_malformed_parens_falls_back_to_whole_title() {
-        // ')' before '(' would make start+1 > end; the guarded get() returns
-        // None and the parser falls back to the whole title (no panic).
+        // The title is kept verbatim regardless of paren placement — a malformed
+        // ')' before '(' is not special-cased; the whole string is the title.
         let line = "0x00 = FILM) (X | M | 0x".to_string() + &"00".repeat(16);
         let e = KeyDb::parse_disc_entry(&line).unwrap();
         assert_eq!(e.title, "FILM) (X");
