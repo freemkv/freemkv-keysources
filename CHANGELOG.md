@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.2] — 2026-07-10
+
+### Changed
+
+- Unit keys carry libfreemkv's new `UnitKey.variant_number`; every source
+  (keydb, online, VUK-derived) emits `0` — ordinary, non-forensic content —
+  via the `UnitKey::new` constructor. No behaviour change. Inherits
+  **libfreemkv 1.3.2**.
+
 ## [1.3.1] — 2026-07-10
 
 ### Licensing

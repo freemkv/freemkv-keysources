@@ -267,10 +267,7 @@ impl KeySource for ScriptedSource {
 }
 
 fn uk(b: u8) -> UnitKey {
-    UnitKey {
-        idx: 0,
-        key: [b; 16],
-    }
+    UnitKey::new(0, [b; 16])
 }
 
 #[test]
