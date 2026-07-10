@@ -225,7 +225,7 @@ fn online_source_unconfigured_is_silent_no_op() {
 
 #[test]
 fn online_source_metadata() {
-    let src = OnlineSource::new("https://example.invalid/keys", "tok");
+    let src = OnlineSource::new("https://example.test/keys", "tok");
     assert_eq!(src.label(), "online");
     // No host-cert serving today — a no-op empty, no network touched.
     assert!(KeySource::host_certs(&src, None).is_empty());
