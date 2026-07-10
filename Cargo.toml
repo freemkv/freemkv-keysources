@@ -40,4 +40,4 @@ codegen-units = 1
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.3.1" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.3.2" }
