@@ -1,9 +1,9 @@
 [package]
 name = "freemkv-keysources"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 rust-version = "1.86"
-license = "AGPL-3.0-only"
+license = "MIT"
 description = "Pluggable AACS key sources (keydb, online key service) for libfreemkv. Each source looks a disc up and hands libfreemkv its terminal Unit Keys via get_uk; the library does all derivation."
 repository = "https://github.com/freemkv/freemkv-keysources"
 keywords = ["aacs", "blu-ray", "uhd", "decryption", "keydb"]
