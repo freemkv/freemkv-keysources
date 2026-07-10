@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.3.0] — 2026-07-08
+
+### Added
+
+- **AACS 2.0 host certs round-trip through `keydb.cfg`.** `to_keydb_cfg` now
+  emits the sibling `| HC2 |` line — the inverse of the v2 host-cert parser — so
+  writing a keydb back out no longer silently drops AACS 2.0 host certs.
+
+### Changed
+
+- **Resolve runs directly on `libfreemkv::aacs` primitives.** After libfreemkv
+  dropped its `aacs::boil` veneer, the resolve path now calls
+  `derive_media_key_from_{pk,dk}`, `derive_vuk`, and `decrypt_unit_key` from
+  `aacs::derive` with the `aacs::types` newtypes. No behaviour change.
+- Inherits **libfreemkv 1.3.0**.
+
+### Fixed
+
+- **keydb save-validation matches the parser exactly.** A `0x` line counts as a
+  disc entry only when it also contains ` = `, so validating and persisting
+  content that parses to zero usable entries (e.g. a stray `0xDEADBEEF` line) can
+  no longer succeed.
+- **Disc-entry titles round-trip verbatim** (parentheses and all) — the parse
+  path now keeps the title exactly as the emit path writes it.
+
 ## [1.2.0] — 2026-06-29
 
 ### Changed
