@@ -306,7 +306,7 @@ impl OnlineSource {
         // A terminal UK is used directly (CPS unit 0 → committed cps 1, matching
         // the old `Key::Unit(vec![(1, uk)])`).
         if let Some(uk) = json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
-            return vec![UnitKey { idx: 0, key: uk }];
+            return vec![UnitKey::new(0, uk)];
         }
         // A VUK is derived to the terminal keys locally, via the disc's
         // encrypted title keys from the context — the library owns the crypto.

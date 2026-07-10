@@ -184,10 +184,7 @@ impl KeydbSource {
         // 1. Terminal Unit Keys stored in the entry — directly usable, no
         //    derivation. Preserve the keydb's CPS numbering (idx = num - 1).
         for (num, key) in &entry.unit_keys {
-            keys.push(UnitKey {
-                idx: num.saturating_sub(1),
-                key: *key,
-            });
+            keys.push(UnitKey::new(num.saturating_sub(1), *key));
         }
 
         // The disc's encrypted title keys (from Unit_Key_RO.inf) — what every
