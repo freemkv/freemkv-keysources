@@ -416,7 +416,7 @@ mod tests {
     /// it's the deliberate no-op stub.
     #[test]
     fn host_certs_is_noop_empty_no_network() {
-        let src = OnlineSource::new("http://example.invalid/keys", "secret");
+        let src = OnlineSource::new("http://example.test/keys", "secret");
         assert!(
             KeySource::host_certs(&src, None).is_empty(),
             "online host_certs must be an empty no-op (no network)"
