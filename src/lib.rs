@@ -47,10 +47,7 @@ pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<U
     enc_title_keys
         .iter()
         .enumerate()
-        .map(|(i, e)| UnitKey {
-            idx: i as u32,
-            key: libfreemkv::aacs::derive::decrypt_unit_key(vuk, e),
-        })
+        .map(|(i, e)| UnitKey::new(i as u32, libfreemkv::aacs::derive::decrypt_unit_key(vuk, e)))
         .collect()
 }
 
