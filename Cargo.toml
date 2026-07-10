@@ -17,7 +17,7 @@ publish = false
 # The crate provides the `KeySource` trait + `Key`/`DiscInputs` types these impls fill.
 # libfreemkv is git-only now; the committed [patch.crates-io] below redirects this
 # bare version req to the libfreemkv git tag (local dev overrides it to a path).
-libfreemkv = "1.2"
+libfreemkv = "1.3"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
@@ -40,4 +40,4 @@ codegen-units = 1
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.2.2" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.3.0" }
