@@ -846,7 +846,7 @@ mod tests {
 
         let body = b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD = Test\n".to_vec();
         let result = src
-            .update(|_url| Ok(body.clone()), "http://example.invalid/keydb.zip")
+            .update(|_url| Ok(body.clone()), "http://example.test/keydb.zip")
             .expect("update must succeed with a good fetch");
 
         assert_eq!(result.path, target, "update must save to the source's path");
