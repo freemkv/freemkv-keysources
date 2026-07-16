@@ -1412,7 +1412,7 @@ mod tests {
     //
     // These exercise the parser (KeyDb::load) end-to-end against a real
     // keydb.cfg and feed its material into libfreemkv's AACS crypto
-    // (derive_vuk / decrypt_unit_try_keys). They live here now that the
+    // (derive_vuk, then decrypt_unit + is_clean_ts). They live here now that the
     // parser lives here. All are KEYDB_PATH-env-gated and no-op in CI when
     // the env is unset; they must still COMPILE.
     // ════════════════════════════════════════════════════════════════════
@@ -1485,20 +1485,20 @@ mod tests {
 
         eprintln!("Found {} entries with unit keys", candidate_entries.len());
 
-        // Try each entry's unit keys
+        // Try each entry's unit keys: apply the key, then ask whether it opened
+        // the unit (the segregated primitives — decrypt, then structural check).
         for entry in &candidate_entries {
-            let keys: Vec<[u8; 16]> = entry.unit_keys.iter().map(|(_, k)| *k).collect();
-            let mut unit = original.clone();
-
-            if let Some(res) = libfreemkv::aacs::content::decrypt_unit_try_keys(&mut unit, &keys) {
-                eprintln!(
-                    "SUCCESS: Decrypted with entry {} ({res:?})",
-                    entry.disc_hash
-                );
-                // Count TS sync bytes
-                let ts = (0..32).filter(|&i| unit[4 + i * 192] == 0x47).count();
-                eprintln!("  TS sync bytes: {}/32", ts);
-                return;
+            for (_, key) in &entry.unit_keys {
+                let mut unit = original.clone();
+                libfreemkv::aacs::content::decrypt_unit(&mut unit, key);
+                if libfreemkv::aacs::content::is_clean(&unit, libfreemkv::disc::ContentFormat::BdTs)
+                {
+                    eprintln!("SUCCESS: Decrypted with entry {}", entry.disc_hash);
+                    // Count TS sync bytes
+                    let ts = (0..32).filter(|&i| unit[4 + i * 192] == 0x47).count();
+                    eprintln!("  TS sync bytes: {}/32", ts);
+                    return;
+                }
             }
         }
 
