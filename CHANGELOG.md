@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.2] — 2026-07-15
+
+Version sync with the workspace; inherits libfreemkv 1.4.2. The keydb test that
+feeds real key material into the AACS crypto was adapted to the segregated
+`decrypt_unit` + `is_clean` primitives (behaviour unchanged).
+
 ## [1.4.1] — 2026-07-14
 
 Version sync with the workspace; inherits libfreemkv 1.4.1.
