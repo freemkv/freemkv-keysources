@@ -16,6 +16,19 @@ use libfreemkv::{Error, KeySource};
 // record stream is normally a few MiB; this is headroom, not an expected size).
 const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
+/// Minimum encrypted-content samples the online source will send in one key
+/// request. The service identifies the key by which of the submitted units it
+/// decrypts, so too few samples — especially on FMTS, where a segment interleaves
+/// several variants at the unit level — can return a key that matches an
+/// incidental unit rather than the one asked about (a false positive). Eight
+/// units drawn from distinct segments make the request unambiguous. A request
+/// carrying fewer is refused (empty result → the resolver moves to the next
+/// source) rather than sent and trusted.
+///
+/// Public so callers that GATHER the samples (the CLI, autorip) sample at least
+/// this many — sampling fewer than the online source's minimum guarantees the
+/// request is skipped and the online source never consulted.
+pub const MIN_SAMPLE_UNITS: usize = 8;
 /// Hard cap on the key-service response body. A real unit-key reply is a few
 /// hundred bytes; bound the read so a malicious/compromised server can't drive
 /// the client to OOM with an unbounded body.
@@ -219,6 +232,22 @@ impl OnlineSource {
             );
             return Vec::new();
         }
+        // Gather encrypted-content samples FIRST and enforce the minimum: the
+        // service resolves a key by which submitted unit it decrypts, so a
+        // request carrying fewer than `MIN_SAMPLE_UNITS` can return a key matching
+        // an incidental unit (a false positive, seen on FMTS variant units). Refuse
+        // to send an under-sampled request — return empty so the resolver falls
+        // through to the next source rather than trusting an ambiguous key.
+        let samples = ctx.samples(64).unwrap_or_default();
+        if samples.len() < MIN_SAMPLE_UNITS {
+            tracing::info!(
+                target: "freemkv::keysource",
+                samples = samples.len(),
+                min = MIN_SAMPLE_UNITS,
+                "too few content samples for a reliable online key request; skipping the online source"
+            );
+            return Vec::new();
+        }
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
             // Raw Unit_Key_RO.inf, verbatim — the server does its own parse /
@@ -229,18 +258,14 @@ impl OnlineSource {
         if let Some(vid) = ctx.vid() {
             body["vid_b64"] = serde_json::Value::String(b64.encode(vid.0));
         }
-        // Up to a generous cap of encrypted content samples for server-side
-        // ciphertext validation.
-        if let Ok(samples) = ctx.samples(64) {
-            if !samples.is_empty() {
-                body["units_b64"] = serde_json::Value::Array(
-                    samples
-                        .iter()
-                        .map(|u| serde_json::Value::String(b64.encode(u)))
-                        .collect(),
-                );
-            }
-        }
+        // Encrypted-content samples for server-side ciphertext validation (already
+        // gathered + minimum-checked above).
+        body["units_b64"] = serde_json::Value::Array(
+            samples
+                .iter()
+                .map(|u| serde_json::Value::String(b64.encode(u)))
+                .collect(),
+        );
         // The disc's own title (UDF/ISO volume id), plain text. The key service
         // catalogs it by disc_hash (its disc-titles.json) — independent of keydb.
         if let Some(label) = ctx.title().map(str::trim) {
@@ -303,10 +328,28 @@ impl OnlineSource {
             Ok(j) => j,
             Err(_) => return Vec::new(),
         };
-        // A terminal UK is used directly (CPS unit 0 → committed cps 1, matching
-        // the old `Key::Unit(vec![(1, uk)])`).
-        if let Some(uk) = json.get("UK").and_then(|u| u.as_str()).and_then(parse_uk) {
-            return vec![UnitKey::new(0, uk)];
+        // `UK` is an ARRAY of hex keys (the service always returns an array now,
+        // even of one). A single element is the base Unit Key. A full set (one per
+        // forensic index, ordered index 1..N) is returned for a forensic sample.
+        // Preserve array order and tag each key with its array position, so the
+        // caller can map position → index (element i = index i+1). A bare string is
+        // still accepted for backward compatibility.
+        if let Some(uk) = json.get("UK") {
+            let mut out = Vec::new();
+            if let Some(s) = uk.as_str() {
+                if let Some(k) = parse_uk(s) {
+                    out.push(UnitKey::new(0, k));
+                }
+            } else if let Some(arr) = uk.as_array() {
+                for (i, v) in arr.iter().enumerate() {
+                    if let Some(k) = v.as_str().and_then(parse_uk) {
+                        out.push(UnitKey::new(i as u32, k));
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
         }
         // A VUK is derived to the terminal keys locally, via the disc's
         // encrypted title keys from the context — the library owns the crypto.
