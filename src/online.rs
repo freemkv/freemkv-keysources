@@ -17,18 +17,18 @@ use libfreemkv::{Error, KeySource};
 const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
 /// Minimum encrypted-content samples the online source will send in one key
-/// request. The service identifies the key by which of the submitted units it
-/// decrypts, so too few samples — especially on FMTS, where a segment interleaves
-/// several variants at the unit level — can return a key that matches an
-/// incidental unit rather than the one asked about (a false positive). Eight
-/// units drawn from distinct segments make the request unambiguous. A request
-/// carrying fewer is refused (empty result → the resolver moves to the next
-/// source) rather than sent and trusted.
+/// request — re-exported from the base crate ([`libfreemkv::keysource::MIN_SAMPLE_UNITS`])
+/// so this crate and libfreemkv's own FMTS forensic query share ONE value.
 ///
-/// Public so callers that GATHER the samples (the CLI, autorip) sample at least
-/// this many — sampling fewer than the online source's minimum guarantees the
-/// request is skipped and the online source never consulted.
-pub const MIN_SAMPLE_UNITS: usize = 8;
+/// The service identifies the key by which of the submitted units it decrypts,
+/// so too few samples — especially on FMTS, where a segment interleaves several
+/// variants at the unit level — can return a key that matches an incidental unit
+/// rather than the one asked about (a false positive). A request carrying fewer
+/// is refused (empty result → the resolver moves to the next source) rather than
+/// sent and trusted. Kept public so callers that GATHER the samples (the CLI,
+/// autorip) sample at least this many — sampling fewer guarantees the request is
+/// skipped and the online source never consulted.
+pub use libfreemkv::keysource::MIN_SAMPLE_UNITS;
 /// Hard cap on the key-service response body. A real unit-key reply is a few
 /// hundred bytes; bound the read so a malicious/compromised server can't drive
 /// the client to OOM with an unbounded body.
