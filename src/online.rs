@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
-use libfreemkv::keysource::ResolveCtx;
+use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
 use libfreemkv::{Error, KeySource};
 
 // Upper bound on the MKB forwarded to the key service — kept in lockstep with
@@ -232,22 +232,23 @@ impl OnlineSource {
             );
             return Vec::new();
         }
-        // Gather encrypted-content samples FIRST and enforce the minimum: the
-        // service resolves a key by which submitted unit it decrypts, so a
-        // request carrying fewer than `MIN_SAMPLE_UNITS` can return a key matching
-        // an incidental unit (a false positive, seen on FMTS variant units). Refuse
-        // to send an under-sampled request — return empty so the resolver falls
-        // through to the next source rather than trusting an ambiguous key.
-        let samples = ctx.samples(64).unwrap_or_default();
-        if samples.len() < MIN_SAMPLE_UNITS {
+        // Gather encrypted-content samples and prove the minimum by TYPE: a
+        // `DecodeSampleSet` only exists with >= MIN_SAMPLE_UNITS units, so from here
+        // on the request cannot be built under-sized. The service resolves a key by
+        // which submitted unit it decrypts, so a request carrying too few can return
+        // a key matching an incidental unit (a false positive, seen on FMTS variant
+        // units) — too few → skip this source and fall through to the next.
+        let gathered = ctx.samples(64).unwrap_or_default();
+        let n = gathered.len();
+        let Some(samples) = DecodeSampleSet::new(gathered) else {
             tracing::info!(
                 target: "freemkv::keysource",
-                samples = samples.len(),
+                samples = n,
                 min = MIN_SAMPLE_UNITS,
                 "too few content samples for a reliable online key request; skipping the online source"
             );
             return Vec::new();
-        }
+        };
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
             // Raw Unit_Key_RO.inf, verbatim — the server does its own parse /
@@ -262,6 +263,7 @@ impl OnlineSource {
         // gathered + minimum-checked above).
         body["units_b64"] = serde_json::Value::Array(
             samples
+                .units()
                 .iter()
                 .map(|u| serde_json::Value::String(b64.encode(u)))
                 .collect(),
