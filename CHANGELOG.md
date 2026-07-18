@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.4.5] — 2026-07-18
+
+Version sync; inherits libfreemkv 1.4.5. `KeySource` split into `get_unit_keys` +
+`get_fmts_indexes`, and a keydb device-key parse bug on an uppercase `0X` hex
+prefix was fixed (case-insensitive hex parsing across the toolchain).
+
+## [1.4.4] — 2026-07-17
+
+Version sync; inherits libfreemkv 1.4.4. The online `/decode` request is built from
+a `DecodeSampleSet` proven sufficient by type rather than a runtime length check.
+
+## [1.4.3] — 2026-07-17
+
+Version sync; inherits libfreemkv 1.4.3. The online unit-key reply is parsed as a
+list (one key for an ordinary disc, the ordered set for a forensic-variant disc),
+and `MIN_SAMPLE_UNITS` is re-exported from libfreemkv.
+
 ## [1.4.2] — 2026-07-15
 
 Version sync with the workspace; inherits libfreemkv 1.4.2. The keydb test that
