@@ -12,7 +12,7 @@
 //! in — then resolve and hand the resulting key to `Disc::decrypt_with`.
 //!
 //! Each source resolves a disc's terminal **Unit Keys** in one shot via
-//! [`KeySource::get_uk`], driving libfreemkv's boil-down crypto primitives for
+//! [`KeySource::get_unit_keys`], driving libfreemkv's boil-down crypto primitives for
 //! whatever level of material it holds. Compose several with [`MultiSource`] in
 //! the caller's chosen order. Reading the encrypted content-sample units a key
 //! server validates on, and applying the resolved keys against a disc, is
@@ -51,9 +51,11 @@ pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<U
         .collect()
 }
 
-/// An ordered composition of key sources, driven as one. [`MultiSource::get_uk`]
-/// tries each inner source in order and returns the first non-empty Unit Key
-/// set. **The caller supplies the list AND the order** — local-first `[Keydb,
+/// An ordered composition of key sources, driven as one.
+/// [`MultiSource::get_unit_keys`] tries each inner source in order and returns
+/// the first non-empty Unit Key set (and [`MultiSource::get_fmts_indexes`] does
+/// the same for the forensic set). **The caller supplies the list AND the
+/// order** — local-first `[Keydb,
 /// Online]`, online-first `[Online, Keydb]`, etc. —
 /// so the "which sources, in what order" policy lives entirely with the
 /// application, not the library. `MultiSource` is itself a [`KeySource`], so it
@@ -70,13 +72,28 @@ impl MultiSource {
 }
 
 impl KeySource for MultiSource {
-    /// Try each inner source in order; the FIRST to return a non-empty Unit Key
-    /// set wins. An inner source that returns empty OR errors is treated as "no
-    /// key here" and the next is tried (a single source failure never blocks the
-    /// chain). All sources exhausted → empty.
-    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+    /// Try each inner source in order; the FIRST to return a non-empty base Unit
+    /// Key set wins. An inner source that returns empty OR errors is treated as
+    /// "no key here" and the next is tried (a single source failure never blocks
+    /// the chain). All sources exhausted → empty.
+    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         for s in &self.sources {
-            if let Ok(uks) = s.get_uk(ctx) {
+            if let Ok(uks) = s.get_unit_keys(ctx) {
+                if !uks.is_empty() {
+                    return Ok(uks);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Forensic-index counterpart: try each inner source's `get_fmts_indexes` in
+    /// the same order and return the first non-empty set. A source with no
+    /// forensic material (the keydb, via the trait default) contributes empty and
+    /// is skipped; on today's discs the online source answers.
+    fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+        for s in &self.sources {
+            if let Ok(uks) = s.get_fmts_indexes(ctx) {
                 if !uks.is_empty() {
                     return Ok(uks);
                 }
