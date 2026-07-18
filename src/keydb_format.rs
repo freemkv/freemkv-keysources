@@ -506,9 +506,12 @@ impl KeyDb {
 
         Some(DeviceKey {
             key: parse_hex16(key_str)?,
-            node: u16::from_str_radix(node_str.trim_start_matches("0x"), 16).ok()?,
-            uv: u32::from_str_radix(uv_str.trim_start_matches("0x"), 16).ok()?,
-            u_mask_shift: u8::from_str_radix(shift_str.trim_start_matches("0x"), 16).ok()?,
+            // Canonical hex parsers (one prefix/case rule for the whole workspace)
+            // — NOT an ad-hoc `from_str_radix(trim_start_matches("0x"))`, whose
+            // case-sensitive strip silently dropped an uppercase-`0X` value.
+            node: libfreemkv::hex::parse_hex_u16(node_str)?,
+            uv: libfreemkv::hex::parse_hex_u32(uv_str)?,
+            u_mask_shift: libfreemkv::hex::parse_hex_u8(shift_str)?,
         })
     }
 
@@ -1220,6 +1223,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_device_key_accepts_uppercase_0x_prefix() {
+        // Regression: node/uv/shift parsed via a case-sensitive
+        // `trim_start_matches("0x")`, so an uppercase `0X` prefix was not
+        // stripped, `from_str_radix` failed, and the WHOLE device key was
+        // silently dropped. All four fields must parse regardless of prefix case.
+        let line = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F \
+                    | DEVICE_NODE 0X0001 | KEY_UV 0X00000002 | KEY_U_MASK_SHIFT 0X03";
+        let dk = KeyDb::parse_device_key(line).expect("uppercase 0X prefix must parse");
+        assert_eq!(dk.node, 1);
+        assert_eq!(dk.uv, 2);
+        assert_eq!(dk.u_mask_shift, 3);
+    }
+
+    #[test]
     fn parse_host_cert_v2_rejects_wrong_priv_len_and_short_cert() {
         // v2 priv must be exactly 32 bytes; cert must be >= 132.
         let bad_priv = format!(
@@ -1527,7 +1544,7 @@ mod tests {
         let entry = entry.unwrap();
         let vuk = entry.vuk.unwrap();
         let vid = entry.vid.unwrap();
-        let hash_hex = format!("0x{}", entry.disc_hash.trim_start_matches("0x"));
+        let hash_hex = format!("0x{}", libfreemkv::hex::strip_hex_prefix(&entry.disc_hash));
 
         // We need the actual Unit_Key_RO.inf from the disc to compute disc hash.
         // Since we don't have it, we can at least test that the KEYDB lookup
