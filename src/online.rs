@@ -365,7 +365,21 @@ impl OnlineSource {
 }
 
 impl KeySource for OnlineSource {
-    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+    /// Base per-CPS-unit Unit Keys: submit the ctx's content samples and take the
+    /// service's reply (a terminal `UK`, or a `VUK` derived locally). One network
+    /// round-trip; any failure yields empty (the resolver tries the next source).
+    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        Ok(self.query(ctx))
+    }
+
+    /// AACS 2.1 forensic index set: the mux injects an index-1 single-phase anchor
+    /// batch as the ctx's samples; the service maps it to the full ordered set of
+    /// forensic index keys, tagged by array position (element `i` → forensic index
+    /// `i + 1`). Same one round-trip as [`get_unit_keys`](Self::get_unit_keys) —
+    /// the difference is purely which samples the mux gathered and how the caller
+    /// reads the reply. The count is whatever the service returns; the mux trusts
+    /// any non-empty result as the complete set and never assumes 32.
+    fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         Ok(self.query(ctx))
     }
 

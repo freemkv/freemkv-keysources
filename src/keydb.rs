@@ -328,10 +328,14 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
 }
 
 impl KeySource for KeydbSource {
-    /// Resolve this disc's terminal Unit Keys from the keydb. A missing /
+    /// Resolve this disc's base per-CPS-unit Unit Keys from the keydb. A missing /
     /// unreadable keydb is not an error — it simply yields no keys (another
     /// source may have them), the same as the library's own loader.
-    fn get_uk(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+    ///
+    /// The keydb carries no AACS 2.1 forensic index keys today, so it does not
+    /// override `get_fmts_indexes` — the default (empty) opts it out, and an FMTS
+    /// disc's forensic set comes from the online source.
+    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         match KeyDb::load(&self.path) {
             Ok(db) => Ok(Self::unit_keys_from(&db, ctx)),
             Err(_) => Ok(Vec::new()),
@@ -748,7 +752,7 @@ mod tests {
     fn get_uk_missing_keydb_is_ok_empty() {
         let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
         let got = src
-            .get_uk(&ctx(HASH, Vec::new(), None))
+            .get_unit_keys(&ctx(HASH, Vec::new(), None))
             .expect("missing keydb is not an error");
         assert!(got.is_empty());
     }

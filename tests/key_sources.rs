@@ -2,7 +2,7 @@
 //!
 //! These exercise the *public* surface of `freemkv-keysources` end-to-end —
 //! real files on disk, the real `KeyDb`/`Mapfile` parsers from libfreemkv, and
-//! the `KeySource` trait (`get_uk` over a `ResolveCtx`) the applications drive.
+//! the `KeySource` trait (`get_unit_keys` over a `ResolveCtx`) the applications drive.
 //!
 //! Covered:
 //! - `KeydbSource`: terminal unit-key lookup by disc hash through a real
@@ -71,8 +71,8 @@ fn inputs(hash: &str) -> DiscInputs {
 /// Resolve a source through the public trait over a `DiscInputsCtx`.
 fn resolve(src: &dyn KeySource, inp: &DiscInputs) -> Vec<UnitKey> {
     let ctx = DiscInputsCtx::new(inp);
-    src.get_uk(&ctx)
-        .expect("get_uk must not error for these fixtures")
+    src.get_unit_keys(&ctx)
+        .expect("get_unit_keys must not error for these fixtures")
 }
 
 // ── KeydbSource: real-file lookup by disc hash ──────────────────────────────
@@ -130,7 +130,7 @@ fn keydb_source_missing_file_is_silent_ok_empty() {
     let inp = inputs(DISC_HASH);
     let ctx = DiscInputsCtx::new(&inp);
     assert!(
-        src.get_uk(&ctx)
+        src.get_unit_keys(&ctx)
             .expect("missing keydb is Ok, not Err")
             .is_empty()
     );
@@ -258,7 +258,7 @@ impl ScriptedSource {
 }
 
 impl KeySource for ScriptedSource {
-    fn get_uk(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+    fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         Ok(self.keys.clone())
     }
     fn label(&self) -> &'static str {
