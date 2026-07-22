@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.5.2] — UNRELEASED
+
+Version sync with the workspace; inherits libfreemkv 1.5.2 (CSS DVD descramble
+fix). No source change in this crate.
+
 ## [1.4.5] — 2026-07-18
 
 Version sync; inherits libfreemkv 1.4.5. `KeySource` split into `get_unit_keys` +
