@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.5.2] — UNRELEASED
+## [1.5.2] — 2026-07-22
 
 Version sync with the workspace; inherits libfreemkv 1.5.2 (CSS DVD descramble
 fix). No source change in this crate.
