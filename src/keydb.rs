@@ -367,7 +367,7 @@ mod tests {
     use libfreemkv::aacs::types::DeviceKey;
     use std::collections::HashMap;
 
-    // ── A test ResolveCtx, so get_uk's path selection can be exercised without
+    // ── A test ResolveCtx, so get_unit_keys's path selection can be exercised without
     //    a real Disc. Each accessor returns exactly what a case needs. ──────────
     struct MockCtx {
         disc_hash: String,
