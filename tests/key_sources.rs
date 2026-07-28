@@ -1,7 +1,7 @@
 //! Fixture-based integration tests for the published key sources.
 //!
 //! These exercise the *public* surface of `freemkv-keysources` end-to-end —
-//! real files on disk, the real `KeyDb`/`Mapfile` parsers from libfreemkv, and
+//! real files on disk, the real `KeyDb` parser from libfreemkv, and
 //! the `KeySource` trait (`get_unit_keys` over a `ResolveCtx`) the applications drive.
 //!
 //! Covered:

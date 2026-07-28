@@ -212,7 +212,7 @@ impl OnlineSource {
     /// disc's encrypted title keys from `ctx`). Any failure — no service,
     /// over-cap MKB, network/parse error, or no key for this disc — yields an
     /// empty `Vec` (the resolver tries the next source). `&self`: one-shot is
-    /// the resolver's contract (each source's `get_uk` is called once), so no
+    /// the resolver's contract (each source's `get_unit_keys` is called once), so no
     /// per-call latch is needed.
     fn query(&self, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
         // No configured service: nothing to resolve.

@@ -1,10 +1,10 @@
 [package]
 name = "freemkv-keysources"
-version = "1.5.2"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
-description = "Pluggable AACS key sources (keydb, online key service) for libfreemkv. Each source looks a disc up and hands libfreemkv its terminal Unit Keys via get_uk; the library does all derivation."
+description = "Pluggable AACS key sources (keydb, online key service) for libfreemkv. Each source looks a disc up and hands libfreemkv its terminal Unit Keys via get_unit_keys; the library does all derivation."
 repository = "https://github.com/freemkv/freemkv-keysources"
 keywords = ["aacs", "blu-ray", "uhd", "decryption", "keydb"]
 categories = ["multimedia"]
@@ -34,7 +34,7 @@ tracing = "0.1"
 lto = "thin"
 codegen-units = 1
 
-# libfreemkv is git-only (off crates.io). Redirect the bare `libfreemkv = "1.2"`
+# libfreemkv is git-only (off crates.io). Redirect the bare `libfreemkv = "1.5"`
 # req above to the git tag — committed and CI-visible. The release script
 # rewrites this tag to the new version before regenerating Cargo.lock. Local dev
 # overrides it with a path patch via the gitignored .cargo/config.toml (a

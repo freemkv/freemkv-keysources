@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.6.0] — UNRELEASED
+
+Version sync with the workspace (freemkv-engine split release). No source change
+in this crate; it remains a pluggable AACS key-source provider consumed by the
+`freemkv` CLI and libfreemkv's key resolver.
+
 ## [1.5.2] — 2026-07-22
 
 Version sync with the workspace; inherits libfreemkv 1.5.2 (CSS DVD descramble
