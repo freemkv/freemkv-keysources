@@ -265,22 +265,33 @@ impl KeyDb {
     /// [`KeyDb`] rather than an error — callers needing a non-empty db must
     /// check the parsed contents.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
-        // Stat-and-cap before reading so a hostile/corrupt file can't force an
-        // unbounded allocation. A file strictly over the cap is rejected (a
-        // file exactly at MAX_KEYDB_BYTES is accepted, matching the `>` guard
-        // and libfreemkv's original at-cap-is-allowed semantics).
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.len() > MAX_KEYDB_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "keydb.cfg exceeds {MAX_KEYDB_BYTES} byte cap: {}",
-                        path.display()
-                    ),
-                ));
-            }
+        // Read through a hard `take` cap rather than trusting a stat. A
+        // `metadata` pre-check is only advisory: it is skipped entirely when the
+        // stat fails, and it reports len 0 for a FIFO or character device, so
+        // `--keydb /dev/zero` passed the guard and then read forever (NUL is
+        // valid UTF-8, so it did not even fail the decode — it just grew until
+        // the process was OOM-killed). Reading one byte past the cap accepts an
+        // exactly-at-cap file and rejects anything larger, matching
+        // `read_capped_to_string` on the download path.
+        use std::io::Read;
+        let f = std::fs::File::open(path)?;
+        let mut buf = Vec::new();
+        f.take(MAX_KEYDB_BYTES + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_KEYDB_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "keydb.cfg exceeds {MAX_KEYDB_BYTES} byte cap: {}",
+                    path.display()
+                ),
+            ));
         }
-        let data = std::fs::read_to_string(path)?;
+        let data = String::from_utf8(buf).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("keydb.cfg is not valid UTF-8: {}", path.display()),
+            )
+        })?;
         Ok(Self::parse(&data))
     }
 
@@ -726,6 +737,43 @@ impl KeyDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load` must enforce `MAX_KEYDB_BYTES` through a bounded read, not a stat.
+    ///
+    /// Regression: the cap used to be a `std::fs::metadata` pre-check followed by
+    /// an unbounded `read_to_string`. That is not a cap — it is skipped when the
+    /// stat fails, and a FIFO or character device reports len 0, so the guard
+    /// passed and the read never terminated. NUL bytes are valid UTF-8, so
+    /// `--keydb /dev/zero` did not even fail the decode; it allocated until the
+    /// process died. Asserts both edges of the boundary so a future cap change
+    /// cannot quietly re-introduce an off-by-one.
+    #[test]
+    fn load_enforces_the_size_cap_at_both_edges() {
+        let dir = std::env::temp_dir()
+            .join("fmkv-keydb-cap")
+            .join(format!("{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Exactly at the cap is accepted. Use a comment line so `parse` is happy
+        // and the content is valid UTF-8 of a known length.
+        let at = dir.join("at_cap.cfg");
+        let body = vec![b'#'; MAX_KEYDB_BYTES as usize];
+        std::fs::write(&at, &body).unwrap();
+        assert!(
+            KeyDb::load(&at).is_ok(),
+            "a file exactly at MAX_KEYDB_BYTES must load"
+        );
+
+        // One byte over is rejected as InvalidData, not truncated and not OOM.
+        let over = dir.join("over_cap.cfg");
+        let mut body = vec![b'#'; MAX_KEYDB_BYTES as usize];
+        body.push(b'#');
+        std::fs::write(&over, &body).unwrap();
+        let err = KeyDb::load(&over).expect_err("over-cap file must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// `to_keydb_cfg` is the exact inverse of `parse`: parse a known line set,
     /// serialize it, re-parse, and every field survives — device key, processing
