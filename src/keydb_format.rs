@@ -23,9 +23,10 @@ use libfreemkv::aacs::types::{DeviceKey, HostCert};
 pub type NumberedUnitKey = (u32, [u8; 16]);
 
 /// Upper bound on the on-disk keydb.cfg size accepted by [`KeyDb::load`].
-/// The real public UHD keydb is a few MiB; 64 MiB is generous headroom while
-/// still bounding the worst-case allocation from a hostile/corrupt file.
-const MAX_KEYDB_BYTES: u64 = 64 * 1024 * 1024;
+/// The public UHD keydb (fvonline) is ~62 MiB and growing; 128 MiB is generous
+/// headroom while still bounding the worst-case allocation from a hostile or
+/// corrupt file.
+const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Upper bound on parsed disc entries. The real public keydb carries
 /// ~170k+ entries, so the cap sits well above that while still bounding
