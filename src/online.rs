@@ -281,7 +281,20 @@ impl OnlineSource {
         // request (and the bearer token) to an internal/metadata host.
         let pinned = match resolve_and_guard(&self.base_url) {
             Ok(addrs) => addrs,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                // Log THAT the URL was rejected, never WHY: the guard's message
+                // names the resolved address, and an internal address must not
+                // reach a log an operator may paste into a bug report. The
+                // static label is enough to separate "misconfigured/blocked
+                // key-service URL" from "this disc has no key", which is the
+                // only distinction the operator needs here.
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    phase = "keyserver_post",
+                    "key-service URL failed the address guard; skipping the online source"
+                );
+                return Vec::new();
+            }
         };
         let agent = hardened_agent(pinned);
         let mut req = agent.post(&self.base_url);
@@ -298,13 +311,30 @@ impl OnlineSource {
         let post_t0 = std::time::Instant::now();
         let resp = match req.send_json(body) {
             Ok(r) => r,
-            Err(_) => {
-                tracing::warn!(
-                    target: "freemkv::keysource",
-                    phase = "keyserver_post",
-                    elapsed_ms = post_t0.elapsed().as_millis() as u64,
-                    "keyserver request failed (timeout, network, or HTTP error)"
-                );
+            Err(e) => {
+                // Record the HTTP status when the service actually answered:
+                // 401/403 (bad or expired token), 429 (rate limited) and
+                // 5xx (service down) are completely different operator actions,
+                // and collapsing them into one line is why a 502 was read as
+                // "this disc has no key". The status is the service's own
+                // response code — it carries no key material and no address.
+                // A transport error has no status; report it as such rather
+                // than inventing one.
+                match e {
+                    ureq::Error::Status(code, _) => tracing::warn!(
+                        target: "freemkv::keysource",
+                        phase = "keyserver_post",
+                        http_status = code,
+                        elapsed_ms = post_t0.elapsed().as_millis() as u64,
+                        "key service returned an HTTP error; no key from online"
+                    ),
+                    ureq::Error::Transport(_) => tracing::warn!(
+                        target: "freemkv::keysource",
+                        phase = "keyserver_post",
+                        elapsed_ms = post_t0.elapsed().as_millis() as u64,
+                        "key service unreachable (connect/timeout/TLS); no key from online"
+                    ),
+                }
                 return Vec::new();
             }
         };
@@ -324,11 +354,27 @@ impl OnlineSource {
             .is_err()
             || buf.len() > MAX_RESPONSE_BYTES
         {
+            // Length only — never the body, which carries base64 key material.
+            tracing::warn!(
+                target: "freemkv::keysource",
+                phase = "keyserver_post",
+                cap = MAX_RESPONSE_BYTES,
+                "key-service reply was unreadable or over the size cap; no key from online"
+            );
             return Vec::new();
         }
         let json: serde_json::Value = match serde_json::from_slice(&buf) {
             Ok(j) => j,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                // Never log the parse error or the payload: a serde message
+                // quotes the offending input, which here is key material.
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    phase = "keyserver_post",
+                    "key-service reply was not valid JSON; no key from online"
+                );
+                return Vec::new();
+            }
         };
         // `UK` is an ARRAY of hex keys (the service always returns an array now,
         // even of one). A single element is the base Unit Key. A full set (one per
@@ -343,10 +389,30 @@ impl OnlineSource {
                     out.push(UnitKey::new(0, k));
                 }
             } else if let Some(arr) = uk.as_array() {
+                // A forensic set is only usable COMPLETE: the mux trusts any
+                // non-empty result as the whole set and never assumes 32 (see
+                // `get_fmts_indexes`). Skipping an unparseable element would
+                // hand back a short set that silently omits an index, so a
+                // malformed element rejects the whole reply — that is a service
+                // bug, not a usable answer.
+                let mut bad = false;
                 for (i, v) in arr.iter().enumerate() {
-                    if let Some(k) = v.as_str().and_then(parse_uk) {
-                        out.push(UnitKey::new(i as u32, k));
+                    match v.as_str().and_then(parse_uk) {
+                        Some(k) => out.push(UnitKey::new(i as u32, k)),
+                        None => {
+                            bad = true;
+                            break;
+                        }
                     }
+                }
+                if bad {
+                    tracing::warn!(
+                        target: "freemkv::keysource",
+                        phase = "keyserver_post",
+                        keys = arr.len(),
+                        "key-service returned a malformed key in the UK set; rejecting the whole reply"
+                    );
+                    return Vec::new();
                 }
             }
             if !out.is_empty() {
@@ -356,10 +422,28 @@ impl OnlineSource {
         // A VUK is derived to the terminal keys locally, via the disc's
         // encrypted title keys from the context — the library owns the crypto.
         if let Some(vuk) = json.get("VUK").and_then(|u| u.as_str()).and_then(parse_uk) {
-            if let Ok(enc) = ctx.enc_title_keys() {
-                return uks_from_vuk(&vuk, enc);
+            match ctx.enc_title_keys() {
+                Ok(enc) => return uks_from_vuk(&vuk, enc),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "freemkv::keysource",
+                        phase = "keyserver_post",
+                        "key-service returned a VUK but the disc's encrypted title keys \
+                         are unreadable; cannot derive unit keys"
+                    );
+                    return Vec::new();
+                }
             }
         }
+        // The genuine miss. Logged distinctly from every failure above so an
+        // operator can tell "the service has no key for this disc" from "the
+        // service did not answer" — collapsing the two is what made a 502 look
+        // like a missing key.
+        tracing::info!(
+            target: "freemkv::keysource",
+            phase = "keyserver_post",
+            "key service has no key for this disc"
+        );
         Vec::new()
     }
 }
