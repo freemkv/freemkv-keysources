@@ -43,8 +43,8 @@ use crate::keydb_format::KeyDb;
 /// Upper bound on decompressed keydb size. The published keydb is a few MiB;
 /// 128 MiB is a generous ceiling that still caps a decompression bomb (a tiny
 /// zip/gz can otherwise inflate to GiB and OOM the daily refresh thread). The
-/// public UHD keydb (fvonline) is ~62 MiB and growing, so 64 MiB was getting
-/// tight; 128 MiB leaves years of headroom.
+/// public UHD keydb is ~62 MiB and growing, so 64 MiB was getting tight;
+/// 128 MiB leaves years of headroom.
 const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Result of a KEYDB save/update -- path written, entry count, and byte size.
