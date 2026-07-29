@@ -219,6 +219,28 @@ impl OnlineSource {
         if self.base_url.is_empty() {
             return Vec::new();
         }
+        // Refuse to transmit over plaintext. The request body always carries
+        // base64 AACS key material (inf/mkb/units/vid) and, when configured, a
+        // bearer token in a header — so an `http://` POST hands both to any
+        // on-path observer, and the token is replayable.
+        //
+        // There is no legitimate plaintext deployment to preserve here: the
+        // address guard below rejects loopback, RFC1918, ULA and link-local, so
+        // an `http://` URL can only ever reach the PUBLIC internet — the single
+        // worst case for cleartext. A self-hosted keyserver on a LAN is already
+        // impossible by that guard, whatever its scheme.
+        //
+        // Falls through to the next key source (a local keydb) rather than
+        // failing the rip, and says why — misconfiguration should be visible,
+        // not silently indistinguishable from "this disc has no key".
+        if !self.base_url.starts_with("https://") {
+            tracing::warn!(
+                target: "freemkv::keysource",
+                "key-service URL is not https:// — refusing to send key material \
+                 and credentials in cleartext; skipping the online source"
+            );
+            return Vec::new();
+        }
         let mkb = ctx.mkb().unwrap_or(&[]);
         // An over-cap MKB cannot be forwarded — bound the body. Log it: a silent
         // empty return here is indistinguishable from "no key", so surface the
