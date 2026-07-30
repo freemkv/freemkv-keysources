@@ -698,22 +698,19 @@ impl KeyDb {
                         i += 1;
                     }
                 }
-                "U" => {
-                    if i + 1 < parts.len() {
-                        // Unit keys: "1-0xKEY" or "1-0xKEY ; comment"
-                        let uk_str = parts[i + 1].split(';').next().unwrap_or("").trim();
-                        for uk in uk_str.split(' ') {
-                            let uk = uk.trim();
-                            if let Some((num, key)) = uk.split_once('-') {
-                                if let Ok(n) = num.parse::<u32>() {
-                                    if let Some(k) = parse_hex16(key) {
-                                        unit_keys.push((n, k));
-                                    }
-                                }
-                            }
+                "U" if i + 1 < parts.len() => {
+                    // Unit keys: "1-0xKEY" or "1-0xKEY ; comment"
+                    let uk_str = parts[i + 1].split(';').next().unwrap_or("").trim();
+                    for uk in uk_str.split(' ') {
+                        let uk = uk.trim();
+                        if let Some((num, key)) = uk.split_once('-')
+                            && let Ok(n) = num.parse::<u32>()
+                            && let Some(k) = parse_hex16(key)
+                        {
+                            unit_keys.push((n, k));
                         }
-                        i += 1;
                     }
+                    i += 1;
                 }
                 _ => {}
             }
