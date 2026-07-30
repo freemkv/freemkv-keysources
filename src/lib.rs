@@ -78,10 +78,10 @@ impl KeySource for MultiSource {
     /// the chain). All sources exhausted → empty.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         for s in &self.sources {
-            if let Ok(uks) = s.get_unit_keys(ctx) {
-                if !uks.is_empty() {
-                    return Ok(uks);
-                }
+            if let Ok(uks) = s.get_unit_keys(ctx)
+                && !uks.is_empty()
+            {
+                return Ok(uks);
             }
         }
         Ok(Vec::new())
@@ -93,10 +93,10 @@ impl KeySource for MultiSource {
     /// is skipped; on today's discs the online source answers.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         for s in &self.sources {
-            if let Ok(uks) = s.get_fmts_indexes(ctx) {
-                if !uks.is_empty() {
-                    return Ok(uks);
-                }
+            if let Ok(uks) = s.get_fmts_indexes(ctx)
+                && !uks.is_empty()
+            {
+                return Ok(uks);
             }
         }
         Ok(Vec::new())

@@ -292,10 +292,10 @@ impl OnlineSource {
         );
         // The disc's own title (UDF/ISO volume id), plain text. The key service
         // catalogs it by disc_hash (its disc-titles.json) — independent of keydb.
-        if let Some(label) = ctx.title().map(str::trim) {
-            if !label.is_empty() {
-                body["title"] = serde_json::Value::String(label.to_string());
-            }
+        if let Some(label) = ctx.title().map(str::trim)
+            && !label.is_empty()
+        {
+            body["title"] = serde_json::Value::String(label.to_string());
         }
         // Resolve + SSRF-guard the host just before the POST; pin the
         // validated addresses into a redirect-disabled agent so a DNS
