@@ -779,11 +779,7 @@ mod tests {
     /// internal key forms (e.g. the `0x`-prefixed disc-hash) match by construction.
     #[test]
     fn to_keydb_cfg_round_trips_through_parse() {
-        let h = |b: u8, n: usize| {
-            std::iter::repeat(format!("{b:02x}"))
-                .take(n)
-                .collect::<String>()
-        };
+        let h = |b: u8, n: usize| format!("{b:02x}").repeat(n);
         let cert = h(0x99, 92); // AACS 1.0 host cert is 92 bytes
         let src = format!(
             "| HC | HOST_PRIV_KEY 0x{priv20} | HOST_CERT 0x{cert} ; Revoked in MKBv72\n\
