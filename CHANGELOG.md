@@ -2,6 +2,17 @@
 
 ## [1.6.0] — UNRELEASED
 
+### Fixed
+
+- **Key-service failures are no longer indistinguishable from "no key for this
+  disc".** `query` returned an empty vector for a 502, a 401, a 429, a
+  transport error and an unparseable body alike — the same value a successful
+  lookup with no match returns. It now returns a typed error, and the HTTP
+  status is classified into the operator action it implies: 401/403 the token,
+  429 back off, any other non-2xx the service. A genuine miss is a 200 with no
+  key, so every non-2xx is a failure by definition. A DNS failure or timeout
+  now counts as unreachable rather than as a bad URL.
+
 Version sync with the workspace (freemkv-engine split release). No source change
 in this crate; it remains a pluggable AACS key-source provider consumed by the
 `freemkv` CLI and libfreemkv's key resolver.
