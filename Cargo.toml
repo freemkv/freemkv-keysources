@@ -21,7 +21,7 @@ libfreemkv = "1.6"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 # KeydbSource::save: decompress a downloaded keydb (.zip / .gz). Same versions
 # already in the resolved graph via libfreemkv — no new tree, no new HTTP stack.
 flate2 = "1"
