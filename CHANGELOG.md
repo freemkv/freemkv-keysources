@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.6.3] — 2026-08-10
+
+### Changed
+
+- **The key service is reached over a newer HTTP client, with the same
+  protections.** Before contacting a key service this crate resolves the host,
+  rejects any private or link-local address, and then pins the connection to the
+  addresses it just checked, so a hostname cannot be re-pointed at an internal
+  machine in the moment between the check and the request. That behaviour is
+  unchanged; only the client underneath it moved.
+
+### Security
+
+- **The address pinning is now proven by a test rather than assumed.** The checks
+  that reject a bad address were well covered, but nothing verified that the
+  approved addresses were the ones actually connected to — and every existing
+  test still passed with that wiring removed entirely, because none of them
+  opened a connection. A connection made to an unreachable name can only
+  succeed if the pinned address is honoured, and that is now asserted. No
+  defect is being fixed here: the pinning was correct. It simply had no way of
+  telling anyone if it stopped being correct.
+
 ## [1.6.2] — 2026-08-08
 
 Version sync with the workspace. No functional change in this crate.
