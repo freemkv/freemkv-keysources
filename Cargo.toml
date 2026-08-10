@@ -19,7 +19,7 @@ publish = false
 # bare version req to the libfreemkv git tag (local dev overrides it to a path).
 libfreemkv = "1.6"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 serde_json = "1"
 base64 = "0.23"
 # KeydbSource::save: decompress a downloaded keydb (.zip / .gz). Same versions

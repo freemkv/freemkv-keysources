@@ -9,6 +9,10 @@ use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
 use libfreemkv::{Error, KeySource};
+use ureq::config::Config;
+use ureq::http::Uri;
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 // Upper bound on the MKB forwarded to the key service — kept in lockstep with
 // libfreemkv's `read_mkb_content` MAX_BYTES (64 MiB) so an MKB the library is
@@ -217,16 +221,54 @@ pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
     resolve_and_guard(url).map(|_| ()).map_err(|(_, msg)| msg)
 }
 
+/// ureq's `ResolvedSocketAddrs` is a fixed 16-slot array and its `push` writes
+/// straight into that array, so handing it a 17th address is an out-of-bounds
+/// panic — in the rip thread, on a host that merely publishes a lot of A
+/// records. Keep the first 16; every one of them was validated by
+/// [`resolve_and_guard`], so a subset is still safe, just less redundant.
+const MAX_PINNED_ADDRS: usize = 16;
+
+/// The pinned-address resolver behind [`hardened_agent`].
+///
+/// ureq 3 replaced v2's resolver closure with this trait. The agent MUST be
+/// built through `Agent::with_parts` to take one: `Agent::new_with_config`
+/// silently keeps the default resolver, which would send the request to live
+/// DNS and quietly reopen the rebinding window this module exists to close.
+/// That failure is invisible — it has no symptom short of an actual attack —
+/// so it is pinned by `hardened_agent_connects_to_the_pinned_address_not_dns`.
+#[derive(Debug)]
+struct PinnedResolver(Vec<SocketAddr>);
+
+impl Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        _uri: &Uri,
+        _config: &Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let mut out = self.empty();
+        for addr in self.0.iter().take(MAX_PINNED_ADDRS) {
+            out.push(*addr);
+        }
+        if out.is_empty() {
+            // The trait's contract: at least one address, or this error.
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
+    }
+}
+
 /// Build a ureq agent that follows zero redirects (so a public URL can't
 /// 30x-redirect to an internal host) and pins DNS resolution to `pinned`
 /// (the addresses already validated by [`resolve_and_guard`]).
 fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(TIMEOUT_SECS))
-        .resolver(move |_netloc: &str| Ok(pinned.clone()))
-        .build()
+    let config = Config::builder()
+        .max_redirects(0)
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(TIMEOUT_SECS)))
+        .build();
+    // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
+    ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
 }
 
 pub struct OnlineSource {
@@ -384,7 +426,7 @@ impl OnlineSource {
         let agent = hardened_agent(pinned);
         let mut req = agent.post(&self.base_url);
         if let Some(value) = bearer_header(&self.secret) {
-            req = req.set("Authorization", &value);
+            req = req.header("Authorization", &value);
         }
         // Begin/end around the keyserver round-trip — a slow or unresponsive
         // service is the suspected DVD-scan hang. The agent is built with a
@@ -433,11 +475,11 @@ fn classify_http_status(code: u16) -> Error {
 /// body carries base64 AACS key material and the reply carries keys — neither is
 /// ever logged, and nor is a serde parse error (it quotes the offending input).
 fn interpret_reply(
-    sent: Result<ureq::Response, ureq::Error>,
+    sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ctx: &dyn ResolveCtx,
     elapsed_ms: u64,
 ) -> Result<Vec<UnitKey>, Error> {
-    let resp = match sent {
+    let mut resp = match sent {
         Ok(r) => r,
         Err(e) => {
             // Record the HTTP status when the service actually answered:
@@ -452,7 +494,7 @@ fn interpret_reply(
             // Each arm now RETURNS the classified error instead of an empty
             // vec, so the distinction survives past this function.
             return Err(match e {
-                ureq::Error::Status(code, _) => {
+                ureq::Error::StatusCode(code) => {
                     let err = classify_http_status(code);
                     tracing::warn!(
                         target: "freemkv::keysource",
@@ -464,7 +506,14 @@ fn interpret_reply(
                     );
                     err
                 }
-                ureq::Error::Transport(_) => {
+                // ureq 3 fans v2's single `Transport` variant out into `Io`,
+                // `Timeout`, `Tls`, `Protocol`, `HostNotFound` and more, and the
+                // enum is non_exhaustive. Every one of them means the same thing
+                // here — nothing answered, so nothing is known about this disc —
+                // and a catch-all is the only shape that stays correct as the
+                // enum grows. The status arm above is the sole case where the
+                // service actually replied.
+                _ => {
                     tracing::warn!(
                         target: "freemkv::keysource",
                         phase = "keyserver_post",
@@ -486,7 +535,8 @@ fn interpret_reply(
     // Reading MAX_RESPONSE_BYTES+1 lets us detect (and reject) an over-cap body.
     let mut buf = Vec::new();
     if resp
-        .into_reader()
+        .body_mut()
+        .as_reader()
         .take(MAX_RESPONSE_BYTES as u64 + 1)
         .read_to_end(&mut buf)
         .is_err()
@@ -801,7 +851,7 @@ mod tests {
 
         let sent = hardened_agent(vec![pinned])
             .post("http://keyserver.invalid/keys")
-            .send_string("{}");
+            .send("{}");
 
         // 1. The connection reached the pinned socket at all. Checked FIRST so
         //    a mis-wired resolver reports the resolver, not a confusing
@@ -885,8 +935,14 @@ mod tests {
         }
     }
 
-    fn reply(status: u16, body: &str) -> ureq::Response {
-        ureq::Response::new(status, "stub", body).expect("stub response")
+    /// A stub reply. ureq 3 has no `Response::new`; a response is just an
+    /// `http::Response` carrying a `ureq::Body`, which is constructible
+    /// directly — so these stay honest unit tests with no server involved.
+    fn reply(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(status)
+            .body(ureq::Body::builder().data(body))
+            .expect("stub response")
     }
 
     /// THE regression. The key service returned HTTP 502 for ~seven hours and
@@ -896,11 +952,7 @@ mod tests {
     #[test]
     fn http_5xx_is_a_source_failure_not_a_missing_key() {
         for status in [500u16, 502, 503, 504] {
-            let out = interpret_reply(
-                Err(ureq::Error::Status(status, reply(status, ""))),
-                &BareCtx,
-                7,
-            );
+            let out = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 7);
             assert_eq!(
                 out.expect_err("a 5xx must not look like an answer").code(),
                 libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
@@ -915,7 +967,7 @@ mod tests {
         assert!(miss.is_empty(), "no key in the body → no keys out");
 
         // And the two must not be the same outcome — the whole point.
-        let down = interpret_reply(Err(ureq::Error::Status(502, reply(502, ""))), &BareCtx, 7);
+        let down = interpret_reply(Err(ureq::Error::StatusCode(502)), &BareCtx, 7);
         assert!(
             down.is_err(),
             "502 and 200-with-no-entry must not collapse to the same result"
@@ -953,19 +1005,24 @@ mod tests {
 
     /// A transport failure — nothing answered at all — is the same verdict as a
     /// 5xx and equally not a missing key. Uses a refused connection to
-    /// 127.0.0.1:1 to obtain a REAL `ureq::Error::Transport` (which has no public
-    /// constructor); this touches no network and never reaches `query`, so the
-    /// SSRF guard is not involved.
+    /// 127.0.0.1:1 to obtain a REAL transport-class error; this touches no
+    /// network and never reaches `query`, so the SSRF guard is not involved.
     #[test]
     fn transport_failure_is_a_source_failure() {
-        let sent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(2))
-            .build()
+        let config = Config::builder()
+            .timeout_connect(Some(Duration::from_secs(2)))
+            .build();
+        let sent = ureq::Agent::new_with_config(config)
             .post("http://127.0.0.1:1/")
-            .send_string("{}");
+            .send("{}");
+        // ureq 3 split v2's single `Transport` variant across `Io`,
+        // `ConnectionFailed`, `Timeout` and friends, and which one a refused
+        // connection produces is a platform detail. The claim that matters is
+        // unchanged and is what this asserts: it failed, and NOT with a status
+        // code — nothing on the other end ever answered.
         assert!(
-            matches!(sent, Err(ureq::Error::Transport(_))),
-            "a refused connection must surface as a ureq transport error"
+            !matches!(sent, Ok(_) | Err(ureq::Error::StatusCode(_))),
+            "a refused connection must fail as transport, never as an HTTP status"
         );
         assert_eq!(
             interpret_reply(sent, &BareCtx, 3)
