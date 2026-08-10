@@ -814,8 +814,9 @@ mod tests {
     // module exists to close is reopened, with no visible symptom.
     //
     // The discriminator: pin the agent to a loopback listener this test owns,
-    // then ask it for a host that CANNOT resolve — `.invalid` is reserved by
-    // RFC 2606 and guaranteed never to. Only a consulted resolver can turn that
+    // then ask it for a host that CANNOT resolve — `.test` is reserved by
+    // RFC 6761 and never resolves in the public DNS. Only a consulted resolver
+    // can turn that
     // name into a connection; a fallback to live DNS fails instead. No network
     // is touched, and `query` (whose guard blocks loopback by design) is not
     // involved — this drives `hardened_agent` directly.
@@ -850,7 +851,7 @@ mod tests {
         });
 
         let sent = hardened_agent(vec![pinned])
-            .post("http://keyserver.invalid/keys")
+            .post("http://keyserver.test/keys")
             .send("{}");
 
         // 1. The connection reached the pinned socket at all. Checked FIRST so
@@ -870,7 +871,7 @@ mod tests {
         let head = server.join().expect("stub server panicked");
         let head = String::from_utf8_lossy(&head);
         assert!(
-            head.contains("keyserver.invalid"),
+            head.contains("keyserver.test"),
             "the pinned agent must still address the original host; got: {head}"
         );
     }
