@@ -752,6 +752,79 @@ mod tests {
         assert_eq!(addrs[0].port(), 8080);
     }
 
+    // ── the pin is actually consulted ──────────────────────────────────────
+    //
+    // `resolve_and_guard` VALIDATES addresses; `hardened_agent` PINS them, so a
+    // hostname cannot re-resolve to an internal address between validation and
+    // connection. The validation half is well covered above — but every one of
+    // those tests still passes if the pinned resolver is never consulted,
+    // because none of them makes a connection. Nothing else in this file proves
+    // the agent honours the pin, and a mis-wired resolver fails OPEN: the
+    // connection quietly falls back to live DNS and the rebinding window this
+    // module exists to close is reopened, with no visible symptom.
+    //
+    // The discriminator: pin the agent to a loopback listener this test owns,
+    // then ask it for a host that CANNOT resolve — `.invalid` is reserved by
+    // RFC 2606 and guaranteed never to. Only a consulted resolver can turn that
+    // name into a connection; a fallback to live DNS fails instead. No network
+    // is touched, and `query` (whose guard blocks loopback by design) is not
+    // involved — this drives `hardened_agent` directly.
+    #[test]
+    fn hardened_agent_connects_to_the_pinned_address_not_dns() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let pinned = listener.local_addr().expect("stub listener address");
+        let (tx, rx) = mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _peer) = listener.accept().expect("stub listener accept failed");
+            // Signal that a connection ARRIVED before doing anything else: that
+            // arrival, on this exact socket, is the fact under test.
+            let _ = tx.send(());
+            // Drain the request head, then answer with the smallest valid reply.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match sock.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => head.push(byte[0]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            let _ = sock.flush();
+            head
+        });
+
+        let sent = hardened_agent(vec![pinned])
+            .post("http://keyserver.invalid/keys")
+            .send_string("{}");
+
+        // 1. The connection reached the pinned socket at all. Checked FIRST so
+        //    a mis-wired resolver reports the resolver, not a confusing
+        //    downstream symptom.
+        rx.recv_timeout(Duration::from_secs(10)).expect(
+            "hardened_agent never connected to the pinned address — the custom \
+             resolver is not being consulted, so a DNS rebind between the guard \
+             and the POST can still redirect the key material",
+        );
+        // 2. The whole round-trip completed through it. Had the agent fallen
+        //    back to live DNS, an unresolvable host is an error, never a 200.
+        let resp = sent.expect("the pinned round-trip must complete");
+        assert_eq!(resp.status(), 200, "the stub server's reply must come back");
+        // 3. The pin redirected the CONNECTION without rewriting the request:
+        //    the original host still travels in the Host header.
+        let head = server.join().expect("stub server panicked");
+        let head = String::from_utf8_lossy(&head);
+        assert!(
+            head.contains("keyserver.invalid"),
+            "the pinned agent must still address the original host; got: {head}"
+        );
+    }
+
     // ── bearer_header ──────────────────────────────────────────────────────
 
     #[test]
