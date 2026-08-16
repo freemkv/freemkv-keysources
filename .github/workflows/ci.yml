@@ -63,7 +63,7 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -100,7 +100,7 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
@@ -148,7 +148,7 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
@@ -193,7 +193,7 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
