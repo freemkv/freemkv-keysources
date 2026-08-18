@@ -31,6 +31,8 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::uks_from_vuk;
 use libfreemkv::aacs::derive::{derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk};
@@ -55,15 +57,129 @@ pub struct UpdateResult {
     pub bytes: usize,
 }
 
+/// The identity of the keydb file a cache entry was parsed from: size plus
+/// last-modified time. A `save()`/`update()` publishes a new file by atomic
+/// rename, so both normally change; `save` ALSO invalidates the cache directly
+/// (below) rather than relying on the stamp, so a same-size rewrite inside the
+/// filesystem's mtime resolution can never be missed on the one path this crate
+/// controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
+///
+/// The parsed database is CACHED behind the file's (size, mtime) stamp. The
+/// published keydb is ~62 MiB / ~181k entries and a single AACS-cert rip parses
+/// it repeatedly — `host_certs()` for the drive handshake (freemkv's
+/// `pipe.rs`/`engine.rs`, autorip's `keysource.rs` each build their own source),
+/// then the trait `host_certs(mkb)` during resolution, then `get_unit_keys` —
+/// and every one of those calls used to re-read all 62 MiB from disk and re-parse
+/// it from scratch, because the struct held nothing but a `PathBuf`. The cache
+/// is keyed on the file stamp, so an externally replaced keydb is still picked up
+/// on the next call; only an unchanged file is served from memory.
 pub struct KeydbSource {
     path: PathBuf,
+    /// `Mutex` (not `RwLock`): the guarded section is a stamp comparison plus an
+    /// `Arc` clone, so there is nothing for concurrent readers to win. Poisoning
+    /// is recovered from rather than propagated — a panic elsewhere must not
+    /// turn every later key lookup into a panic.
+    cache: Mutex<Option<(FileStamp, Arc<KeyDb>)>>,
+    /// How many times the file was actually read + parsed (cache MISSES). The
+    /// only honest way to assert the cache from a test: timing is flaky and the
+    /// parsed value is identical either way. Cheap enough to keep in release.
+    parses: AtomicUsize,
 }
 
 impl KeydbSource {
     /// A keydb source reading the given `keydb.cfg` path.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            cache: Mutex::new(None),
+            parses: AtomicUsize::new(0),
+        }
+    }
+
+    /// The parsed keydb, from cache when the file is unchanged.
+    ///
+    /// Errors are the same ones [`KeyDb::load`] produces, unchanged: a missing
+    /// file is `NotFound` (the documented benign case), an over-cap or non-UTF-8
+    /// file is `InvalidData`. The `metadata` call is what detects a changed
+    /// file; it is a stat, not a 62 MiB read.
+    fn cached_db(&self) -> std::io::Result<Arc<KeyDb>> {
+        let stamp = FileStamp::of(&std::fs::metadata(&self.path)?);
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, db)) = guard.as_ref()
+            && *cached == stamp
+        {
+            return Ok(db.clone());
+        }
+        let db = Arc::new(KeyDb::load(&self.path)?);
+        self.parses.fetch_add(1, Ordering::Relaxed);
+        *guard = Some((stamp, db.clone()));
+        Ok(db)
+    }
+
+    /// Drop the cached parse. Called after this source WRITES the file, so the
+    /// next lookup re-reads it without depending on mtime resolution.
+    fn invalidate_cache(&self) {
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Cache misses so far — the number of real file reads + parses. Test-only
+    /// observability for the cache (see [`Self::cached_db`]).
+    #[cfg(test)]
+    fn parse_count(&self) -> usize {
+        self.parses.load(Ordering::Relaxed)
+    }
+
+    /// Turn a [`KeyDb::load`] failure into this source's verdict.
+    ///
+    /// A MISSING keydb is the documented benign case: the app may simply not
+    /// have one, another source may hold the key, and "no keydb" is genuinely
+    /// "no key here". Everything else is NOT that: `InvalidData` is a keydb over
+    /// the 128 MiB cap or one that is not valid UTF-8 — i.e. corrupt, truncated,
+    /// or a half-finished download — and a permission/IO failure means the file
+    /// could not be read at all. Reporting either as an empty result made a
+    /// broken keydb indistinguishable from "this disc has no key" (the same
+    /// conflation as the seven-hour 502), with no log to notice it by. Both are
+    /// now logged AND surfaced as errors so the resolver reports a source
+    /// failure instead of `E7022`.
+    fn load_failure(&self, e: &std::io::Error) -> Option<Error> {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => None,
+            std::io::ErrorKind::InvalidData => {
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    path = %self.path.display(),
+                    "keydb.cfg is unusable (over the size cap or not valid UTF-8) — this is a corrupt or truncated keydb, NOT a disc without a key"
+                );
+                Some(Error::KeydbInvalid)
+            }
+            kind => {
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    path = %self.path.display(),
+                    io_kind = ?kind,
+                    "keydb.cfg could not be read — NOT a disc without a key"
+                );
+                Some(Error::KeydbLoad {
+                    path: self.path.display().to_string(),
+                })
+            }
+        }
     }
 
     /// Validate, decompress, and crash-safely persist raw keydb bytes (plain
@@ -92,11 +208,12 @@ impl KeydbSource {
             .lines()
             .filter(|l| {
                 let t = l.trim();
-                // Mirror KeyDb::parse's disc-entry rule EXACTLY (keydb_format.rs:
-                // a "0x" line is only an entry if it also contains " = "), so
-                // save() never validates + persists content that parses to zero
-                // usable entries (e.g. a stray "0xDEADBEEF" comment line).
-                (t.starts_with("0x") && t.contains(" = "))
+                // Mirror KeyDb::parse's disc-entry rule EXACTLY by CALLING it
+                // (`is_disc_entry_line`), so save() never validates + persists
+                // content that parses to zero usable entries (e.g. a stray
+                // "0xDEADBEEF" comment line) and the two can no longer drift —
+                // they did drift once already, on the `0X` case rule.
+                crate::keydb_format::is_disc_entry_line(t)
                     || t.starts_with("| DK")
                     || t.starts_with("| PK")
                     || t.starts_with("| HC")
@@ -108,6 +225,8 @@ impl KeydbSource {
         }
 
         write_atomic(&self.path, &text)?;
+        // The file this source reads was just replaced; drop the parsed copy.
+        self.invalidate_cache();
 
         Ok(UpdateResult {
             path: self.path.clone(),
@@ -143,9 +262,14 @@ impl KeydbSource {
     /// filtering is applied (passes `None`). The [`KeySource::host_certs`] TRAIT
     /// method wires the real MKB generation through for revocation filtering.
     pub fn host_certs(&self) -> Vec<HostCert> {
-        match KeyDb::load(&self.path) {
+        match self.cached_db() {
             Ok(db) => db.host_certs(None),
-            Err(_) => Vec::new(),
+            // No error channel here (the scan-options builder wants a list), so
+            // the failure can only be LOGGED — but it must not be invisible.
+            Err(e) => {
+                let _ = self.load_failure(&e);
+                Vec::new()
+            }
         }
     }
 
@@ -330,17 +454,27 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
 }
 
 impl KeySource for KeydbSource {
-    /// Resolve this disc's base per-CPS-unit Unit Keys from the keydb. A missing /
-    /// unreadable keydb is not an error — it simply yields no keys (another
-    /// source may have them), the same as the library's own loader.
+    /// Resolve this disc's base per-CPS-unit Unit Keys from the keydb.
+    ///
+    /// A MISSING keydb is not an error — it simply yields no keys (another
+    /// source may have them), the same as the library's own loader. A keydb that
+    /// exists but cannot be USED (over the size cap, not UTF-8, unreadable) is a
+    /// source failure and returns `Err`: it says nothing about whether this disc
+    /// has a key, and reporting it as an empty result is the same
+    /// looks-like-success failure as a 502 reported as `E7022`.
     ///
     /// The keydb carries no AACS 2.1 forensic index keys today, so it does not
     /// override `get_fmts_indexes` — the default (empty) opts it out, and an FMTS
     /// disc's forensic set comes from the online source.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        match KeyDb::load(&self.path) {
+        match self.cached_db() {
             Ok(db) => Ok(Self::unit_keys_from(&db, ctx)),
-            Err(_) => Ok(Vec::new()),
+            Err(e) => match self.load_failure(&e) {
+                // Missing keydb: the documented benign miss.
+                None => Ok(Vec::new()),
+                // Corrupt / unreadable keydb: a SOURCE FAILURE, not a miss.
+                Some(err) => Err(err),
+            },
         }
     }
 
@@ -350,9 +484,13 @@ impl KeySource for KeydbSource {
     /// `; Revoked in MKBv<N>` annotation): a cert revoked at generation `R` is
     /// withheld once the disc's generation reaches `R`.
     fn host_certs(&self, mkb: Option<u32>) -> Vec<HostCert> {
-        match KeyDb::load(&self.path) {
+        match self.cached_db() {
             Ok(db) => db.host_certs(mkb),
-            Err(_) => Vec::new(),
+            // Vec-returning trait method: log the failure, return nothing.
+            Err(e) => {
+                let _ = self.load_failure(&e);
+                Vec::new()
+            }
         }
     }
 
@@ -794,6 +932,180 @@ mod tests {
         assert_eq!(certs[0].certificate.len(), 92);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Caching: the 62 MiB / 181k-entry keydb is parsed ONCE ────────────────
+
+    /// A single AACS-cert rip drives this source at least three times — the
+    /// scan-options builder's inherent `host_certs()`, the trait
+    /// `host_certs(mkb)` during the handshake, then `get_unit_keys` — and each
+    /// call used to re-read and re-parse the WHOLE file, because `KeydbSource`
+    /// held nothing but a `PathBuf`. Measured on the real 62 MiB / 184,860-entry
+    /// keydb: ~140 ms per parse in `--release`, i.e. ~420 ms and ~186 MiB of
+    /// file reads per rip, against ~1 µs for a cache hit.
+    ///
+    /// Catches the mutation that drops the cache (every call re-parses: count 3)
+    /// and the mutation that makes the cache unconditional (see the
+    /// invalidation tests below).
+    #[test]
+    fn repeated_lookups_parse_the_keydb_once() {
+        let dir = scratch("cache-hit");
+        let path = dir.join("keydb.cfg");
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(20),
+            "00".repeat(92)
+        );
+        std::fs::write(&path, &line).unwrap();
+
+        let src = KeydbSource::new(&path);
+        assert_eq!(src.host_certs().len(), 1);
+        assert_eq!(KeySource::host_certs(&src, Some(70)).len(), 1);
+        assert!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            src.parse_count(),
+            1,
+            "three lookups over an unchanged file must parse it once"
+        );
+    }
+
+    /// The cache must not go stale: a keydb replaced UNDERNEATH the source (the
+    /// daily-refresh thread writing through a different `KeydbSource`, or an
+    /// operator dropping in a new file) has a different size/mtime stamp and
+    /// must be re-read. Catches the mutation that caches on first load and never
+    /// re-stats — which would pin a rip to a keydb deleted hours earlier.
+    #[test]
+    fn a_changed_keydb_file_is_reparsed() {
+        let dir = scratch("cache-stamp");
+        let path = dir.join("keydb.cfg");
+        let hc = |b: &str, n: usize| {
+            format!(
+                "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+                "00".repeat(20),
+                b.repeat(n)
+            )
+        };
+        std::fs::write(&path, hc("00", 92)).unwrap();
+        let src = KeydbSource::new(&path);
+        assert_eq!(src.host_certs()[0].certificate.len(), 92);
+
+        // A different LENGTH guarantees a different stamp regardless of the
+        // filesystem's mtime resolution.
+        std::fs::write(&path, hc("11", 100)).unwrap();
+        assert_eq!(
+            src.host_certs()[0].certificate.len(),
+            100,
+            "a replaced keydb must be re-read, not served from a stale cache"
+        );
+        assert_eq!(src.parse_count(), 2, "one parse per distinct file");
+    }
+
+    /// `save()` replaces the very file this source reads, so it drops the cached
+    /// parse ITSELF rather than trusting the (size, mtime) stamp: a same-size
+    /// rewrite that lands inside the filesystem's timestamp granularity is the
+    /// one change the stamp cannot see — and it is exactly the change this crate
+    /// performs (the daily-refresh thread re-saving a keydb through the source
+    /// it then reads from).
+    ///
+    /// The test forces that indistinguishable case rather than hoping for it:
+    /// the file is written, stamped to a FIXED mtime, cached, re-saved with
+    /// different keys of the SAME length, and stamped back to the same mtime. To
+    /// the stamp the two files are identical, so only the explicit invalidation
+    /// can produce the new key. Unix-only because pinning an mtime needs
+    /// `touch -t` (no `filetime` dependency for one test).
+    #[cfg(unix)]
+    #[test]
+    fn save_invalidates_the_cache_even_when_the_file_stamp_is_unchanged() {
+        // A fixed, in-the-past timestamp: `touch -t CCYYMMDDhhmm.ss`.
+        const STAMP: &str = "202601011200.00";
+        let dir = scratch("cache-save");
+        let path = dir.join("keydb.cfg");
+        let k1 = "01".repeat(16);
+        let k2 = "02".repeat(16);
+        let body = |k: &str| format!("0xaabb = T | U | 1-0x{k}\n");
+        let pin_mtime = |p: &std::path::Path| {
+            let ok = std::process::Command::new("touch")
+                .arg("-t")
+                .arg(STAMP)
+                .arg(p)
+                .status()
+                .expect("touch must run")
+                .success();
+            assert!(ok, "touch -t failed");
+        };
+
+        std::fs::write(&path, body(&k1)).unwrap();
+        pin_mtime(&path);
+
+        let src = KeydbSource::new(&path);
+        let first = src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+        assert_eq!(first[0].key, [0x01u8; 16]);
+
+        // Same byte length, written THROUGH this source, then stamped back so
+        // (size, mtime) is bit-identical to what the cache recorded.
+        src.save(body(&k2).as_bytes()).expect("save must succeed");
+        pin_mtime(&path);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            body(&k1).len() as u64,
+            "the two keydbs must be the same size for this test to mean anything"
+        );
+
+        let second = src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+        assert_eq!(
+            second[0].key, [0x02u8; 16],
+            "a save through this source must invalidate its own cache, not wait for the stamp to change"
+        );
+    }
+
+    // ── A corrupt keydb is a source FAILURE, not "this disc has no key" ──────
+
+    /// `KeyDb::load` fails distinguishably for a keydb that is over the 128 MiB
+    /// cap or not valid UTF-8 — a truncated download, a half-written file, a
+    /// binary blob dropped in by mistake. Both used to collapse into
+    /// `Ok(Vec::new())` with ZERO tracing, i.e. into the benign "no key for this
+    /// disc" the resolver reports as `E7022` — the same looks-like-success
+    /// failure as the seven-hour 502. Only a MISSING file is genuinely benign.
+    ///
+    /// Catches the mutation that restores `Err(_) => Ok(Vec::new())`.
+    #[test]
+    fn a_corrupt_keydb_is_an_error_not_an_empty_answer() {
+        let dir = scratch("corrupt");
+        let path = dir.join("keydb.cfg");
+        // Invalid UTF-8 (a lone continuation byte) → InvalidData from load.
+        std::fs::write(&path, [0x30u8, 0x78, 0xFF, 0xFE, 0x0A]).unwrap();
+
+        let src = KeydbSource::new(&path);
+        let err = src
+            .get_unit_keys(&ctx(HASH, Vec::new(), None))
+            .expect_err("a corrupt keydb must not look like a disc with no key");
+        assert_eq!(
+            err.code(),
+            libfreemkv::error::E_KEYDB_INVALID,
+            "an unusable keydb must report itself, not E7022"
+        );
+        assert_ne!(
+            err.code(),
+            libfreemkv::error::E_NO_DISC_KEY,
+            "a corrupt keydb says NOTHING about whether this disc has a key"
+        );
+    }
+
+    /// The contrast case, through the same code: a keydb that simply is not
+    /// there stays the documented benign miss (`Ok(empty)`), so the fix above
+    /// cannot have turned "no keydb configured" into a hard failure.
+    #[test]
+    fn a_missing_keydb_is_still_a_benign_empty() {
+        let src = KeydbSource::new("/nonexistent/path/keydb.cfg");
+        assert!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None))
+                .expect("a missing keydb is not an error")
+                .is_empty()
+        );
     }
 
     // ── save / update (moved from libfreemkv::keydb) ──────────────────────────
