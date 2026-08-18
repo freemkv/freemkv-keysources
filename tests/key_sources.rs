@@ -362,6 +362,147 @@ fn multi_source_real_keydb_resolves_through_chain() {
     );
 }
 
+// ── MultiSource: a source that could not ANSWER is not a source that said no ─
+//
+// `MultiSource` re-collapsed the Ok/Err distinction `OnlineSource` was
+// engineered to draw: `if let Ok(uks) = s.get_unit_keys(ctx)` discarded every
+// `Err`, so a composition whose sources ALL failed returned `Ok(Vec::new())` —
+// which the resolver reports as `E7022 No key source has a decryption key for
+// this disc`. That is the seven-hour-502 incident reproduced one layer up.
+
+/// A source that always fails, with a chosen error — the key-service outage.
+struct FailingSource {
+    err: fn() -> libfreemkv::Error,
+    label: &'static str,
+}
+
+impl KeySource for FailingSource {
+    fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+        Err((self.err)())
+    }
+    fn get_fmts_indexes(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+        Err((self.err)())
+    }
+    fn label(&self) -> &'static str {
+        self.label
+    }
+}
+
+fn unavailable() -> libfreemkv::Error {
+    libfreemkv::Error::KeyServiceUnavailable
+}
+
+fn unauthorized() -> libfreemkv::Error {
+    libfreemkv::Error::KeyServiceUnauthorized
+}
+
+/// THE regression, one layer up from `interpret_reply`: when no source holds a
+/// key AND a source could not answer, the composition must report the FAILURE,
+/// never a clean "no key". Catches the mutation that restores
+/// `if let Ok(uks) = ..` (which drops the `Err` and returns `Ok(empty)`).
+#[test]
+fn multi_source_reports_a_source_failure_instead_of_a_clean_no_key() {
+    let multi = MultiSource::new(vec![
+        Box::new(FailingSource {
+            err: unavailable,
+            label: "down",
+        }),
+        Box::new(ScriptedSource::new("empty", vec![])),
+    ]);
+    let err = multi
+        .get_unit_keys(&DiscInputsCtx::new(&inputs("x")))
+        .expect_err("a failed source must not collapse into a clean no-key");
+    assert_eq!(
+        err.code(),
+        libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        "the composition must surface the service outage"
+    );
+    assert_ne!(
+        err.code(),
+        libfreemkv::error::E_NO_DISC_KEY,
+        "an outage must never be reported as 'this disc has no key'"
+    );
+}
+
+/// The forensic half carried the identical bug and is now driven through the
+/// same helper — pinned separately so a future edit cannot fix one and leave
+/// the other.
+#[test]
+fn multi_source_fmts_indexes_also_preserve_a_source_failure() {
+    let multi = MultiSource::new(vec![Box::new(FailingSource {
+        err: unavailable,
+        label: "down",
+    })]);
+    assert_eq!(
+        multi
+            .get_fmts_indexes(&DiscInputsCtx::new(&inputs("x")))
+            .expect_err("the forensic path must preserve the failure too")
+            .code(),
+        libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+    );
+}
+
+/// A source failure must NOT block the chain: a later source that actually has
+/// the key still wins outright. Pins the other half of the contract, so the fix
+/// cannot be over-applied into "any error aborts the composition".
+#[test]
+fn multi_source_failure_never_blocks_a_later_success() {
+    let multi = MultiSource::new(vec![
+        Box::new(FailingSource {
+            err: unavailable,
+            label: "down",
+        }),
+        Box::new(ScriptedSource::new("real", vec![uk(0xc1)])),
+    ]);
+    assert_eq!(
+        resolve(&multi, &inputs("x")),
+        vec![uk(0xc1)],
+        "a failing first source must not stop the second from resolving"
+    );
+}
+
+/// FIRST failure wins, matching libfreemkv's `source_failure` rule: the
+/// most-preferred source's reason is the one the operator is told about, in the
+/// same order the caller expressed a preference for successes.
+#[test]
+fn multi_source_reports_the_first_failure_not_the_last() {
+    let multi = MultiSource::new(vec![
+        Box::new(FailingSource {
+            err: unauthorized,
+            label: "bad-token",
+        }),
+        Box::new(FailingSource {
+            err: unavailable,
+            label: "down",
+        }),
+    ]);
+    assert_eq!(
+        multi
+            .get_unit_keys(&DiscInputsCtx::new(&inputs("x")))
+            .expect_err("both sources failed")
+            .code(),
+        libfreemkv::error::E_KEY_SERVICE_UNAUTHORIZED,
+        "the first source's failure is the one reported"
+    );
+}
+
+/// The contrast case: every source ANSWERED and none holds a key. That is the
+/// genuine miss, and `E7022` is then the truth — so the fix must not turn an
+/// honest empty into an error.
+#[test]
+fn multi_source_all_sources_answering_empty_is_still_a_clean_no_key() {
+    let multi = MultiSource::new(vec![
+        Box::new(ScriptedSource::new("a", vec![])),
+        Box::new(ScriptedSource::new("b", vec![])),
+    ]);
+    assert!(
+        multi
+            .get_unit_keys(&DiscInputsCtx::new(&inputs("x")))
+            .expect("every source answered; this is a genuine miss")
+            .is_empty()
+    );
+}
+
 /// The `Path`-typed constructor accepts a borrowed path.
 #[test]
 fn keydb_source_accepts_borrowed_path() {
