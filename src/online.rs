@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::uks_from_vuk;
@@ -148,7 +149,20 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     } else if let Some((h, p)) = authority.rsplit_once(':') {
         match p.parse::<u16>() {
             Ok(p) => (h.to_string(), p),
-            Err(_) => (authority.to_string(), default_port),
+            // A `host:port` authority whose port is not a u16 is a TYPO in the
+            // operator's config — `https://example.com:notaport/keys`. This used
+            // to fall back to the WHOLE authority as the hostname (port text
+            // included), which of course never resolves, so the URL surfaced as
+            // `GuardFail::Unreachable` → `Err(KeyServiceUnavailable)`: a standing
+            // misconfiguration reported as a transient outage, the exact
+            // collapse `GuardFail`'s own doc says must not happen, because the
+            // two halves demand OPPOSITE operator actions (fix the URL vs. wait).
+            // Reject it as `Config`, identical to the bracketed-IPv6 branch a few
+            // lines above, which already returns `Config` for an unparseable
+            // port. Silently substituting `default_port` would be worse still —
+            // it would ship the bearer token and key material to a port the
+            // operator never configured.
+            Err(_) => return Err((GuardFail::Config, "invalid port".into())),
         }
     } else {
         (authority.to_string(), default_port)
@@ -274,6 +288,20 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 pub struct OnlineSource {
     base_url: String,
     secret: String,
+    /// The last agent built, with the address set it was pinned to.
+    ///
+    /// A `query` used to build a FRESH `ureq::Agent` every call, and an FMTS disc
+    /// makes two calls per rip (`get_unit_keys` + `get_fmts_indexes`), so it paid
+    /// two TLS handshakes to the same host for no reason — an agent owns the
+    /// connection pool, and a discarded agent discards the pooled, already
+    /// negotiated TLS connection with it.
+    ///
+    /// SECURITY: the agent is reused ONLY when the freshly resolved + guarded
+    /// address set is IDENTICAL to the one the cached agent is pinned to. Every
+    /// query still re-resolves and re-runs the SSRF guard — that is the whole
+    /// anti-rebinding defence and is deliberately not cached; what is reused is
+    /// the connection, and only to addresses just re-validated this call.
+    agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
 }
 
 impl OnlineSource {
@@ -281,7 +309,24 @@ impl OnlineSource {
         Self {
             base_url: base_url.into(),
             secret: secret.into(),
+            agent: Mutex::new(None),
         }
+    }
+
+    /// The agent pinned to `pinned` — the cached one when the address set is
+    /// unchanged, a fresh one otherwise (which then becomes the cached one).
+    /// Poisoning is recovered from: a panic elsewhere must not make every later
+    /// key request panic.
+    fn agent_for(&self, pinned: Vec<SocketAddr>) -> Arc<ureq::Agent> {
+        let mut guard = self.agent.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((addrs, agent)) = guard.as_ref()
+            && *addrs == pinned
+        {
+            return agent.clone();
+        }
+        let agent = Arc::new(hardened_agent(pinned.clone()));
+        *guard = Some((pinned, agent.clone()));
+        agent
     }
 
     /// The server-resolved Unit Keys for this disc. Runs exactly one network
@@ -423,7 +468,7 @@ impl OnlineSource {
                 return Ok(Vec::new());
             }
         };
-        let agent = hardened_agent(pinned);
+        let agent = self.agent_for(pinned);
         let mut req = agent.post(&self.base_url);
         if let Some(value) = bearer_header(&self.secret) {
             req = req.header("Authorization", &value);
@@ -1099,6 +1144,214 @@ mod tests {
                 "{url} is a configuration fault, not an outage"
             );
         }
+    }
+
+    // ── The pre-flight guards in `query` (nothing leaves the process) ───────
+    //
+    // Each of the three guards below returns `Ok(empty)` BEFORE any address is
+    // resolved and before anything is sent. None was exercised: a reordering
+    // that let the cleartext POST through would have shipped green, and that
+    // POST carries the bearer token plus base64 key material.
+    //
+    // The discriminator in all three: the configured host is `.invalid`, which
+    // RFC 6761 guarantees never resolves. On the guarded path nothing resolves
+    // it, so the test touches no network and returns `Ok(empty)`. Remove the
+    // guard and control reaches `resolve_and_guard`, which fails as
+    // `Unreachable` → `Err(KeyServiceUnavailable)` — a different Result, so the
+    // mutation cannot pass.
+
+    /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
+    struct GuardCtx {
+        mkb: Vec<u8>,
+        samples: usize,
+    }
+    impl ResolveCtx for GuardCtx {
+        fn disc_hash(&self) -> &str {
+            "0x422EB"
+        }
+        fn title(&self) -> Option<&str> {
+            None
+        }
+        fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+            None
+        }
+        fn mkb(&self) -> Result<&[u8], Error> {
+            Ok(&self.mkb)
+        }
+        fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+            Ok(&[])
+        }
+        fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+            Ok(vec![vec![0u8; 16]; self.samples])
+        }
+    }
+
+    /// An `http://` key-service URL must never be POSTed to: the body carries
+    /// base64 AACS key material and the header carries a replayable bearer
+    /// token. The source refuses and falls through to the next source.
+    #[test]
+    fn cleartext_http_url_is_refused_before_anything_is_sent() {
+        let src = OnlineSource::new("http://keyserver.invalid/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            // Enough samples that ONLY the scheme guard can stop the request.
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert!(
+            src.get_unit_keys(&ctx)
+                .expect("a cleartext URL is a config skip, not a service failure")
+                .is_empty(),
+            "an http:// key-service URL must be refused, not sent"
+        );
+    }
+
+    /// An MKB larger than the forward cap cannot be sent; the source skips
+    /// rather than truncating the MKB (which would ask about a different disc).
+    #[test]
+    fn over_cap_mkb_skips_the_request() {
+        let src = OnlineSource::new("https://keyserver.invalid/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: vec![0u8; MAX_MKB_BYTES + 1],
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert!(
+            src.get_unit_keys(&ctx)
+                .expect("an un-forwardable MKB is a skip, not a service failure")
+                .is_empty(),
+            "an over-cap MKB must skip the online source"
+        );
+    }
+
+    /// Too few content samples make the service's answer ambiguous (it
+    /// identifies the key by which submitted unit decrypts), so the request is
+    /// never built. Proven at the boundary: `MIN_SAMPLE_UNITS - 1` skips.
+    #[test]
+    fn too_few_samples_skips_the_request() {
+        let src = OnlineSource::new("https://keyserver.invalid/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS - 1,
+        };
+        assert!(
+            src.get_unit_keys(&ctx)
+                .expect("under-sampling is a skip, not a service failure")
+                .is_empty(),
+            "fewer than MIN_SAMPLE_UNITS samples must skip the online source"
+        );
+    }
+
+    // ── MAX_RESPONSE_BYTES: the stated anti-OOM defence ─────────────────────
+
+    /// The reply cap is the crate's only defence against a hostile or broken
+    /// key service driving the client to OOM with an unbounded body, and it had
+    /// never been exercised. Both edges are asserted so the `+1` read cannot
+    /// quietly become a truncating read (which would hand a half-body to the
+    /// JSON parser) or an off-by-one that rejects a legal reply.
+    #[test]
+    fn over_cap_reply_is_rejected_and_an_at_cap_reply_still_parses() {
+        // The over-cap body is deliberately VALID, key-bearing JSON. A body of
+        // junk would be rejected by the JSON parser whether or not the cap
+        // exists, so the test would pass with the cap deleted — worthless. This
+        // one is only rejectable BY the cap: remove the bounded read and it
+        // parses into a key.
+        let head = r#"{"UK":["000102030405060708090a0b0c0d0e0f"],"pad":""#;
+        let tail = r#""}"#;
+        let over = format!(
+            "{head}{}{tail}",
+            "p".repeat(MAX_RESPONSE_BYTES + 1 - head.len() - tail.len())
+        );
+        assert_eq!(over.len(), MAX_RESPONSE_BYTES + 1);
+        assert_eq!(
+            interpret_reply(Ok(reply(200, &over)), &BareCtx, 1)
+                .expect_err("an over-cap body must not be treated as an answer")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+
+        // EXACTLY at the cap, and valid: still read and still answered. Padded
+        // with a JSON string so the length is exact and the key is real.
+        let pad = MAX_RESPONSE_BYTES - head.len() - tail.len();
+        let at_cap = format!("{head}{}{tail}", "p".repeat(pad));
+        assert_eq!(at_cap.len(), MAX_RESPONSE_BYTES);
+        let keys = interpret_reply(Ok(reply(200, &at_cap)), &BareCtx, 1)
+            .expect("a reply exactly at the cap is legal and must be read");
+        assert_eq!(keys.len(), 1, "the key in an at-cap reply must survive");
+    }
+
+    // ── A bad port is CONFIG, not an outage ────────────────────────────────
+
+    /// `https://example.com:notaport/keys` is a typo in the operator's config.
+    /// The unparseable port used to make the WHOLE authority (port text
+    /// included) the hostname, which of course never resolved — so a standing
+    /// misconfiguration was reported as `Unreachable`, i.e. as the key service
+    /// being down. The two demand OPPOSITE actions (fix the URL vs. wait), which
+    /// is precisely what `GuardFail`'s doc says must not be collapsed.
+    #[test]
+    fn unparseable_port_is_a_config_fault_not_an_outage() {
+        for url in [
+            "https://example.com:notaport/keys",
+            "http://example.com:99999/keys", // out of u16 range
+            "https://example.com:/keys",     // empty port
+        ] {
+            assert_eq!(
+                resolve_and_guard(url).expect_err("must be rejected").0,
+                GuardFail::Config,
+                "{url} is a configuration typo, not a service outage"
+            );
+        }
+        // A WELL-FORMED port is still split off the host and honoured.
+        let addrs = resolve_and_guard("https://8.8.8.8:8443/keys").expect("valid port accepted");
+        assert_eq!(addrs[0].port(), 8443);
+    }
+
+    /// The same distinction as seen by a caller: a mistyped port makes the
+    /// online source SKIP (`Ok(empty)`, the next source is tried and a genuine
+    /// `E7022` is honest), where an unreachable service returns `Err`. Before
+    /// the fix this URL returned `Err(KeyServiceUnavailable)` and sent the
+    /// operator waiting for an outage that would never end.
+    #[test]
+    fn query_with_a_mistyped_port_skips_rather_than_reporting_an_outage() {
+        let src = OnlineSource::new("https://example.com:notaport/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert!(
+            src.get_unit_keys(&ctx)
+                .expect("a mistyped port is configuration, not an outage")
+                .is_empty()
+        );
+    }
+
+    // ── One agent per address set, not one per query ────────────────────────
+
+    /// An FMTS disc calls `query` twice per rip (`get_unit_keys` +
+    /// `get_fmts_indexes`), and a fresh `ureq::Agent` per call throws away the
+    /// connection pool with it — a second full TLS handshake to the same host
+    /// for nothing. The agent is reused only while the freshly guarded address
+    /// set is IDENTICAL, so the anti-rebinding guarantee is untouched: a
+    /// different address set builds (and re-pins) a new agent.
+    #[test]
+    fn the_agent_is_reused_per_address_set_only() {
+        let src = OnlineSource::new("https://keyserver.invalid/keys", "");
+        let a: Vec<SocketAddr> = vec!["8.8.8.8:443".parse().unwrap()];
+        let b: Vec<SocketAddr> = vec!["1.1.1.1:443".parse().unwrap()];
+
+        let first = src.agent_for(a.clone());
+        let second = src.agent_for(a.clone());
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same pinned address set must reuse the agent (and its pooled TLS connection)"
+        );
+
+        let other = src.agent_for(b);
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a DIFFERENT address set must never reuse an agent pinned elsewhere"
+        );
+        // And the address set is re-pinned, so going back re-builds.
+        let back = src.agent_for(a);
+        assert!(!Arc::ptr_eq(&first, &back));
     }
 
     /// Finding #9 regression: parse_uk must reject any non-hex byte up front so
