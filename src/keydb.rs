@@ -57,49 +57,185 @@ pub struct UpdateResult {
     pub bytes: usize,
 }
 
-/// The identity of the keydb file a cache entry was parsed from: size plus
-/// last-modified time. A `save()`/`update()` publishes a new file by atomic
-/// rename, so both normally change; `save` ALSO invalidates the cache directly
-/// (below) rather than relying on the stamp, so a same-size rewrite inside the
-/// filesystem's mtime resolution can never be missed on the one path this crate
-/// controls.
+/// Widest observed granularity of a filesystem's stored mtime. HFS+, many
+/// container overlay filesystems and most network filesystems record whole
+/// seconds; 2 s leaves room for that plus rounding. Used by
+/// [`CacheEntry::is_settled`] — see the argument there.
+const MTIME_GRANULARITY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The identity of the keydb file a cache entry was parsed from.
+///
+/// `(len, modified)` ALONE IS NOT AN IDENTITY. mtime is stored at whole-second
+/// resolution on HFS+, on many container overlays and on most network
+/// filesystems, so a writer that replaces `keydb.cfg` within the same second
+/// with a file of the same byte length leaves `(len, modified)` bit-identical —
+/// and the cache then serves the superseded parse for the rest of the process's
+/// life. For a key database that is not a stale page: it is serving retired or
+/// since-corrected keys while reporting success. The writers that hit this are
+/// real and named in this crate's own docs: the daily-refresh job, a second
+/// freemkv process, an operator's editor, a sync tool.
+///
+/// Two independent discriminators close it:
+///
+/// 1. `dev` + `ino`. Every writer that publishes ATOMICALLY (temp file, fsync,
+///    rename — what [`KeydbSource::save`] does, and what any correct publisher
+///    does) creates a NEW inode, so the stamp differs immediately and
+///    unconditionally, whatever the clock or the mtime resolution did. Zero on
+///    platforms without them (see [`Self::of`]), which costs nothing: rule 2
+///    stands alone.
+/// 2. A freshness rule on the cache entry — [`CacheEntry::is_settled`] — which
+///    covers the residual in-place rewrite that reuses the inode.
+///
+/// What this still does NOT catch: a writer that FORGES the timestamp, i.e.
+/// restores an mtime equal to the cached one (`touch -t`, `rsync --times`, a
+/// tar/backup restore) into the SAME inode with the SAME length. Nothing short
+/// of hashing the content can see that, and hashing 62 MiB per lookup is
+/// precisely the cost the cache exists to remove (~141 ms × ≥3 loads per rip).
+/// [`KeydbSource::save`] therefore keeps invalidating the cache directly, so the
+/// one write path this crate owns never depends on any of the above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
+    /// Filesystem device id. `0` where unavailable.
+    dev: u64,
+    /// Inode number — the discriminator an atomic rename always changes. `0`
+    /// where unavailable.
+    ino: u64,
     len: u64,
     modified: Option<std::time::SystemTime>,
 }
 
 impl FileStamp {
+    /// Stamp from a metadata block. Take it from `File::metadata` on an OPEN
+    /// handle (an `fstat`), never from a second `std::fs::metadata` on the path:
+    /// only the handle guarantees the stamp and the bytes describe one file.
     fn of(meta: &std::fs::Metadata) -> Self {
+        // dev/ino are a Unix concept. Windows has a rough equivalent
+        // (volume serial + file index) but exposes it only through
+        // `MetadataExt` methods that are documented as unreliable on some
+        // filesystems; rule 2 alone is correct there, so the cross-platform
+        // fallback is simply "no inode discriminator" rather than a shaky one.
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0u64, 0u64);
         Self {
+            dev,
+            ino,
             len: meta.len(),
             modified: meta.modified().ok(),
         }
     }
 }
 
+/// One cached parse: the file identity it came from, WHEN that identity was
+/// observed, the parsed database, and the parser's rejection counts.
+struct CacheEntry {
+    stamp: FileStamp,
+    /// Wall-clock time at which `stamp` was read off the open handle. The whole
+    /// point of storing it is [`Self::is_settled`].
+    stamped_at: std::time::SystemTime,
+    db: Arc<KeyDb>,
+    /// Retained, not just logged: [`KeydbSource::cached_db`] re-emits the
+    /// summary on every hit, because a cache hit skips `KeyDb::parse` and with
+    /// it the one warning that a corrupt keydb is being served.
+    stats: crate::keydb_format::ParseStats,
+}
+
+impl CacheEntry {
+    /// Whether this entry's stamp can be TRUSTED to change if the file changes.
+    ///
+    /// The proof, for a filesystem storing mtime at granularity `G`: suppose
+    /// this entry was stamped at `stamped_at` with `stamped_at - modified >= G`,
+    /// and some writer later rewrites the file in place at wall time
+    /// `T > stamped_at`. The recorded mtime `m'` of that write is within one
+    /// granule of `T`, so `m' >= T - G > stamped_at - G >= modified`. Hence
+    /// `m' != modified` and the stamp DOES change. The ambiguous window is
+    /// therefore exactly the one where the cached entry was stamped less than
+    /// `G` after the file's own mtime — i.e. we looked at the file while it was
+    /// still "hot" — and in that window the entry is refused and the file is
+    /// re-read. Once the file has been quiet for `G`, its entry settles and the
+    /// cache is fully effective again.
+    ///
+    /// Cost: after every keydb write, lookups re-parse for up to `G` (2 s).
+    /// The published keydb is rewritten daily, so that is ~2 s of re-parsing per
+    /// day against a cache that saves ~420 ms per rip.
+    ///
+    /// `modified: None` (a filesystem that reports no mtime) never settles: the
+    /// only two discriminators left would be size and inode, so the entry is
+    /// re-read every time rather than being trusted on a weaker basis.
+    ///
+    /// CLOCK CAVEAT: `stamped_at` is the local clock and `modified` is the
+    /// filesystem's. On a network share whose server clock runs AHEAD of the
+    /// client's by more than `G`, entries never settle (safe: more re-parsing).
+    /// A server clock BEHIND the client's makes an entry settle early, which
+    /// re-opens the same-second window it closes — the inode rule (1) is what
+    /// covers the realistic writers there.
+    fn is_settled(&self, granularity: std::time::Duration) -> bool {
+        self.stamp
+            .modified
+            .and_then(|m| self.stamped_at.duration_since(m).ok())
+            .is_some_and(|age| age >= granularity)
+    }
+}
+
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 ///
-/// The parsed database is CACHED behind the file's (size, mtime) stamp. The
+/// The parsed database is CACHED behind the file's identity stamp. The
 /// published keydb is ~62 MiB / ~181k entries and a single AACS-cert rip parses
 /// it repeatedly — `host_certs()` for the drive handshake (freemkv's
 /// `pipe.rs`/`engine.rs`, autorip's `keysource.rs` each build their own source),
 /// then the trait `host_certs(mkb)` during resolution, then `get_unit_keys` —
 /// and every one of those calls used to re-read all 62 MiB from disk and re-parse
-/// it from scratch, because the struct held nothing but a `PathBuf`. The cache
-/// is keyed on the file stamp, so an externally replaced keydb is still picked up
-/// on the next call; only an unchanged file is served from memory.
+/// it from scratch, because the struct held nothing but a `PathBuf`.
+///
+/// A keydb replaced underneath this source is picked up on the next call, with
+/// ONE stated exception: a writer that rewrites the file in place, into the same
+/// inode, at the same byte length, having restored the previous mtime exactly
+/// (`touch -t` / `rsync --times` / a backup restore). Everything else — any
+/// atomic rename, any length change, any real clock advance — changes the stamp.
+/// [`FileStamp`] and [`CacheEntry::is_settled`] carry the full argument and the
+/// clock caveats; do not weaken either without re-reading them. (The earlier
+/// wording here — "an externally replaced keydb is still picked up" —
+/// was simply false for a same-second, same-length replacement, which is the
+/// common shape of a daily-refresh job on a whole-second-mtime filesystem.)
+///
+/// MEMORY RESIDENCY (accepted, and deliberately recorded rather than fixed
+/// here): a hit keeps the entire parsed keydb — every disc's Media Key / VID /
+/// VUK / Unit Keys, the processing- and device-key pools, and the host-cert
+/// PRIVATE keys — resident for the process's life, where the pre-cache code held
+/// one parse transiently. Nothing in this crate zeroizes on drop, so that
+/// material was always exposed to a core dump or a swapped page; the cache
+/// widens the WINDOW, it does not create the class. Closing it properly means
+/// zeroize-on-drop across `KeyDb`, `DiscEntry` and libfreemkv's `aacs::types`
+/// (which owns most of the buffers) — a cross-crate change, tracked separately,
+/// NOT smuggled in behind a cache fix.
 pub struct KeydbSource {
     path: PathBuf,
     /// `Mutex` (not `RwLock`): the guarded section is a stamp comparison plus an
     /// `Arc` clone, so there is nothing for concurrent readers to win. Poisoning
     /// is recovered from rather than propagated — a panic elsewhere must not
     /// turn every later key lookup into a panic.
-    cache: Mutex<Option<(FileStamp, Arc<KeyDb>)>>,
+    cache: Mutex<Option<CacheEntry>>,
     /// How many times the file was actually read + parsed (cache MISSES). The
     /// only honest way to assert the cache from a test: timing is flaky and the
     /// parsed value is identical either way. Cheap enough to keep in release.
     parses: AtomicUsize,
+    /// The `G` of [`CacheEntry::is_settled`]. A field, not the constant inlined,
+    /// so the two discriminators can be tested ONE AT A TIME: with `G` at zero
+    /// every entry settles, which isolates the inode/len rule; with `G` enormous
+    /// nothing settles, which isolates the freshness rule. Testing them together
+    /// is how a stale-cache test ends up passing whether or not the fix is
+    /// present — on APFS (nanosecond mtimes) the naive same-second scenario is
+    /// simply not reproducible, so a test that "reproduces" it there is
+    /// asserting nothing.
+    mtime_granularity: std::time::Duration,
+    /// How many corruption summaries were emitted (see
+    /// [`KeydbSource::emit_parse_stats`]). Same rationale as `parses`: the
+    /// alternative instrument is a `tracing` subscriber in dev-dependencies.
+    warnings: AtomicUsize,
 }
 
 impl KeydbSource {
@@ -109,26 +245,85 @@ impl KeydbSource {
             path: path.into(),
             cache: Mutex::new(None),
             parses: AtomicUsize::new(0),
+            mtime_granularity: MTIME_GRANULARITY,
+            warnings: AtomicUsize::new(0),
         }
     }
 
-    /// The parsed keydb, from cache when the file is unchanged.
+    /// Log the parser's rejection summary and count the emission.
+    ///
+    /// The count is the only way to assert, without pulling a `tracing`
+    /// subscriber into dev-dependencies, that the corruption warning is NOT
+    /// swallowed by the cache. See [`Self::cached_db`].
+    fn emit_parse_stats(&self, stats: &crate::keydb_format::ParseStats) {
+        if stats.log() {
+            self.warnings.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Corruption summaries emitted so far. Test-only observability, paired with
+    /// [`Self::parse_count`]: a corrupt keydb must warn once per LOOKUP, while
+    /// still parsing once.
+    #[cfg(test)]
+    fn warning_count(&self) -> usize {
+        self.warnings.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: override the settle window (see the field's doc).
+    #[cfg(test)]
+    fn with_mtime_granularity(mut self, g: std::time::Duration) -> Self {
+        self.mtime_granularity = g;
+        self
+    }
+
+    /// The parsed keydb, from cache when the file is provably unchanged.
     ///
     /// Errors are the same ones [`KeyDb::load`] produces, unchanged: a missing
     /// file is `NotFound` (the documented benign case), an over-cap or non-UTF-8
-    /// file is `InvalidData`. The `metadata` call is what detects a changed
-    /// file; it is a stat, not a 62 MiB read.
+    /// file is `InvalidData`. The stamp costs an `fstat`, not a 62 MiB read.
+    ///
+    /// ONE OPEN, ONE IDENTITY. The file is opened once and both the stamp
+    /// (`fstat` on that handle) and, on a miss, the bytes come from it. The
+    /// previous shape — `std::fs::metadata(path)` and then a separate
+    /// `KeyDb::load(path)` — resolved the path TWICE with no atomicity between
+    /// them, so a rename landing in the gap cached the new file's stamp beside
+    /// the old file's contents (or the reverse); the pairing was then served,
+    /// looking perfectly valid, until the stamp changed again. The stamp is read
+    /// BEFORE the bytes on purpose: a write racing the read then leaves the OLD
+    /// stamp cached, which the next call detects, whereas stamping afterwards
+    /// would file torn content under a fresh-looking identity and pin it.
     fn cached_db(&self) -> std::io::Result<Arc<KeyDb>> {
-        let stamp = FileStamp::of(&std::fs::metadata(&self.path)?);
+        let file = std::fs::File::open(&self.path)?;
+        let stamp = FileStamp::of(&file.metadata()?);
+        let stamped_at = std::time::SystemTime::now();
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, db)) = guard.as_ref()
-            && *cached == stamp
+        if let Some(entry) = guard.as_ref()
+            && entry.stamp == stamp
+            && entry.is_settled(self.mtime_granularity)
         {
-            return Ok(db.clone());
+            // Re-emit the parser's rejection summary on EVERY hit, not just on
+            // the parse that produced it. `KeyDb::parse` is what logs it, and a
+            // hit skips `parse` entirely — so a daemon that cached a corrupt
+            // keydb logged its rejected-row counts exactly once, at whatever
+            // moment it first read the file, and then served that same damaged
+            // database to every later rip in silence. Repetition is the correct
+            // failure mode here: the line is emitted only when the file really
+            // does have rejected or duplicate rows, and a warning an operator
+            // can still see on the tenth rip is worth more than one they had to
+            // catch on the first.
+            self.emit_parse_stats(&entry.stats);
+            return Ok(entry.db.clone());
         }
-        let db = Arc::new(KeyDb::load(&self.path)?);
+        let (db, stats) = KeyDb::load_counted(file, &self.path)?;
+        self.emit_parse_stats(&stats);
+        let db = Arc::new(db);
         self.parses.fetch_add(1, Ordering::Relaxed);
-        *guard = Some((stamp, db.clone()));
+        *guard = Some(CacheEntry {
+            stamp,
+            stamped_at,
+            db: db.clone(),
+            stats,
+        });
         Ok(db)
     }
 
@@ -503,6 +698,29 @@ impl KeySource for KeydbSource {
 mod tests {
     use super::*;
     use crate::keydb_format::DiscEntry;
+
+    /// A fixed, in-the-past mtime — `touch -t CCYYMMDDhhmm.ss`.
+    #[cfg(unix)]
+    const PINNED_MTIME: &str = "202601011200.00";
+
+    /// Force a file's mtime to [`PINNED_MTIME`], so two different files can be
+    /// made bit-identical to a `(len, mtime)` stamp on purpose. The cache tests
+    /// that matter all depend on FORCING the indistinguishable case rather than
+    /// hoping the filesystem produces it: on APFS (nanosecond mtimes) a
+    /// same-second replacement is otherwise detected by mtime alone, and a test
+    /// that relies on that passes with the fix reverted — which is worth nothing.
+    #[cfg(unix)]
+    fn pin_mtime(p: &std::path::Path) {
+        let ok = std::process::Command::new("touch")
+            .arg("-t")
+            .arg(PINNED_MTIME)
+            .arg(p)
+            .status()
+            .expect("touch must run")
+            .success();
+        assert!(ok, "touch -t failed");
+    }
+
     use libfreemkv::aacs::derive::derive_vuk;
     use libfreemkv::aacs::types::DeviceKey;
     use std::collections::HashMap;
@@ -947,6 +1165,13 @@ mod tests {
     /// Catches the mutation that drops the cache (every call re-parses: count 3)
     /// and the mutation that makes the cache unconditional (see the
     /// invalidation tests below).
+    ///
+    /// The mtime is pinned into the PAST first, because a cache entry is only
+    /// trusted once the file has been quiet for the mtime granularity
+    /// ([`CacheEntry::is_settled`]) — a keydb written microseconds ago is
+    /// deliberately re-read. Unix-only: pinning an mtime needs `touch -t` (no
+    /// `filetime` dependency for a test).
+    #[cfg(unix)]
     #[test]
     fn repeated_lookups_parse_the_keydb_once() {
         let dir = scratch("cache-hit");
@@ -957,6 +1182,7 @@ mod tests {
             "00".repeat(92)
         );
         std::fs::write(&path, &line).unwrap();
+        pin_mtime(&path);
 
         let src = KeydbSource::new(&path);
         assert_eq!(src.host_certs().len(), 1);
@@ -1004,6 +1230,232 @@ mod tests {
         assert_eq!(src.parse_count(), 2, "one parse per distinct file");
     }
 
+    // ── The two stale-cache discriminators, tested ONE AT A TIME ────────────
+    //
+    // The defect both of these pin: `(len, mtime)` is not a file identity. An
+    // external writer — the daily-refresh job, a second freemkv process, an
+    // editor, a sync tool — that replaces `keydb.cfg` inside one mtime granule
+    // with a file of the SAME length leaves that pair bit-identical, and the
+    // source then serves the superseded parse for the rest of the process's
+    // life: retired or since-corrected keys, reported as success.
+    //
+    // Each test disables the OTHER discriminator through `mtime_granularity`, so
+    // neither can pass on the strength of the one it is not testing, and neither
+    // depends on the host filesystem's real mtime resolution (on APFS the naive
+    // scenario is not reproducible at all).
+
+    /// Discriminator 1, the inode: a keydb replaced by ATOMIC RENAME — how
+    /// every correct publisher, including this crate's own `save()`, installs a
+    /// new file — must be re-read even when length and mtime are identical.
+    /// `mtime_granularity: 0` makes every entry settle, so ONLY dev+ino can
+    /// distinguish the two files here.
+    ///
+    /// Catches the mutation that drops `dev`/`ino` from `FileStamp` (the
+    /// original `(len, modified)` stamp): the source then keeps answering with
+    /// the previous keydb's keys.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_length_same_mtime_rename_is_still_re_read() {
+        let dir = scratch("cache-inode");
+        let path = dir.join("keydb.cfg");
+        let replacement = dir.join("keydb.cfg.new");
+        let body = |k: &str| format!("0xaabb = T | U | 1-0x{k}\n");
+
+        std::fs::write(&path, body(&"01".repeat(16))).unwrap();
+        pin_mtime(&path);
+        let src = KeydbSource::new(&path).with_mtime_granularity(std::time::Duration::ZERO);
+        assert_eq!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+            [0x01u8; 16]
+        );
+
+        // Same length, same mtime, different inode.
+        std::fs::write(&replacement, body(&"02".repeat(16))).unwrap();
+        pin_mtime(&replacement);
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            body(&"01".repeat(16)).len() as u64,
+            "the two keydbs must be the same size for this test to mean anything"
+        );
+
+        assert_eq!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+            [0x02u8; 16],
+            "a renamed-in keydb of the same size and mtime must not be served from the stale cache"
+        );
+        assert_eq!(src.parse_count(), 2, "the replacement must be re-parsed");
+    }
+
+    /// Discriminator 2, the settle window: a keydb rewritten IN PLACE — same
+    /// inode, same length, mtime forced back to the same value — must still be
+    /// re-read while the cached entry is too young to trust. `mtime_granularity`
+    /// is set to a decade so nothing ever settles, which is the same condition a
+    /// real same-second, whole-second-mtime replacement creates and the only way
+    /// to reproduce it deterministically on a nanosecond-mtime filesystem.
+    ///
+    /// Catches the mutation that deletes the `is_settled` check from
+    /// `cached_db` (every stamp match trusted unconditionally, which is what the
+    /// original code did): dev, ino, len and mtime are ALL identical here, so
+    /// without the freshness rule the source serves the old keys forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_in_place_rewrite_under_an_unsettled_stamp_is_still_re_read() {
+        use std::io::Write as _;
+        let dir = scratch("cache-settle");
+        let path = dir.join("keydb.cfg");
+        let body = |k: &str| format!("0xaabb = T | U | 1-0x{k}\n");
+
+        std::fs::write(&path, body(&"01".repeat(16))).unwrap();
+        pin_mtime(&path);
+        let ino_before = std::fs::metadata(&path)
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+            .unwrap();
+        let src = KeydbSource::new(&path)
+            .with_mtime_granularity(std::time::Duration::from_secs(10 * 365 * 24 * 3600));
+        assert_eq!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+            [0x01u8; 16]
+        );
+
+        // Overwrite the SAME inode in place (no truncate, no rename), same
+        // length, then force the mtime back: every field of the old stamp
+        // matches.
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all(body(&"02".repeat(16)).as_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        pin_mtime(&path);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+                .unwrap(),
+            ino_before,
+            "the rewrite must reuse the inode for this test to mean anything"
+        );
+
+        assert_eq!(
+            src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+            [0x02u8; 16],
+            "an in-place rewrite under an indistinguishable stamp must not be served from cache"
+        );
+    }
+
+    /// A corrupt-but-parseable keydb must keep saying so. `ParseStats::log` runs
+    /// inside `KeyDb::parse`, and a cache hit skips `parse` — so once the cache
+    /// landed, the rejected-row summary for a given file was emitted exactly
+    /// ONCE for the entire life of the process, while that same damaged file
+    /// went on being served to every subsequent rip. A long-running daemon
+    /// (autorip) logs it at startup, the operator misses it in the startup noise
+    /// or loses it to log rotation, and there is no second chance for as long as
+    /// the process runs.
+    ///
+    /// Catches the mutation that deletes the `emit_parse_stats` call from the
+    /// cache-HIT arm of `cached_db`: warnings would drop to 1 while the file is
+    /// still served three times.
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupt_keydb_warns_on_every_lookup_not_only_on_the_parse() {
+        let dir = scratch("cache-warn");
+        let path = dir.join("keydb.cfg");
+        // Parseable (one good disc row) but damaged: two rows the parser must
+        // reject and count.
+        std::fs::write(
+            &path,
+            "0xaabb = T | U | 1-0x00112233445566778899aabbccddeeff\n\
+             | PK | 0xnothex\n\
+             | DK | DEVICE_KEY 0xZZ | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17\n",
+        )
+        .unwrap();
+        pin_mtime(&path);
+
+        let src = KeydbSource::new(&path);
+        for _ in 0..3 {
+            assert!(
+                !src.get_unit_keys(&ctx(HASH, Vec::new(), None))
+                    .unwrap()
+                    .is_empty(),
+                "the healthy row must still resolve — corruption is not a source failure here"
+            );
+        }
+        assert_eq!(
+            src.parse_count(),
+            1,
+            "the cache must still do its job: one parse for three lookups"
+        );
+        assert_eq!(
+            src.warning_count(),
+            3,
+            "the corruption summary must be re-emitted on every cache hit, not once per process"
+        );
+    }
+
+    /// A HEALTHY keydb must stay silent — the re-emission above must not turn
+    /// into a per-lookup log line for every operator with an intact file.
+    ///
+    /// Catches the mutation that makes `emit_parse_stats` unconditional (drops
+    /// `ParseStats::log`'s empty-counts early return).
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_keydb_warns_on_no_lookup() {
+        let dir = scratch("cache-quiet");
+        let path = dir.join("keydb.cfg");
+        std::fs::write(
+            &path,
+            "0xaabb = T | U | 1-0x00112233445566778899aabbccddeeff\n",
+        )
+        .unwrap();
+        pin_mtime(&path);
+
+        let src = KeydbSource::new(&path);
+        for _ in 0..3 {
+            let _ = src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+        }
+        assert_eq!(
+            src.warning_count(),
+            0,
+            "an intact keydb must produce no corruption summary at all"
+        );
+    }
+
+    /// The cost side of the settle rule, asserted so it is a decision and not an
+    /// accident: a keydb written just now is re-read on every lookup until it
+    /// has been quiet for the granularity. That is the price of never serving a
+    /// same-second replacement, and it is bounded — 2 s after each write of a
+    /// file that is rewritten daily.
+    ///
+    /// Catches the mutation that widens the window to something unbounded (a
+    /// granularity of hours would re-parse 62 MiB on every lookup all day) by
+    /// pairing with `repeated_lookups_parse_the_keydb_once`, which proves the
+    /// entry DOES settle once the mtime is in the past.
+    #[test]
+    fn a_freshly_written_keydb_is_not_trusted_from_cache() {
+        let dir = scratch("cache-fresh");
+        let path = dir.join("keydb.cfg");
+        std::fs::write(
+            &path,
+            "0xaabb = T | U | 1-0x00112233445566778899aabbccddeeff\n",
+        )
+        .unwrap();
+
+        let src = KeydbSource::new(&path);
+        assert!(
+            !src.get_unit_keys(&ctx(HASH, Vec::new(), None))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !src.get_unit_keys(&ctx(HASH, Vec::new(), None))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            src.parse_count(),
+            2,
+            "a keydb whose mtime is younger than the granularity must be re-read, not trusted"
+        );
+    }
+
     /// `save()` replaces the very file this source reads, so it drops the cached
     /// parse ITSELF rather than trusting the (size, mtime) stamp: a same-size
     /// rewrite that lands inside the filesystem's timestamp granularity is the
@@ -1020,23 +1472,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn save_invalidates_the_cache_even_when_the_file_stamp_is_unchanged() {
-        // A fixed, in-the-past timestamp: `touch -t CCYYMMDDhhmm.ss`.
-        const STAMP: &str = "202601011200.00";
         let dir = scratch("cache-save");
         let path = dir.join("keydb.cfg");
         let k1 = "01".repeat(16);
         let k2 = "02".repeat(16);
         let body = |k: &str| format!("0xaabb = T | U | 1-0x{k}\n");
-        let pin_mtime = |p: &std::path::Path| {
-            let ok = std::process::Command::new("touch")
-                .arg("-t")
-                .arg(STAMP)
-                .arg(p)
-                .status()
-                .expect("touch must run")
-                .success();
-            assert!(ok, "touch -t failed");
-        };
 
         std::fs::write(&path, body(&k1)).unwrap();
         pin_mtime(&path);
