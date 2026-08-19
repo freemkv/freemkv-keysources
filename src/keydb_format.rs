@@ -251,10 +251,19 @@ impl ParseStats {
             + self.disc_over_cap
     }
 
-    /// Emit the one summary line, if there is anything to say.
-    fn log(&self) {
+    /// Emit the one summary line, if there is anything to say. Returns whether
+    /// a line was emitted — the only way a test can observe the warning without
+    /// a `tracing` subscriber dependency, and the seam
+    /// [`crate::KeydbSource::cached_db`] counts to prove the warning survives
+    /// the cache.
+    ///
+    /// `pub(crate)` because [`crate::KeydbSource`] re-emits it on a CACHE HIT
+    /// too: the cache short-circuits `parse`, so without that the corruption
+    /// summary for a given file fired once per process and a long-running daemon
+    /// went on serving the damaged keydb in silence forever after.
+    pub(crate) fn log(&self) -> bool {
         if self.rejected() == 0 && self.disc_duplicate == 0 {
-            return;
+            return false;
         }
         tracing::warn!(
             target: "freemkv::keysource",
@@ -267,6 +276,7 @@ impl ParseStats {
             disc_duplicate = self.disc_duplicate,
             "keydb.cfg lines were rejected while parsing; the file may be truncated or corrupt (keys past the damage will not resolve)"
         );
+        true
     }
 }
 
@@ -437,6 +447,27 @@ impl KeyDb {
     /// [`KeyDb`] rather than an error — callers needing a non-empty db must
     /// check the parsed contents.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let (db, stats) = Self::load_counted(std::fs::File::open(path)?, path)?;
+        stats.log();
+        Ok(db)
+    }
+
+    /// [`Self::load`] from an ALREADY-OPEN file, without the log.
+    ///
+    /// Two callers need this seam, both in [`crate::KeydbSource`]:
+    ///
+    /// * The identity stamp and the bytes must come from the SAME descriptor.
+    ///   Stat-the-path-then-load-the-path is two independent resolutions of one
+    ///   name, so an atomic rename landing between them stored a stamp
+    ///   describing one file next to the parsed contents of another — and the
+    ///   cache then served that pairing until the stamp changed again. `fstat`
+    ///   on the open handle cannot be pointed at a different inode.
+    /// * The rejection counts have to be RETAINED, not just logged, so a cache
+    ///   hit can re-emit them.
+    pub(crate) fn load_counted(
+        f: std::fs::File,
+        path: &std::path::Path,
+    ) -> std::io::Result<(Self, ParseStats)> {
         // Read through a hard `take` cap rather than trusting a stat. A
         // `metadata` pre-check is only advisory: it is skipped entirely when the
         // stat fails, and it reports len 0 for a FIFO or character device, so
@@ -446,7 +477,6 @@ impl KeyDb {
         // exactly-at-cap file and rejects anything larger, matching
         // `read_capped_to_string` on the download path.
         use std::io::Read;
-        let f = std::fs::File::open(path)?;
         let mut buf = Vec::new();
         f.take(MAX_KEYDB_BYTES + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_KEYDB_BYTES {
@@ -464,7 +494,7 @@ impl KeyDb {
                 format!("keydb.cfg is not valid UTF-8: {}", path.display()),
             )
         })?;
-        Ok(Self::parse(&data))
+        Ok(Self::parse_counted(&data))
     }
 
     /// Look up a disc by its hash. Returns the VUK if found.
@@ -1284,6 +1314,53 @@ mod tests {
         );
     }
 
+    /// `load_counted` must read the HANDLE it was given, never re-resolve the
+    /// path. `KeydbSource::cached_db` stamps the open file with `fstat` and then
+    /// parses from that same descriptor precisely so the recorded identity and
+    /// the parsed bytes cannot describe two different files; the moment this
+    /// function re-opens the path, that guarantee is gone and an atomic rename
+    /// landing in between stores one file's stamp beside another file's keys —
+    /// a mismatch the cache then serves as if it were valid.
+    ///
+    /// The race itself cannot be scheduled deterministically in-process, so the
+    /// SEAM is what is pinned: with the path already replaced, the handle's
+    /// contents must still win. Catches the mutation that restores an internal
+    /// `File::open(path)`.
+    #[cfg(unix)]
+    #[test]
+    fn load_counted_reads_the_handle_not_the_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "fmk-keysources-load-seam-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keydb.cfg");
+        let other = dir.join("replacement.cfg");
+        let row = |k: &str| format!("0xaabb = T | U | 1-0x{k}\n");
+        std::fs::write(&path, row(&"01".repeat(16))).unwrap();
+        std::fs::write(&other, row(&"02".repeat(16))).unwrap();
+
+        let handle = std::fs::File::open(&path).unwrap();
+        // The path now names a DIFFERENT inode; the handle still names the old
+        // one, exactly as it would mid-race.
+        std::fs::rename(&other, &path).unwrap();
+
+        let (db, _) = KeyDb::load_counted(handle, &path).expect("the open handle is still valid");
+        assert_eq!(
+            db.disc_entries
+                .values()
+                .next()
+                .expect("one entry")
+                .unit_keys[0]
+                .1,
+            [0x01u8; 16],
+            "the parse must come from the handle that was stamped, not from a re-opened path"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ── Debug redaction: key material must never reach a log or a panic ────
 
     /// The only key bytes in these fixtures are the byte 0x5A repeated; the
@@ -1299,9 +1376,18 @@ mod tests {
             "{what} Debug leaked a hex key byte: {rendered}"
         );
         // A derived `Debug` over `[u8; 16]` / `Vec<[u8; 16]>` renders a byte
-        // array — `[90, 90, ...]`. A redacting impl never emits one.
+        // array — `[90, 90, ...]`. A redacting impl never emits one. Matched as
+        // "a `[` immediately followed by a digit" rather than "any `[`", because
+        // callers legitimately render a `Vec` OF redacting structs
+        // (`{:?}` on `KeyDb::host_certs`), whose own `[` opens a list of
+        // `Name { .. }` — never a byte. Every byte-array rendering, decimal or
+        // nested, still starts `[<digit>` (or `[[<digit>`), and the two byte
+        // checks above catch the payload independently.
+        let bytes = rendered.as_bytes();
         assert!(
-            !rendered.contains('['),
+            !rendered
+                .match_indices('[')
+                .any(|(i, _)| bytes.get(i + 1).is_some_and(u8::is_ascii_digit)),
             "{what} Debug rendered a raw byte array: {rendered}"
         );
     }
@@ -1375,6 +1461,70 @@ mod tests {
             rendered.contains("processing_keys_len"),
             "counts, not contents: {rendered}"
         );
+    }
+
+    /// The SIBLING type. `KeyDb`'s hand-written `Debug` prints
+    /// `host_certs_len`, so it protects the whole-db rendering and nothing else
+    /// — [`KeyDb::host_certs`] is a public field, and `{:?}` on ONE element of
+    /// it walks a completely different code path: `KeydbHostCert`'s derive,
+    /// then `HostCert`'s impl. That path carries the AACS host PRIVATE key, the
+    /// only key material in the crate that authenticates US rather than opening
+    /// a disc.
+    ///
+    /// It is safe today only because `libfreemkv::HostCert` hand-writes a
+    /// redacting `Debug` (`aacs::types`, `private_key: "<redacted>"` +
+    /// `certificate_len`) — an EXTERNAL guarantee this crate silently inherits
+    /// through the derive, with nothing on this side pinning it. This test pins
+    /// it: it catches a libfreemkv upgrade that swaps that impl for
+    /// `#[derive(Debug)]`, which would leak the host private key out of this
+    /// crate's public API with no diff in this repository at all.
+    ///
+    /// Rendered three ways because callers reach the cert three ways: the whole
+    /// `Vec` (`?db.host_certs`), one element, and the inner `HostCert` a caller
+    /// gets back from `KeyDb::host_certs(mkb)`.
+    #[test]
+    fn host_cert_debug_is_redacted_including_the_sibling_wrapper() {
+        let hc = KeydbHostCert {
+            cert: HostCert {
+                private_key: [0x5A; 20],
+                certificate: vec![0x5A; 92],
+                private_key_v2: Some([0x5A; 32]),
+                certificate_v2: Some(vec![0x5A; 132]),
+            },
+            revoked_at_mkb: Some(76),
+        };
+        assert_no_key_bytes("KeydbHostCert", &format!("{hc:?}"));
+        assert_no_key_bytes("Vec<KeydbHostCert>", &format!("{:?}", vec![hc.clone()]));
+        assert_no_key_bytes("HostCert", &format!("{:?}", hc.cert));
+        // Positive half: the private keys must be present-but-masked, not
+        // omitted. A `Debug` that simply dropped the fields would satisfy the
+        // negative assertions above while hiding that a key is held at all.
+        assert_eq!(
+            format!("{hc:?}").matches("<redacted>").count(),
+            2,
+            "both host private keys (1.0 and 2.0) must render as <redacted>: {hc:?}"
+        );
+        // The non-secret revocation field is what the wrapper exists for and is
+        // still printed — redaction must not become "print nothing useful".
+        assert!(
+            format!("{hc:?}").contains("76"),
+            "the revocation generation is not secret and must survive: {hc:?}"
+        );
+    }
+
+    /// The `Vec<DeviceKey>` on the other public `KeyDb` field, for the same
+    /// reason: `device_keys` is reachable element-wise and each entry holds a
+    /// 16-byte device key. Also inherited from libfreemkv's redacting impl.
+    #[test]
+    fn device_key_debug_is_redacted() {
+        let dk = DeviceKey {
+            key: [0x5A; 16],
+            node: 1,
+            uv: 2,
+            u_mask_shift: 3,
+        };
+        assert_no_key_bytes("DeviceKey", &format!("{dk:?}"));
+        assert_no_key_bytes("Vec<DeviceKey>", &format!("{:?}", vec![dk]));
     }
 
     // ── Parser rejection accounting ────────────────────────────────────────
@@ -1988,13 +2138,24 @@ mod tests {
             .collect();
 
         eprintln!("Found {} entries with unit keys", candidate_entries.len());
+        // Without candidates nothing below runs and the test would "pass" having
+        // exercised nothing — a parser regression that dropped every unit key
+        // would look exactly like the expected AACS 2.0 outcome.
+        assert!(
+            !candidate_entries.is_empty(),
+            "the fixture keydb must carry at least one entry with unit keys"
+        );
 
         // Try each entry's unit keys: apply the key, then ask whether it opened
         // the unit (the segregated primitives — decrypt, then structural check).
+        let mut attempts = 0usize;
+        let mut any_key_changed_the_unit = false;
         for entry in &candidate_entries {
             for (_, key) in &entry.unit_keys {
                 let mut unit = original.clone();
                 libfreemkv::aacs::content::decrypt_unit(&mut unit, key);
+                attempts += 1;
+                any_key_changed_the_unit |= unit != original;
                 if libfreemkv::aacs::content::is_clean(&unit, libfreemkv::disc::ContentFormat::BdTs)
                 {
                     eprintln!("SUCCESS: Decrypted with entry {}", entry.disc_hash);
@@ -2006,8 +2167,26 @@ mod tests {
             }
         }
 
-        // Expected: none work because this is AACS 2.0 and needs bus decryption first
-        eprintln!("No unit key worked (expected for AACS 2.0 BEE disc — needs read_data_key)");
+        // Reaching here is the EXPECTED outcome for the AACS 2.0 (BEE) sample
+        // this test was written against: the unit is still bus-encrypted, so no
+        // unit key alone can open it. That makes "no key worked" an unusable
+        // assertion — which is exactly why this test used to end in an
+        // `eprintln!` and fall off the end, i.e. pass unconditionally. A no-op
+        // `decrypt_unit`, an `is_clean` stuck at `false`, or a parser that
+        // yielded zero keys would all have produced this same clean exit.
+        //
+        // What CAN be asserted regardless of the sample: the pipeline actually
+        // ran, and the decrypt primitive actually transformed the bytes.
+        assert!(attempts > 0, "no unit key was tried at all");
+        assert!(
+            any_key_changed_the_unit,
+            "decrypt_unit left the aligned unit byte-identical for all {attempts} keys — \
+             the decrypt primitive is a no-op, not a failed key"
+        );
+        eprintln!(
+            "No unit key worked over {attempts} attempts \
+             (expected for AACS 2.0 BEE disc — needs read_data_key)"
+        );
     }
 
     /// REQUIRES a real keydb; `#[ignore]` by default. Run with:
@@ -2021,14 +2200,16 @@ mod tests {
 
         // Find any BD entry that carries a VUK and unit keys, then exercise
         // the lookup-by-hash + VUK-derivation chain against it.
+        // `expect`, not an early `return`: returning here asserted NOTHING while
+        // reporting success, so a parser regression that stopped populating
+        // `vid`/`vuk` — the very fields this test exists to exercise — would make
+        // the `find` miss and ship green. If the fixture genuinely has no such
+        // entry, that is a broken fixture and must be loud.
         let entry = db
             .disc_entries
             .values()
-            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.vid.is_some());
-        if entry.is_none() {
-            return;
-        }
-        let entry = entry.unwrap();
+            .find(|e| e.vuk.is_some() && !e.unit_keys.is_empty() && e.vid.is_some())
+            .expect("the fixture keydb must carry an entry with VUK + unit keys + VID");
         let vuk = entry.vuk.unwrap();
         let vid = entry.vid.unwrap();
         let hash_hex = format!("0x{}", libfreemkv::hex::strip_hex_prefix(&entry.disc_hash));

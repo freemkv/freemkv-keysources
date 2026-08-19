@@ -1,5 +1,53 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A misconfigured key service is no longer quieter than an outage.** A
+  mistyped port, an `http://` URL, or a key-service address the SSRF guard
+  refuses all mean the same thing: the service was never asked, so nothing is
+  known about the disc. They were reported as an empty result — the same value a
+  service returns when it genuinely holds no key — so a standing
+  misconfiguration surfaced to the operator as "no key for this disc" and never
+  self-corrected, while a transient DNS failure was correctly reported as a
+  failure. All three are now failures, logged at error level and separated in
+  the log text from an outage: one says fix the URL, the other says wait. A
+  later key source's real key still wins, so nothing that used to rip stops
+  ripping.
+- **A replaced `keydb.cfg` can no longer be missed.** The parsed keydb is cached
+  behind the file's identity, and that identity was size plus modification time
+  — which are byte-identical when a file is replaced within the same second by
+  one of the same length, the common shape of a daily refresh on a filesystem
+  that records whole seconds. The old, superseded keys were then served for the
+  rest of the process's life while every lookup reported success. The identity
+  now includes the file's inode, and a cache entry is not trusted until the file
+  has been unmodified long enough for its timestamp to be meaningful.
+- **A corrupt keydb keeps saying so.** The summary warning that counts rejected
+  and duplicated rows is produced while parsing, and the cache skips parsing —
+  so a damaged keydb warned once, at whatever moment it was first read, and was
+  then served in silence to every later disc. The summary is now re-emitted on
+  every lookup that serves that file. An intact keydb stays silent.
+- **A keydb's identity and its contents are read through one file handle.** The
+  cache used to stat the path and then separately open it, so a replacement
+  landing between the two stored one file's identity beside another file's keys.
+
+### Security
+
+- **The host certificate's redaction is now pinned by a test.** `{:?}` on a
+  keydb host certificate does not print the AACS host private key, and never
+  did — but that depended entirely on libfreemkv's own redacting formatter,
+  with nothing in this crate to notice if it changed. The whole-database
+  formatter's test did not cover it. It does now, along with device keys.
+
+### Changed
+
+- **Breaking (API):** `KeyDb::disc_entries`' key and `DiscEntry::disc_hash` are
+  `Arc<str>` rather than `String` (a ~13 MB saving on the published keydb, which
+  is now held in memory). Code that requires an owned `String` from either needs
+  `.to_string()`. Unreleased in 1.6.4; recorded here because it shipped to git
+  consumers without a note.
+
 ## [1.6.4] — 2026-08-15
 
 ### Changed
