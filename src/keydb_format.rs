@@ -882,21 +882,28 @@ impl KeyDb {
         let mut i = 1;
         while i < parts.len() {
             match parts[i].trim() {
+                // M/I/V strip a trailing `; comment` before hex-parsing, exactly
+                // as the U arm below does: when the disc row's LAST field is one
+                // of these (no U field after it), a real keydb.cfg glues the
+                // `; MKBv…` comment onto that value, and parse_hex16 of
+                // "0x… ; MKBv64" fails — silently dropping a key the file
+                // actually holds. A hex16 never contains ';', so the split is safe.
                 "M" => {
                     if i + 1 < parts.len() {
-                        media_key = parse_hex16(parts[i + 1].trim());
+                        media_key =
+                            parse_hex16(parts[i + 1].split(';').next().unwrap_or("").trim());
                         i += 1;
                     }
                 }
                 "I" => {
                     if i + 1 < parts.len() {
-                        vid = parse_hex16(parts[i + 1].trim());
+                        vid = parse_hex16(parts[i + 1].split(';').next().unwrap_or("").trim());
                         i += 1;
                     }
                 }
                 "V" => {
                     if i + 1 < parts.len() {
-                        vuk = parse_hex16(parts[i + 1].trim());
+                        vuk = parse_hex16(parts[i + 1].split(';').next().unwrap_or("").trim());
                         i += 1;
                     }
                 }
@@ -1150,6 +1157,25 @@ mod tests {
         assert!(entry.vuk.is_some());
         assert_eq!(entry.unit_keys.len(), 1);
         assert_eq!(entry.unit_keys[0].0, 1);
+    }
+
+    #[test]
+    fn disc_entry_strips_a_comment_glued_to_a_trailing_v_field() {
+        // A real keydb.cfg row whose LAST field is V (no U after it) with the
+        // `; MKBv…` comment glued straight onto the hex value. The U arm already
+        // strips such a comment; before M/I/V did too, parse_hex16 saw
+        // "0x00… ; MKBv64" and silently dropped the VUK — the disc then reported
+        // no key despite the file holding one.
+        let z40 = "00".repeat(20);
+        let z32 = "00".repeat(16);
+        let line =
+            format!("0x{z40} = SAMPLE (Sample) | M | 0x{z32} | I | 0x{z32} | V | 0x{z32} ; MKBv64");
+        let entry = KeyDb::parse_disc_entry(&line).unwrap();
+        assert!(entry.media_key.is_some(), "M key must survive");
+        assert!(
+            entry.vuk.is_some(),
+            "a VUK with a trailing ; comment must not be dropped"
+        );
     }
 
     // NOTE: key fields below use obvious repeated-byte / zero placeholders
