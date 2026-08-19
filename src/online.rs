@@ -97,6 +97,17 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// standing misconfiguration that will never fix itself, while `Unreachable` is
 /// the key service being down right now — exactly the condition this module's
 /// callers must not report as "this disc has no key".
+///
+/// SEPARABLE, NOT RANKED. Distinguishing the two is about the *message*, never
+/// about whether the caller hears anything at all. BOTH variants mean the
+/// service was never asked, so BOTH are `Err` out of [`OnlineSource::query`]
+/// (see the match there). The first cut of this enum routed `Config` to
+/// `Ok(Vec::new())` and only `Unreachable` to `Err`, which made a permanent
+/// fault — a mistyped port, an `http://` URL, a host that resolves into RFC1918
+/// — strictly QUIETER than a transient one: one `warn!` and then a benign-looking
+/// empty that `MultiSource::first_non_empty` cannot tell from "this keydb simply
+/// has no row for this disc". That is the seven-hour-502 collapse with the
+/// polarity reversed: the outage at least self-heals, the typo never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardFail {
     /// Malformed URL, bad scheme, or a host that is (or resolves to) a
@@ -297,10 +308,22 @@ pub struct OnlineSource {
     /// negotiated TLS connection with it.
     ///
     /// SECURITY: the agent is reused ONLY when the freshly resolved + guarded
-    /// address set is IDENTICAL to the one the cached agent is pinned to. Every
+    /// address SET is identical to the one the cached agent is pinned to. Every
     /// query still re-resolves and re-runs the SSRF guard — that is the whole
     /// anti-rebinding defence and is deliberately not cached; what is reused is
     /// the connection, and only to addresses just re-validated this call.
+    ///
+    /// The stored `Vec<SocketAddr>` is the SET KEY: sorted and deduped, so the
+    /// comparison is order-insensitive. `to_socket_addrs` hands back whatever
+    /// order the resolver felt like, and a round-robin keyserver reorders its
+    /// A/AAAA records on essentially every lookup — an ordered `==` therefore
+    /// missed the cache every single time against exactly the deployment that
+    /// most needs it, silently degrading to the per-query TLS handshake this
+    /// field exists to avoid. Set equality is also the honest predicate: the
+    /// security property being asserted is "these are the same validated
+    /// addresses", which says nothing about their order. The agent itself stays
+    /// pinned to the order it was BUILT with; that is safe because an equal set
+    /// means every address it holds was re-resolved and re-guarded this call.
     agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
 }
 
@@ -318,14 +341,21 @@ impl OnlineSource {
     /// Poisoning is recovered from: a panic elsewhere must not make every later
     /// key request panic.
     fn agent_for(&self, pinned: Vec<SocketAddr>) -> Arc<ureq::Agent> {
+        // Compare SETS, not sequences — see the `agent` field's doc.
+        let key = {
+            let mut k = pinned.clone();
+            k.sort();
+            k.dedup();
+            k
+        };
         let mut guard = self.agent.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((addrs, agent)) = guard.as_ref()
-            && *addrs == pinned
+        if let Some((cached_key, agent)) = guard.as_ref()
+            && *cached_key == key
         {
             return agent.clone();
         }
-        let agent = Arc::new(hardened_agent(pinned.clone()));
-        *guard = Some((pinned, agent.clone()));
+        let agent = Arc::new(hardened_agent(pinned));
+        *guard = Some((key, agent.clone()));
         agent
     }
 
@@ -367,21 +397,44 @@ impl OnlineSource {
         // worst case for cleartext. A self-hosted keyserver on a LAN is already
         // impossible by that guard, whatever its scheme.
         //
-        // Falls through to the next key source (a local keydb) rather than
-        // failing the rip, and says why — misconfiguration should be visible,
-        // not silently indistinguishable from "this disc has no key".
+        // Still falls THROUGH to the next key source (a local keydb) — an `Err`
+        // here does not block the chain, because `MultiSource::first_non_empty`
+        // returns any later source's non-empty key set outright and only
+        // surfaces the failure when nothing anywhere resolved. What it does stop
+        // is the silent case: a cleartext URL is the same permanent operator
+        // fault as the address-guard rejection below (see [`GuardFail`]), so it
+        // gets the same verdict. Returning `Ok(empty)` here made "we refused to
+        // ask" indistinguishable from "the service answered and has no key".
         if !self.base_url.starts_with("https://") {
-            tracing::warn!(
+            tracing::error!(
                 target: "freemkv::keysource",
                 "key-service URL is not https:// — refusing to send key material \
-                 and credentials in cleartext; skipping the online source"
+                 and credentials in cleartext; the service was NOT asked about this disc \
+                 (fix the URL scheme), which is not the same as this disc having no key"
             );
-            return Ok(Vec::new());
+            return Err(Error::KeyServiceUnavailable);
         }
         let mkb = ctx.mkb().unwrap_or(&[]);
-        // An over-cap MKB cannot be forwarded — bound the body. Log it: a silent
-        // empty return here is indistinguishable from "no key", so surface the
-        // real cause (the cap is 64 MiB, far above any real trimmed MKB).
+        // THE LINE this source draws between its skips (written out after the
+        // `Config`-was-quieter-than-`Unreachable` bug), in three parts:
+        //
+        // * NO URL AT ALL is not a fault: the operator did not configure an
+        //   online source, so there is nothing to report. `Ok(empty)`, silently
+        //   (the first guard in this function).
+        // * A bad URL — wrong scheme, mistyped port, guard-blocked address — is
+        //   an OPERATOR FAULT. Every disc is affected, nothing was asked, and
+        //   the fix is to edit the config. That is `Err` (above).
+        // * An over-cap MKB or too few content samples is a property of THIS
+        //   DISC's inputs, not a fault: the request cannot be *formed* for this
+        //   disc, so this source has nothing for it and never will, whatever the
+        //   operator does and however long they wait. Reporting that as
+        //   `KeyServiceUnavailable` would send the operator waiting out an
+        //   outage that does not exist — the same mislabelling in the opposite
+        //   direction. These stay `Ok(empty)`, and stay logged.
+        //
+        // Log it: a silent empty return here is indistinguishable from "no key",
+        // so surface the real cause (the cap is 64 MiB, far above any real
+        // trimmed MKB).
         if mkb.len() > MAX_MKB_BYTES {
             tracing::warn!(
                 target: "freemkv::keysource",
@@ -460,12 +513,32 @@ impl OnlineSource {
                 // static label is enough to separate "misconfigured/blocked
                 // key-service URL" from "this disc has no key", which is the
                 // only distinction the operator needs here.
-                tracing::warn!(
+                //
+                // `error!`, not `warn!`, and `Err`, not `Ok(empty)`. This arm
+                // used to return `Ok(Vec::new())`, which made the PERMANENT
+                // fault quieter than the transient one directly above it: the
+                // service was never asked, yet the composition was handed a
+                // clean empty and — with no other source holding the key — told
+                // the operator `E7022 no key for this disc`. Same lie as the
+                // seven-hour 502, from a config typo that never self-heals. A
+                // failure to ask is never evidence about the disc, so it leaves
+                // as `Err`; `MultiSource::first_non_empty` still lets a later
+                // source's real key win outright, so this cannot fail a rip that
+                // the local keydb could have served.
+                tracing::error!(
                     target: "freemkv::keysource",
                     phase = "keyserver_post",
-                    "key-service URL failed the address guard; skipping the online source"
+                    "key-service URL failed the address guard — the service was NOT asked about this disc; \
+                     this is a standing misconfiguration (fix the URL), not a disc without a key"
                 );
-                return Ok(Vec::new());
+                // NOTE (reported upstream): libfreemkv has no
+                // `KeyServiceMisconfigured` code, so the permanent fault borrows
+                // the transient E7028. E7028's contract — "the source never got
+                // as far as answering the question" — is exactly true here; only
+                // its "transient, retry later" hint is wrong, and the `error!`
+                // above carries the correcting detail until a 70xx config code
+                // exists.
+                return Err(Error::KeyServiceUnavailable);
             }
         };
         let agent = self.agent_for(pinned);
@@ -1148,10 +1221,16 @@ mod tests {
 
     // ── The pre-flight guards in `query` (nothing leaves the process) ───────
     //
-    // Each of the three guards below returns `Ok(empty)` BEFORE any address is
-    // resolved and before anything is sent. None was exercised: a reordering
-    // that let the cleartext POST through would have shipped green, and that
-    // POST carries the bearer token plus base64 key material.
+    // Each of the three guards below fires BEFORE any address is resolved and
+    // before anything is sent. None was exercised: a reordering that let the
+    // cleartext POST through would have shipped green, and that POST carries the
+    // bearer token plus base64 key material.
+    //
+    // Their VERDICTS differ on purpose (see the comment above the MKB cap in
+    // `query`): the cleartext-scheme guard is an operator fault and yields
+    // `Err`, while the two input-shaped guards yield `Ok(empty)` — this source
+    // has nothing for THIS disc, permanently, and calling that an outage would
+    // send the operator waiting for nothing.
     //
     // The discriminator in all three: the configured host is `.invalid`, which
     // RFC 6761 guarantees never resolves. On the guarded path nothing resolves
@@ -1188,7 +1267,18 @@ mod tests {
 
     /// An `http://` key-service URL must never be POSTed to: the body carries
     /// base64 AACS key material and the header carries a replayable bearer
-    /// token. The source refuses and falls through to the next source.
+    /// token. The source refuses — and, because refusing means the service was
+    /// never asked, says so with `Err` rather than an empty that reads as "this
+    /// disc has no key". A later source's real key still wins
+    /// (`MultiSource::first_non_empty`), so refusing does not fail a rip the
+    /// local keydb can serve.
+    ///
+    /// Catches two mutations: sending the request anyway (the host is `.invalid`
+    /// and would surface as `Unreachable`, but the assertion below would still
+    /// hold, which is why `too_few_samples_skips_the_request` guards the
+    /// send-path ordering) and — the one this test was rewritten for — returning
+    /// `Ok(Vec::new())`, which made a permanent cleartext misconfiguration
+    /// indistinguishable from a genuine miss.
     #[test]
     fn cleartext_http_url_is_refused_before_anything_is_sent() {
         let src = OnlineSource::new("http://keyserver.invalid/keys", "s3cr3t");
@@ -1197,11 +1287,12 @@ mod tests {
             // Enough samples that ONLY the scheme guard can stop the request.
             samples: MIN_SAMPLE_UNITS,
         };
-        assert!(
+        assert_eq!(
             src.get_unit_keys(&ctx)
-                .expect("a cleartext URL is a config skip, not a service failure")
-                .is_empty(),
-            "an http:// key-service URL must be refused, not sent"
+                .expect_err("refusing to ask is a source failure, never a miss")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+            "an http:// key-service URL must be refused, not sent — and reported"
         );
     }
 
@@ -1304,26 +1395,95 @@ mod tests {
         assert_eq!(addrs[0].port(), 8443);
     }
 
-    /// The same distinction as seen by a caller: a mistyped port makes the
-    /// online source SKIP (`Ok(empty)`, the next source is tried and a genuine
-    /// `E7022` is honest), where an unreachable service returns `Err`. Before
-    /// the fix this URL returned `Err(KeyServiceUnavailable)` and sent the
-    /// operator waiting for an outage that would never end.
+    /// The same distinction as seen by a caller — and the CRITICAL half of it:
+    /// separating a config fault from an outage must never make the config fault
+    /// quieter. A mistyped port means the service was never asked, so the caller
+    /// gets `Err`, exactly like an outage; only the log text differs.
+    ///
+    /// Catches the mutation that returns `Ok(Vec::new())` from the
+    /// `GuardFail::Config` arm of `query` (which is what this code did, and is
+    /// how a permanent misconfiguration became an `E7022 no key for this disc`
+    /// with no `Err` for `MultiSource::first_non_empty` to surface).
     #[test]
-    fn query_with_a_mistyped_port_skips_rather_than_reporting_an_outage() {
+    fn query_with_a_mistyped_port_reports_a_failure_not_a_miss() {
         let src = OnlineSource::new("https://example.com:notaport/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
         };
-        assert!(
+        assert_eq!(
             src.get_unit_keys(&ctx)
-                .expect("a mistyped port is configuration, not an outage")
-                .is_empty()
+                .expect_err("a config fault means the service was never asked — never Ok(empty)")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    /// A guard-BLOCKED address (the SSRF/metadata case) travels the same
+    /// `GuardFail::Config` arm and must be just as loud: the POST never left the
+    /// process, so nothing is known about this disc. Distinct from the mistyped
+    /// port above because it fails AFTER resolution, on the address check.
+    ///
+    /// Catches the mutation that makes only the parse-level config faults `Err`
+    /// while letting the resolved-to-private-address case fall back to
+    /// `Ok(empty)`.
+    #[test]
+    fn query_against_a_guard_blocked_address_reports_a_failure_not_a_miss() {
+        // 127.0.0.1 needs no DNS and is unconditionally rejected by is_blocked_ip.
+        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert_eq!(
+            src.get_unit_keys(&ctx)
+                .expect_err("a blocked address means the service was never asked")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
         );
     }
 
     // ── One agent per address set, not one per query ────────────────────────
+
+    /// A round-robin keyserver returns the SAME addresses in a different order
+    /// on each lookup. That is the same validated set, so it must reuse the
+    /// agent — an ordered `==` on the cache key missed on every single query
+    /// against exactly the deployment the cache was written for, silently
+    /// reverting to a fresh TLS handshake per request.
+    ///
+    /// Catches the mutation that drops the sort/dedup from `agent_for`'s key
+    /// (the reversed order would then build a second agent) and, via the second
+    /// half, the mutation that "fixes" order-sensitivity by comparing only
+    /// lengths or the first element — which would wrongly reuse an agent pinned
+    /// to a DIFFERENT address.
+    #[test]
+    fn a_reordered_but_identical_address_set_reuses_the_agent() {
+        let src = OnlineSource::new("https://keyserver.invalid/keys", "");
+        let forward: Vec<SocketAddr> = vec![
+            "8.8.8.8:443".parse().unwrap(),
+            "8.8.4.4:443".parse().unwrap(),
+        ];
+        let reversed: Vec<SocketAddr> = forward.iter().rev().copied().collect();
+        assert_ne!(forward, reversed, "the two orders must really differ");
+
+        let first = src.agent_for(forward);
+        let again = src.agent_for(reversed);
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a reordered but identical address SET must reuse the pinned agent"
+        );
+
+        // Same cardinality, one address swapped: a genuinely different set, so
+        // never the same agent.
+        let changed: Vec<SocketAddr> = vec![
+            "8.8.8.8:443".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap(),
+        ];
+        assert!(
+            !Arc::ptr_eq(&first, &src.agent_for(changed)),
+            "a different address set must never reuse an agent pinned elsewhere"
+        );
+    }
 
     /// An FMTS disc calls `query` twice per rip (`get_unit_keys` +
     /// `get_fmts_indexes`), and a fresh `ureq::Agent` per call throws away the
