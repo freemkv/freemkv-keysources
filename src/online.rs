@@ -1232,7 +1232,7 @@ mod tests {
     // has nothing for THIS disc, permanently, and calling that an outage would
     // send the operator waiting for nothing.
     //
-    // The discriminator in all three: the configured host is `.invalid`, which
+    // The discriminator in all three: the configured host is `.test`, which
     // RFC 6761 guarantees never resolves. On the guarded path nothing resolves
     // it, so the test touches no network and returns `Ok(empty)`. Remove the
     // guard and control reaches `resolve_and_guard`, which fails as
@@ -1273,7 +1273,7 @@ mod tests {
     /// (`MultiSource::first_non_empty`), so refusing does not fail a rip the
     /// local keydb can serve.
     ///
-    /// Catches two mutations: sending the request anyway (the host is `.invalid`
+    /// Catches two mutations: sending the request anyway (the host is `.test`
     /// and would surface as `Unreachable`, but the assertion below would still
     /// hold, which is why `too_few_samples_skips_the_request` guards the
     /// send-path ordering) and — the one this test was rewritten for — returning
@@ -1281,7 +1281,7 @@ mod tests {
     /// indistinguishable from a genuine miss.
     #[test]
     fn cleartext_http_url_is_refused_before_anything_is_sent() {
-        let src = OnlineSource::new("http://keyserver.invalid/keys", "s3cr3t");
+        let src = OnlineSource::new("http://keyserver.test/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: Vec::new(),
             // Enough samples that ONLY the scheme guard can stop the request.
@@ -1300,7 +1300,7 @@ mod tests {
     /// rather than truncating the MKB (which would ask about a different disc).
     #[test]
     fn over_cap_mkb_skips_the_request() {
-        let src = OnlineSource::new("https://keyserver.invalid/keys", "s3cr3t");
+        let src = OnlineSource::new("https://keyserver.test/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: vec![0u8; MAX_MKB_BYTES + 1],
             samples: MIN_SAMPLE_UNITS,
@@ -1318,7 +1318,7 @@ mod tests {
     /// never built. Proven at the boundary: `MIN_SAMPLE_UNITS - 1` skips.
     #[test]
     fn too_few_samples_skips_the_request() {
-        let src = OnlineSource::new("https://keyserver.invalid/keys", "s3cr3t");
+        let src = OnlineSource::new("https://keyserver.test/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS - 1,
@@ -1458,7 +1458,7 @@ mod tests {
     /// to a DIFFERENT address.
     #[test]
     fn a_reordered_but_identical_address_set_reuses_the_agent() {
-        let src = OnlineSource::new("https://keyserver.invalid/keys", "");
+        let src = OnlineSource::new("https://keyserver.test/keys", "");
         let forward: Vec<SocketAddr> = vec![
             "8.8.8.8:443".parse().unwrap(),
             "8.8.4.4:443".parse().unwrap(),
@@ -1493,7 +1493,7 @@ mod tests {
     /// different address set builds (and re-pins) a new agent.
     #[test]
     fn the_agent_is_reused_per_address_set_only() {
-        let src = OnlineSource::new("https://keyserver.invalid/keys", "");
+        let src = OnlineSource::new("https://keyserver.test/keys", "");
         let a: Vec<SocketAddr> = vec!["8.8.8.8:443".parse().unwrap()];
         let b: Vec<SocketAddr> = vec!["1.1.1.1:443".parse().unwrap()];
 
