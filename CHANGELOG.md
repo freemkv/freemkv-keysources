@@ -1,8 +1,19 @@
 # Changelog
 
-## [Unreleased]
+## [1.6.5] — 2026-08-20
 
 ### Fixed
+
+- **A media, disc-ID, or VUK key at the end of a keydb row is no longer
+  lost to the comment beside it.** Many `keydb.cfg` rows end with a
+  `; MKBv…` note. When that note sat directly after the row's final
+  field and that field was the media key (`M`), disc ID (`I`), or VUK
+  (`V`) — rather than a unit key (`U`) — the note was read as part of the
+  value, the hex parse failed, and the key was silently dropped, so the
+  disc reported no key even though the file held one. The note is now
+  stripped from those three fields exactly as it already was from the
+  unit-key field (a hex value never contains `;`, so the split is safe).
+  A disc that stopped resolving for this reason resolves again.
 
 - **A misconfigured key service is no longer quieter than an outage.** A
   mistyped port, an `http://` URL, or a key-service address the SSRF guard
@@ -33,6 +44,15 @@
   landing between the two stored one file's identity beside another file's keys.
 
 ### Security
+
+- **`{:?}` on a keydb no longer spells out its keys.** `KeyDb` and
+  `DiscEntry` derived their `Debug`, so a single `{:?}` in a log line, a
+  tracing field, or a panic message wrote out every processing key and
+  every disc's media key, disc ID, VUK, and unit keys in full — on the
+  published file, all 184,860 discs' worth. Both are public API, so any
+  caller could trip it. Both types now format through a redacting `Debug`
+  that names each field without its bytes, matching the AACS types this
+  parser was split from, and a test fails if the plain derive ever returns.
 
 - **The host certificate's redaction is now pinned by a test.** `{:?}` on a
   keydb host certificate does not print the AACS host private key, and never
