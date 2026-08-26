@@ -1922,6 +1922,15 @@ mod tests {
         assert_eq!(pk, [0xABu8; 16]);
     }
 
+    /// A `| PK |` row with fewer than 3 `|`-delimited parts (no key field at
+    /// all) has nothing to parse and must return `None`, not panic on an
+    /// out-of-range index.
+    #[test]
+    fn parse_processing_key_rejects_row_with_too_few_parts() {
+        assert!(KeyDb::parse_processing_key("| PK |").is_none());
+        assert!(KeyDb::parse_processing_key("just text, no pipes at all").is_none());
+    }
+
     // ── Disc-entry comment metadata: MKBv / VolumeSize / UHD ────────────────
 
     #[test]
@@ -2082,6 +2091,106 @@ mod tests {
         assert_eq!(uks.len(), 1, "only the entry with unit keys is listed");
         assert_eq!(uks[0].0, "0xaaaa");
         assert_eq!(uks[0].1, vec![(1, [0x03u8; 16])]);
+    }
+
+    /// `parse_digits_after` must return `None`, not panic or misparse, when
+    /// the marker is present but no digit immediately follows it (Path 3 of
+    /// the MKBv/VolumeSize comment grammar: marker-with-no-value).
+    #[test]
+    fn parse_digits_after_marker_with_no_trailing_digits_is_none() {
+        assert_eq!(parse_digits_after::<u32>("MKBv", "MKBv"), None);
+        assert_eq!(parse_digits_after::<u32>("MKBv/BEE", "MKBv"), None);
+        assert_eq!(parse_digits_after::<u32>("no marker here", "MKBv"), None);
+    }
+
+    /// `iter_disc_entries` yields every parsed disc, independent of hash
+    /// lookup — Path 3's full-scan use.
+    #[test]
+    fn iter_disc_entries_yields_every_disc() {
+        let k = "01".repeat(16);
+        let db = KeyDb::parse(&format!(
+            "0xAAAA = A | U | 1-0x{k}\n0xBBBB = B | U | 1-0x{k}\n"
+        ));
+        let mut hashes: Vec<&str> = db.iter_disc_entries().map(|e| &*e.disc_hash).collect();
+        hashes.sort();
+        assert_eq!(hashes, vec!["0xaaaa", "0xbbbb"]);
+    }
+
+    /// `to_keydb_cfg` emits the sibling `| HC2 |` line for a host cert that
+    /// carries AACS 2.0 credentials, and a `parse` of the output recovers
+    /// them. Also: an empty title serializes as the literal `Unknown` (the
+    /// inverse of the parser's own convention).
+    #[test]
+    fn to_keydb_cfg_emits_hc2_and_unknown_for_empty_title() {
+        let h = |b: u8, n: usize| format!("{b:02x}").repeat(n);
+        let k = h(0x09, 16);
+        let src = format!(
+            "| HC | HOST_PRIV_KEY 0x{priv1} | HOST_CERT 0x{cert1}\n\
+             | HC2 | HOST_PRIV_KEY 0x{priv2} | HOST_CERT 0x{cert2}\n\
+             0xAAAA =  | U | 1-0x{k}\n",
+            priv1 = h(0x01, 20),
+            cert1 = h(0x02, 92),
+            priv2 = h(0x03, 32),
+            cert2 = h(0x04, 132),
+        );
+        let db = KeyDb::parse(&src);
+        assert_eq!(db.host_certs.len(), 1);
+        assert!(db.host_certs[0].cert.certificate_v2.is_some());
+        // Empty title round-trips through "Unknown".
+        let entry = db.disc_entries.values().next().unwrap();
+        assert_eq!(entry.title, "");
+
+        let out = db.to_keydb_cfg();
+        assert!(
+            out.contains("| HC2 | HOST_PRIV_KEY"),
+            "HC2 must be emitted: {out}"
+        );
+        assert!(
+            out.contains("Unknown"),
+            "empty title must serialize as Unknown: {out}"
+        );
+
+        // And it round-trips: re-parsing sees the HC2 material again.
+        let db2 = KeyDb::parse(&out);
+        assert_eq!(db2.host_certs.len(), 1);
+        assert!(db2.host_certs[0].cert.certificate_v2.is_some());
+        assert_eq!(
+            db2.host_certs[0].cert.private_key_v2,
+            db.host_certs[0].cert.private_key_v2
+        );
+    }
+
+    /// `to_keydb_cfg`'s comment clause is written piecewise (MKBv, then
+    /// VolumeSize, then UHD) — exercise each optional sub-field independently
+    /// (not just all-three-true) so every combination of the trailing
+    /// `; comment` assembly is proven, not just the "everything present" case.
+    #[test]
+    fn to_keydb_cfg_comment_fields_are_independent() {
+        let k = "0a".repeat(16);
+
+        // Only VolumeSize, no MKBv, not UHD.
+        let a = KeyDb::parse(&format!("0xAAAA = A | U | 1-0x{k} ; VolumeSize: 12345\n"));
+        let out_a = a.to_keydb_cfg();
+        assert!(out_a.contains("VolumeSize: 12345"), "{out_a}");
+        assert!(!out_a.contains("MKBv"), "{out_a}");
+        assert!(!out_a.contains("(UHD)"), "{out_a}");
+        let a2 = KeyDb::parse(&out_a);
+        let ea2 = a2.disc_entries.values().next().unwrap();
+        assert_eq!(ea2.volume_size, Some(12345));
+        assert_eq!(ea2.mkb_version, None);
+        assert!(!ea2.is_uhd);
+
+        // Only the UHD flag, no MKBv, no VolumeSize.
+        let b = KeyDb::parse(&format!("0xBBBB = B | U | 1-0x{k} ; (UHD)\n"));
+        let out_b = b.to_keydb_cfg();
+        assert!(out_b.contains("(UHD)"), "{out_b}");
+        assert!(!out_b.contains("MKBv"), "{out_b}");
+        assert!(!out_b.contains("VolumeSize"), "{out_b}");
+        let b2 = KeyDb::parse(&out_b);
+        let eb2 = b2.disc_entries.values().next().unwrap();
+        assert!(eb2.is_uhd);
+        assert_eq!(eb2.mkb_version, None);
+        assert_eq!(eb2.volume_size, None);
     }
 
     // ════════════════════════════════════════════════════════════════════
