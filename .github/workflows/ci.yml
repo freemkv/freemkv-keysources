@@ -226,6 +226,7 @@ jobs:
           files: freemkv-keysources/lcov.info
           slug: freemkv/freemkv-keysources
           fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   check-windows:
     # dev is the FAST lane: this job still runs, but on the release-candidate
