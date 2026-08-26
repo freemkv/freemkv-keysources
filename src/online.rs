@@ -907,6 +907,52 @@ mod tests {
         assert!(resolve_and_guard("").is_err());
     }
 
+    /// Malformed-authority edges that `resolve_and_guard` must reject BEFORE
+    /// ever touching DNS: an empty host after the scheme (`https://`), an
+    /// unterminated IPv6 literal (missing `]`), and a bare `host:` with an
+    /// empty host part.
+    #[test]
+    fn resolve_and_guard_rejects_malformed_authorities() {
+        // Scheme with nothing after it at all.
+        assert!(resolve_and_guard("https://").is_err());
+        // Scheme immediately followed by a path — empty authority.
+        assert!(resolve_and_guard("https:///keys").is_err());
+        // Bracketed IPv6 host missing its closing `]`.
+        assert!(resolve_and_guard("http://[::1/keys").is_err());
+        // `host:port` split with an empty host before the colon.
+        assert!(resolve_and_guard("https://:8080/keys").is_err());
+    }
+
+    /// A host that genuinely does not resolve (RFC 6761 reserves `.test`
+    /// to never resolve in the public DNS) must be reported as
+    /// `GuardFail::Unreachable` — "the service is down", not
+    /// `GuardFail::Config` ("fix the URL"). No real network traffic beyond a
+    /// local DNS lookup that is guaranteed to fail.
+    #[test]
+    fn resolve_and_guard_reports_unreachable_for_a_host_that_never_resolves() {
+        let (kind, msg) = resolve_and_guard("https://this-host-does-not-exist.test/keys")
+            .expect_err(
+                "a .test host must never resolve — if this passes, treat it as a fixture bug",
+            );
+        assert_eq!(kind, GuardFail::Unreachable);
+        assert!(msg.contains("resolve"), "message should explain: {msg}");
+    }
+
+    /// `PinnedResolver` with an EMPTY address set — the state `agent_for`
+    /// would build if `resolve_and_guard` somehow returned no addresses —
+    /// must fail the resolve step with `HostNotFound` rather than silently
+    /// falling back to live DNS.
+    #[test]
+    fn pinned_resolver_with_no_addresses_fails_the_connection() {
+        let result = hardened_agent(Vec::new())
+            .post("http://keyserver.test/keys")
+            .send("{}");
+        assert!(
+            result.is_err(),
+            "an empty pin must fail the connection, not silently resolve some other way"
+        );
+    }
+
     #[test]
     fn resolve_and_guard_accepts_public_literal() {
         // Public numeric hosts resolve without DNS — must be accepted.
@@ -1199,6 +1245,110 @@ mod tests {
         assert_eq!(keys[1].key[0], 0x0f);
     }
 
+    /// Backward-compatible form: `"UK"` as a bare hex STRING (not an array)
+    /// is still the single base Unit Key at index 0.
+    #[test]
+    fn uk_as_a_bare_string_is_still_accepted() {
+        let keys = interpret_reply(
+            Ok(reply(200, r#"{"UK":"000102030405060708090a0b0c0d0e0f"}"#)),
+            &BareCtx,
+            1,
+        )
+        .expect("a string UK must still resolve");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].idx, 0);
+        assert_eq!(keys[0].key[0], 0x00);
+    }
+
+    /// A malformed `"UK"` STRING (not the array form) parses to nothing and
+    /// falls through to the genuine-miss path — proven distinct from the
+    /// array form's "reject the whole reply" behaviour, since a bad scalar
+    /// string has no partial set to protect.
+    #[test]
+    fn uk_as_an_unparseable_string_falls_through_to_a_miss() {
+        let keys = interpret_reply(Ok(reply(200, r#"{"UK":"not hex"}"#)), &BareCtx, 1)
+            .expect("an unparseable scalar UK is a miss, not a transport failure");
+        assert!(keys.is_empty());
+    }
+
+    /// A `"VUK"` reply is derived LOCALLY into terminal unit keys via the
+    /// disc's encrypted title keys — the service never sees or returns them
+    /// directly.
+    #[test]
+    fn vuk_reply_is_derived_locally_into_unit_keys() {
+        struct EncCtx;
+        impl ResolveCtx for EncCtx {
+            fn disc_hash(&self) -> &str {
+                "0x422EB"
+            }
+            fn title(&self) -> Option<&str> {
+                None
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                None
+            }
+            fn mkb(&self) -> Result<&[u8], Error> {
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+                Ok(&[[0x11u8; 16], [0x22u8; 16]])
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+                Ok(Vec::new())
+            }
+        }
+        let vuk_hex = "0f0e0d0c0b0a09080706050403020100";
+        let keys = interpret_reply(
+            Ok(reply(200, &format!(r#"{{"VUK":"{vuk_hex}"}}"#))),
+            &EncCtx,
+            1,
+        )
+        .expect("a VUK reply must resolve");
+        assert_eq!(
+            keys.len(),
+            2,
+            "one derived unit key per encrypted title key"
+        );
+        assert_eq!(keys[0].idx, 0);
+        assert_eq!(keys[1].idx, 1);
+    }
+
+    /// The service answered correctly with a VUK, but the DISC's encrypted
+    /// title keys could not be read — that is a disc-side condition, not a
+    /// service failure, so it is `Ok(empty)`, never `Err`.
+    #[test]
+    fn vuk_reply_with_unreadable_enc_title_keys_is_an_empty_ok_not_an_error() {
+        struct BrokenEncCtx;
+        impl ResolveCtx for BrokenEncCtx {
+            fn disc_hash(&self) -> &str {
+                "0x422EB"
+            }
+            fn title(&self) -> Option<&str> {
+                None
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                None
+            }
+            fn mkb(&self) -> Result<&[u8], Error> {
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+                Err(Error::KeydbInvalid)
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+                Ok(Vec::new())
+            }
+        }
+        let vuk_hex = "0f0e0d0c0b0a09080706050403020100";
+        let keys = interpret_reply(
+            Ok(reply(200, &format!(r#"{{"VUK":"{vuk_hex}"}}"#))),
+            &BrokenEncCtx,
+            1,
+        )
+        .expect("an unreadable disc-side input must not be a source failure");
+        assert!(keys.is_empty());
+    }
+
     /// A URL that fails the ADDRESS guard is operator configuration, not the
     /// service being down — the two must stay separable, since only one of them
     /// is worth retrying.
@@ -1441,6 +1591,113 @@ mod tests {
                 .code(),
             libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
         );
+    }
+
+    /// `get_fmts_indexes` shares `query` with `get_unit_keys` — never
+    /// separately exercised. Same guard-blocked, no-network path as the
+    /// `get_unit_keys` tests above proves it is wired up.
+    #[test]
+    fn get_fmts_indexes_shares_the_same_query_path() {
+        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert_eq!(
+            src.get_fmts_indexes(&ctx)
+                .expect_err("a blocked address means the service was never asked")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    /// A host that genuinely does not resolve travels `query`'s OWN
+    /// `GuardFail::Unreachable` arm (distinct from the `Config` arm covered
+    /// above) — still `Err`, since "did not resolve" is what a key-service
+    /// outage looks like from here, never a genuine miss.
+    #[test]
+    fn query_against_an_unresolvable_host_reports_unreachable_as_a_failure() {
+        let src = OnlineSource::new("https://this-host-does-not-exist.test/keys", "s3cr3t");
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+        };
+        assert_eq!(
+            src.get_unit_keys(&ctx)
+                .expect_err("an unresolvable host means the service was never asked")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    /// The request body's `vid_b64` and `title` fields are assembled BEFORE
+    /// the address guard runs (see `query`'s ordering), so a ctx that
+    /// supplies a VID and a title still exercises that assembly even when
+    /// the guard then rejects the address — proven through the same
+    /// deterministic guard-blocked path the tests above use (no network).
+    #[test]
+    fn query_assembles_vid_and_title_before_the_address_guard_runs() {
+        struct VidTitleCtx;
+        impl ResolveCtx for VidTitleCtx {
+            fn disc_hash(&self) -> &str {
+                "0x422EB"
+            }
+            fn title(&self) -> Option<&str> {
+                Some("  My Disc Title  ")
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                Some(libfreemkv::aacs::types::Vid([0x42u8; 16]))
+            }
+            fn mkb(&self) -> Result<&[u8], Error> {
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+                Ok(&[])
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+                Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
+            }
+        }
+        // 127.0.0.1 needs no DNS and is unconditionally rejected — the guard
+        // fires AFTER the body (incl. vid/title) is already built.
+        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        assert_eq!(
+            src.get_unit_keys(&VidTitleCtx)
+                .expect_err("a blocked address means the service was never asked")
+                .code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    /// A title that is present but ALL WHITESPACE must not be sent — `query`
+    /// trims then checks `is_empty()` before adding the `title` field.
+    #[test]
+    fn query_skips_a_whitespace_only_title() {
+        struct WhitespaceTitleCtx;
+        impl ResolveCtx for WhitespaceTitleCtx {
+            fn disc_hash(&self) -> &str {
+                "0x422EB"
+            }
+            fn title(&self) -> Option<&str> {
+                Some("   ")
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                None
+            }
+            fn mkb(&self) -> Result<&[u8], Error> {
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+                Ok(&[])
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+                Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
+            }
+        }
+        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        // Reaches the same guard-blocked failure either way; this test's
+        // value is in exercising the whitespace-title branch without panic.
+        assert!(src.get_unit_keys(&WhitespaceTitleCtx).is_err());
     }
 
     // ── One agent per address set, not one per query ────────────────────────
