@@ -270,6 +270,15 @@ fn uk(b: u8) -> UnitKey {
     UnitKey::new(0, [b; 16])
 }
 
+/// `MultiSource` itself reports a fixed label, distinct from any inner
+/// source's own label — this is what a rip's source-attribution log shows
+/// when the composition, not one of its members, answered.
+#[test]
+fn multi_source_label_is_multi() {
+    let multi = MultiSource::new(vec![Box::new(ScriptedSource::new("A", Vec::new()))]);
+    assert_eq!(multi.label(), "multi");
+}
+
 #[test]
 fn multi_source_first_non_empty_wins_in_caller_order() {
     // Caller supplies [A, B]; A is non-empty so A's keys win.

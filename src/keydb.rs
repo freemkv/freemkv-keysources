@@ -809,6 +809,17 @@ mod tests {
 
     const HASH: &str = "0xaabb";
 
+    /// `MockCtx` implements the full `ResolveCtx` trait so it can stand in for
+    /// a real disc, but `KeydbSource` itself never calls `title()`/`samples()`
+    /// (those matter to the online source, not the local keydb). Exercise
+    /// them directly so the mock's trait surface is proven correct too.
+    #[test]
+    fn mock_ctx_title_and_samples_are_stubbed_correctly() {
+        let c = ctx(HASH, Vec::new(), None);
+        assert_eq!(c.title(), None);
+        assert_eq!(c.samples(4).unwrap(), Vec::<Vec<u8>>::new());
+    }
+
     // ── KAT (a): disc with terminal Unit Keys, no enc_title_keys ──────────────
     /// Stored terminal unit keys are returned with their CPS numbering preserved.
     /// Here `enc_title_keys` is empty, so the VUK can't derive anything — only the
@@ -1637,6 +1648,52 @@ mod tests {
         assert!(matches!(src.save(garbage), Err(Error::KeydbInvalid)));
     }
 
+    /// A keydb.cfg that is over the size cap or not valid UTF-8
+    /// (`std::io::ErrorKind::InvalidData`) must surface as a SOURCE FAILURE
+    /// (`Error::KeydbInvalid`), never as a silent empty result — a corrupt
+    /// keydb is not the same thing as "this disc has no key".
+    #[test]
+    fn get_unit_keys_reports_invalid_utf8_keydb_as_a_failure() {
+        let dir = scratch("load-failure-invalid");
+        let path = dir.join("keydb.cfg");
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00, 0x01]).unwrap();
+        let src = KeydbSource::new(&path);
+        let err = src
+            .get_unit_keys(&ctx(HASH, Vec::new(), None))
+            .expect_err("non-UTF-8 keydb must be a failure, not an empty miss");
+        assert!(matches!(err, Error::KeydbInvalid));
+    }
+
+    /// Any OTHER read failure (not "missing", not "invalid data") — e.g. the
+    /// configured path is a directory, not a file — is also a source failure,
+    /// distinct from `KeydbInvalid`.
+    #[test]
+    fn get_unit_keys_reports_unreadable_keydb_path_as_a_failure() {
+        let dir = scratch("load-failure-unreadable");
+        // Point the source AT a directory: `File::open` fails with an io::Error
+        // whose kind is neither NotFound nor InvalidData.
+        let src = KeydbSource::new(&dir);
+        let err = src
+            .get_unit_keys(&ctx(HASH, Vec::new(), None))
+            .expect_err("an unreadable keydb path must be a failure, not an empty miss");
+        assert!(matches!(err, Error::KeydbLoad { .. }));
+    }
+
+    /// `host_certs` (the `Vec`-returning trait method) hits the exact same
+    /// `load_failure` branches, just via a swallowed log instead of `Err` —
+    /// prove it returns empty rather than panicking on a corrupt keydb.
+    #[test]
+    fn host_certs_swallows_a_corrupt_keydb_into_an_empty_list() {
+        let dir = scratch("load-failure-hostcerts");
+        let path = dir.join("keydb.cfg");
+        std::fs::write(&path, [0xffu8, 0xfe]).unwrap();
+        let src = KeydbSource::new(&path);
+        assert!(
+            src.host_certs().is_empty(),
+            "a corrupt keydb must yield no host certs, not panic"
+        );
+    }
+
     /// `save` recognises gzip magic (0x1f 0x8b) and routes to the gz decoder; a
     /// truncated gzip is a parse/invalid error, never a plain-text UTF-8 error.
     #[test]
@@ -1661,6 +1718,97 @@ mod tests {
             Error::KeydbParse | Error::KeydbInvalid => {}
             e => panic!("wrong error for bad zip: {e:?}"),
         }
+    }
+
+    /// `extract_zip` on a WELL-FORMED zip that carries no `*.cfg`/`*.CFG`
+    /// member must fall through the whole member loop and return
+    /// `Error::KeydbInvalid` — never a parse error, and never silently pick a
+    /// non-keydb member.
+    #[test]
+    fn save_rejects_a_valid_zip_with_no_cfg_member() {
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+            writer.start_file("readme.txt", opts).unwrap();
+            writer.write_all(b"not a keydb").unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(buf.starts_with(b"PK\x03\x04"), "must be a real zip");
+
+        let dir = scratch("save-zip-no-cfg");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        assert!(matches!(src.save(&buf), Err(Error::KeydbInvalid)));
+    }
+
+    /// `save` on a WELL-FORMED zip that DOES carry a `*.cfg` member routes
+    /// through the success arm of `extract_zip` — proven distinct from the
+    /// "no member found" and "truncated/corrupt zip" cases above.
+    #[test]
+    fn save_extracts_the_cfg_member_from_a_valid_zip() {
+        use std::io::Write as _;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+            writer.start_file("ignored.txt", opts).unwrap();
+            writer.write_all(b"not a keydb").unwrap();
+            writer.start_file("KEYDB.cfg", opts).unwrap();
+            writer
+                .write_all(b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD = Test\n")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let dir = scratch("save-zip-with-cfg");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        let result = src
+            .save(&buf)
+            .expect("a zip carrying a .cfg member must extract");
+        assert_eq!(result.entries, 1);
+    }
+
+    /// `write_atomic` when the temp file cannot be CREATED (permission
+    /// denied on an existing, unwritable parent directory) must clean up and
+    /// surface `Error::KeydbWrite`, distinct from the create_dir_all failure
+    /// already pinned by `write_atomic_failure_preserves_prior_keydb`.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_failure_when_temp_file_cannot_be_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("write-atomic-unwritable");
+        let target = dir.join("keydb.cfg");
+        // Parent dir exists (so create_dir_all is a no-op) but is read-only,
+        // so `File::create(&tmp)` fails with permission denied.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = write_atomic(&target, "0xAAAA = x\n");
+        // Restore write permission so the scratch dir can be cleaned up by a
+        // later test run regardless of outcome here.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(result, Err(Error::KeydbWrite { .. })));
+    }
+
+    /// `write_atomic` when the RENAME step fails (the temp file wrote fine,
+    /// but the destination is an existing directory, so `rename` refuses)
+    /// must surface `Error::KeydbWrite` and remove the orphaned temp file.
+    #[test]
+    fn write_atomic_failure_when_rename_target_is_a_directory() {
+        let dir = scratch("write-atomic-rename-fail");
+        // The "keydb path" is itself an existing directory — the temp file
+        // writes fine (same parent), but renaming a file onto a directory
+        // always fails.
+        let target = dir.join("keydb.cfg");
+        std::fs::create_dir_all(&target).unwrap();
+        let result = write_atomic(&target, "0xAAAA = x\n");
+        assert!(matches!(result, Err(Error::KeydbWrite { .. })));
+        // No stray temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
     /// `read_capped_to_string` rejects input over the cap (decompression-bomb
