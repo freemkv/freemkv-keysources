@@ -1,0 +1,19 @@
+# Coverage is informational only: it never blocks a merge or a release. The
+# release cascade is gated by ci.yml / qa.yml and the local precommit, not by
+# a coverage threshold.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# No PR comment noise; the badge and the Codecov UI are enough.
+comment: false
+
+# Exclude non-product code from the coverage denominator.
+ignore:
+  - "tests/**"
+  - "ci/**"
