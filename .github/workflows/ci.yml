@@ -181,6 +181,52 @@ jobs:
       - run: cargo build --tests
         working-directory: freemkv-keysources
 
+  # Additive, NON-REQUIRED coverage. Mirrors the `test` job's sibling-checkout
+  # layout and pinned toolchain (nothing in the release cascade depends on it,
+  # and codecov upload is tokenless with fail_ci_if_error:false, so a flaky
+  # upload never reddens the run). `--locked` is deliberately absent here for
+  # the same reason it is in `test`: Cargo.lock is gitignored, so there is no
+  # lockfile to lock against on a fresh runner.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: freemkv-keysources
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: freemkv-keysources
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: freemkv-keysources
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        working-directory: freemkv-keysources
+      - uses: codecov/codecov-action@v5
+        with:
+          files: freemkv-keysources/lcov.info
+          slug: freemkv/freemkv-keysources
+          fail_ci_if_error: false
+
   check-windows:
     # dev is the FAST lane: this job still runs, but on the release-candidate
     # branches rather than on every push to dev. Nothing is deleted and no
