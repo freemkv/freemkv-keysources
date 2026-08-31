@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-keysources"
-version = "1.6.13"
+version = "1.6.14"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -40,7 +40,7 @@ codegen-units = 1
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.12" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.14" }
 
 [lints.clippy]
 uninlined_format_args = "allow"
