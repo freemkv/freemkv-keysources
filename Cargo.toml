@@ -2,7 +2,7 @@
 name = "freemkv-keysources"
 version = "1.6.13"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.88"
 license = "MIT"
 description = "Pluggable AACS key sources (keydb, online key service) for libfreemkv. Each source looks a disc up and hands libfreemkv its terminal Unit Keys via get_unit_keys; the library does all derivation."
 repository = "https://github.com/freemkv/freemkv-keysources"
@@ -41,3 +41,6 @@ codegen-units = 1
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.12" }
+
+[lints.clippy]
+uninlined_format_args = "allow"
