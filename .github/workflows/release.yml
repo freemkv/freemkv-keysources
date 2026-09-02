@@ -31,8 +31,9 @@ jobs:
   # release job does NOT `needs:` this job. The tag decision was already gated by
   # the local precommit (same MSRV, same commit).
   #
-  # freemkv-keysources is a library — Cargo.lock isn't tracked, so --locked
-  # would always fail (no lockfile to lock against on a fresh runner). Its
+  # Cargo.lock is now committed (issue #15), but --locked is still omitted: on
+  # the runner the libfreemkv dep resolves from crates.io, not the local path
+  # patch, which --locked can't reconcile. Its
   # libfreemkv dep resolves from crates.io (the dev .cargo/config.toml patch is
   # gitignored and absent on the runner), so libfreemkv must already be published
   # at this version — the release script enforces that ordering before tagging.
