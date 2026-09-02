@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.0] — 2026-09-02
+
+### Changed
+
+- Version aligned to 1.7.0 for the unified release. Internal CI/lint hardening only (stable-clippy MSRV split, cargo-deny dependency-audit gate, audience-based comment-guard); no functional changes.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed

@@ -32,12 +32,26 @@ on:
 # libfreemkv path-deps ../freemkv-unlock, which resolves to the workspace root
 # under this layout — hence the third checkout.
 #
-# `--locked` is deliberately absent: Cargo.lock is gitignored here (library
-# convention), so there is nothing to lock against and it fails rather than
-# resolves. That is what was breaking this workflow. The lock that has to hold
-# is the one release.sh regenerates in each consuming binary.
+# `--locked` is deliberately absent: Cargo.lock is now committed (issue #15) and
+# the `deny` job audits the resolved graph, but CI's sibling path-patch layout
+# resolves the freemkv crates as path packages, which `--locked` can't satisfy —
+# the same reason the binary crates omit it. The lock that has to hold is the one
+# release.sh regenerates in each consuming binary.
 
 jobs:
+  # Single source of truth for the MSRV — read rust-version from Cargo.toml once
+  # and export it; MSRV-bound jobs consume needs.resolve-msrv.outputs.v. clippy
+  # runs on stable instead (see CI.md's Toolchain policy).
+  resolve-msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.msrv.outputs.v }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        shell: bash
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
   # CI owns the changelog: main may never carry a released version without a
   # CHANGELOG.md entry for it. The release orchestrator dates an existing
   # `## [X.Y.Z]` heading — it does NOT invent one — so a version bump that
@@ -65,6 +79,7 @@ jobs:
           echo "::warning::${msg} (allowed on ${GITHUB_REF_NAME:-unknown}; required before it can reach main)."
 
   lint:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -89,19 +104,27 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # fmt runs on the MSRV pin; clippy runs on stable so new-lint debt is a
+      # blocking gate the pinned toolchain would hide. Stable is installed first
+      # for clippy; the MSRV pin goes second so it stays fmt's default toolchain.
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
       - run: cargo fmt --check
         working-directory: freemkv-keysources
       # --all-targets so the test code is linted too, not just the library.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo +stable clippy --all-targets -- -D warnings
         working-directory: freemkv-keysources
 
   test:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -126,12 +149,49 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
       - run: cargo test --tests
         working-directory: freemkv-keysources
+
+  # Dependency-audit gate. Mirrors the `test` job's sibling-checkout layout and
+  # generated .cargo/config.toml so `cargo metadata` resolves the git-tag patch
+  # to the local sibling paths; cargo-deny then audits advisories, bans,
+  # licenses, and sources against the committed deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: freemkv-keysources
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: freemkv-keysources
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          EOF
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: freemkv-keysources/Cargo.toml
 
   # This crate ships wherever freemkv and autorip ship, and it drags in all of
   # libfreemkv's platform code (SCSI transports included). Build the tests, not
@@ -149,6 +209,7 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
@@ -174,7 +235,9 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
@@ -185,9 +248,10 @@ jobs:
   # layout and pinned toolchain (nothing in the release cascade depends on it,
   # and codecov upload is tokenless with fail_ci_if_error:false, so a flaky
   # upload never reddens the run). `--locked` is deliberately absent here for
-  # the same reason it is in `test`: Cargo.lock is gitignored, so there is no
-  # lockfile to lock against on a fresh runner.
+  # the same reason it is in `test`: CI's sibling path-patch layout resolves the
+  # freemkv crates as path packages, which `--locked` can't satisfy.
   coverage:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -212,8 +276,9 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
@@ -241,6 +306,7 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
@@ -266,7 +332,9 @@ jobs:
           [patch.crates-io]
           libfreemkv = { path = "../libfreemkv" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-keysources
