@@ -16,46 +16,28 @@ use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 // Upper bound on the MKB forwarded to the key service — kept in lockstep with
-// libfreemkv's `read_mkb_content` MAX_BYTES (64 MiB) so an MKB the library is
-// willing to capture is never silently un-forwardable here (a trimmed MKB
-// record stream is normally a few MiB; this is headroom, not an expected size).
+// libfreemkv's `read_mkb_content` MAX_BYTES (64 MiB), so a capturable MKB is
+// never silently un-forwardable here (headroom, not an expected size).
 const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
 /// Minimum encrypted-content samples the online source will send in one key
-/// request — re-exported from the base crate ([`libfreemkv::keysource::MIN_SAMPLE_UNITS`])
-/// so this crate and libfreemkv's own FMTS forensic query share ONE value.
+/// request — re-exported from the base crate
+/// ([`libfreemkv::keysource::MIN_SAMPLE_UNITS`]) so this crate and
+/// libfreemkv's own FMTS forensic query share ONE value.
 ///
-/// The service identifies the key by which of the submitted units it decrypts,
-/// so too few samples — especially on FMTS, where a segment interleaves several
-/// variants at the unit level — can return a key that matches an incidental unit
-/// rather than the one asked about (a false positive). A request carrying fewer
-/// is refused (empty result → the resolver moves to the next source) rather than
-/// sent and trusted. Kept public so callers that GATHER the samples (the CLI,
-/// autorip) sample at least this many — sampling fewer guarantees the request is
-/// skipped and the online source never consulted.
+/// A request carrying fewer samples is refused (empty result, never sent)
+/// since the service identifies the key by which submitted unit it decrypts
+/// and too few risks a false-positive match. Kept public so gathering
+/// callers (the CLI, autorip) sample at least this many.
 pub use libfreemkv::keysource::MIN_SAMPLE_UNITS;
 /// Hard cap on the key-service response body. A real unit-key reply is a few
 /// hundred bytes; bound the read so a malicious/compromised server can't drive
 /// the client to OOM with an unbounded body.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-// ── SSRF guard ──────────────────────────────────────────────────────────────
-//
-// The keyserver URL is operator-supplied and the bearer token is confidential.
-// After validate_keyserver_url checked the host at config time, an attacker
-// who controls the keyserver's DNS can rebind it to 169.254.169.254 (cloud
-// metadata) or an RFC1918 host in the window between validation and the
-// actual POST, exfiltrating the key material and the Authorization token.
-//
-// Defence: resolve the host once just before the POST, reject any blocked IP,
-// and pin the ureq connection to those validated addresses so a subsequent DNS
-// flip cannot redirect the request. Use redirects(0) so a public URL can't
-// 30x-redirect to an internal host.
-
-/// True when `ip` must never be the target of an outbound key-service POST.
-/// Blocks loopback, link-local (incl. 169.254.0.0/16 cloud metadata), all
-/// RFC1918 private ranges, carrier-grade NAT, multicast, unspecified, and
-/// IPv4-mapped equivalents for all of the above.
+// ── SSRF guard — see docs/online-ssrf-guard.md ───────────────────────────────
+// is_blocked_ip: true when `ip` must never be an outbound key-service POST
+// target (loopback, link-local incl. cloud metadata, RFC1918, IPv4-mapped).
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -92,39 +74,22 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-/// Why [`resolve_and_guard`] rejected a URL. The two halves demand OPPOSITE
-/// operator actions, so they must not be collapsed: a `Config` rejection is a
-/// standing misconfiguration that will never fix itself, while `Unreachable` is
-/// the key service being down right now — exactly the condition this module's
-/// callers must not report as "this disc has no key".
-///
-/// SEPARABLE, NOT RANKED. Distinguishing the two is about the *message*, never
-/// about whether the caller hears anything at all. BOTH variants mean the
-/// service was never asked, so BOTH are `Err` out of [`OnlineSource::query`]
-/// (see the match there). The first cut of this enum routed `Config` to
-/// `Ok(Vec::new())` and only `Unreachable` to `Err`, which made a permanent
-/// fault — a mistyped port, an `http://` URL, a host that resolves into RFC1918
-/// — strictly QUIETER than a transient one: one `warn!` and then a benign-looking
-/// empty that `MultiSource::first_non_empty` cannot tell from "this keydb simply
-/// has no row for this disc". That is the seven-hour-502 collapse with the
-/// polarity reversed: the outage at least self-heals, the typo never does.
+// Why resolve_and_guard rejected a URL, split by the operator action each
+// demands: Config is a standing misconfiguration (never self-heals),
+// Unreachable is the service down now. Both are Err from query, never Ok(empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardFail {
-    /// Malformed URL, bad scheme, or a host that is (or resolves to) a
-    /// non-public address. Operator configuration; retrying changes nothing.
+    // Malformed URL, bad scheme, or a host that resolves to a non-public
+    // address. Operator configuration; retrying changes nothing.
     Config,
-    /// The host did not resolve — DNS failure or DNS timeout. The service is
-    /// unreachable; nothing is known about this disc's key. Transient.
+    // Host did not resolve — DNS failure or timeout. Service unreachable;
+    // nothing known about this disc's key. Transient.
     Unreachable,
 }
 
-/// Resolve `url`'s host and validate every resulting address against the SSRF
-/// guard. Returns the pinned socket addresses (for use with a custom ureq
-/// resolver) on success, or the rejection reason plus an explanatory message.
-///
-/// SECURITY: the message names the resolved address on an SSRF rejection and is
-/// for the CONFIG-time caller only — never log it (see the call site in
-/// [`OnlineSource::query`]).
+// Resolve `url`'s host, validating every address against the SSRF guard;
+// returns pinned socket addrs or a rejection reason + message. SECURITY: the
+// message names the address — log only at config time, never in `query`.
 fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> {
     let rest = if let Some(r) = url.strip_prefix("https://") {
         (r, 443u16)
@@ -160,19 +125,9 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     } else if let Some((h, p)) = authority.rsplit_once(':') {
         match p.parse::<u16>() {
             Ok(p) => (h.to_string(), p),
-            // A `host:port` authority whose port is not a u16 is a TYPO in the
-            // operator's config — `https://example.com:notaport/keys`. This used
-            // to fall back to the WHOLE authority as the hostname (port text
-            // included), which of course never resolves, so the URL surfaced as
-            // `GuardFail::Unreachable` → `Err(KeyServiceUnavailable)`: a standing
-            // misconfiguration reported as a transient outage, the exact
-            // collapse `GuardFail`'s own doc says must not happen, because the
-            // two halves demand OPPOSITE operator actions (fix the URL vs. wait).
-            // Reject it as `Config`, identical to the bracketed-IPv6 branch a few
-            // lines above, which already returns `Config` for an unparseable
-            // port. Silently substituting `default_port` would be worse still —
-            // it would ship the bearer token and key material to a port the
-            // operator never configured.
+            // A malformed port (e.g. `:notaport`) is an operator config typo,
+            // not a service outage — reject as `Config`, same as the
+            // bracketed-IPv6 branch above. See docs/online-guardfail.md.
             Err(_) => return Err((GuardFail::Config, "invalid port".into())),
         }
     } else {
@@ -182,10 +137,8 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
         return Err((GuardFail::Config, "URL has no host".into()));
     }
     // `to_socket_addrs` is a BLOCKING DNS lookup that can hang for the OS
-    // resolver timeout (tens of seconds) and freeze the rip thread that called
-    // query(). Run it on a spawned thread and join with a bounded deadline;
-    // on timeout return Err so query() yields None and the rip proceeds
-    // (mirrors the bounded-resolve in autorip/libfreemkv).
+    // resolver timeout and freeze the calling rip thread, so run it on a
+    // spawned thread with a bounded deadline (mirrors autorip/libfreemkv).
     let addrs: Vec<SocketAddr> = {
         use std::sync::mpsc;
         const DNS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -236,31 +189,20 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
 /// metadata-exfiltration guard). Returns `Ok(())` on success so a caller can
 /// gate `OnlineSource` construction; the error string explains the rejection.
 ///
-/// This is the *config-time* check. [`OnlineSource`] independently re-resolves
-/// and re-guards the host immediately before each POST (and pins the validated
-/// addresses), so a DNS rebind between this check and the request can't redirect
-/// the key material. The two share the SAME `is_blocked_ip` classifier and the
-/// SAME bounded-resolve, so their verdicts never diverge — the reason this lives
-/// here, in the key-source crate, rather than being re-rolled per application.
+/// This is the *config-time* check; [`OnlineSource`] re-resolves and
+/// re-guards the host again before each POST, closing the DNS-rebind window.
 pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
     resolve_and_guard(url).map(|_| ()).map_err(|(_, msg)| msg)
 }
 
-/// ureq's `ResolvedSocketAddrs` is a fixed 16-slot array and its `push` writes
-/// straight into that array, so handing it a 17th address is an out-of-bounds
-/// panic — in the rip thread, on a host that merely publishes a lot of A
-/// records. Keep the first 16; every one of them was validated by
-/// [`resolve_and_guard`], so a subset is still safe, just less redundant.
+// ureq's `ResolvedSocketAddrs` is a fixed 16-slot array; `push`ing a 17th
+// address panics (out of bounds) on a host with many A records. Keep the
+// first 16 — each already validated by `resolve_and_guard`.
 const MAX_PINNED_ADDRS: usize = 16;
 
-/// The pinned-address resolver behind [`hardened_agent`].
-///
-/// ureq 3 replaced v2's resolver closure with this trait. The agent MUST be
-/// built through `Agent::with_parts` to take one: `Agent::new_with_config`
-/// silently keeps the default resolver, which would send the request to live
-/// DNS and quietly reopen the rebinding window this module exists to close.
-/// That failure is invisible — it has no symptom short of an actual attack —
-/// so it is pinned by `hardened_agent_connects_to_the_pinned_address_not_dns`.
+// The pinned-address resolver behind `hardened_agent`. Must be wired via
+// `Agent::with_parts` — `new_with_config` silently keeps live DNS and
+// reopens the rebind window. See docs/online-ssrf-guard.md.
 #[derive(Debug)]
 struct PinnedResolver(Vec<SocketAddr>);
 
@@ -299,31 +241,13 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 pub struct OnlineSource {
     base_url: String,
     secret: String,
-    /// The last agent built, with the address set it was pinned to.
-    ///
-    /// A `query` used to build a FRESH `ureq::Agent` every call, and an FMTS disc
-    /// makes two calls per rip (`get_unit_keys` + `get_fmts_indexes`), so it paid
-    /// two TLS handshakes to the same host for no reason — an agent owns the
-    /// connection pool, and a discarded agent discards the pooled, already
-    /// negotiated TLS connection with it.
-    ///
-    /// SECURITY: the agent is reused ONLY when the freshly resolved + guarded
-    /// address SET is identical to the one the cached agent is pinned to. Every
-    /// query still re-resolves and re-runs the SSRF guard — that is the whole
-    /// anti-rebinding defence and is deliberately not cached; what is reused is
-    /// the connection, and only to addresses just re-validated this call.
-    ///
-    /// The stored `Vec<SocketAddr>` is the SET KEY: sorted and deduped, so the
-    /// comparison is order-insensitive. `to_socket_addrs` hands back whatever
-    /// order the resolver felt like, and a round-robin keyserver reorders its
-    /// A/AAAA records on essentially every lookup — an ordered `==` therefore
-    /// missed the cache every single time against exactly the deployment that
-    /// most needs it, silently degrading to the per-query TLS handshake this
-    /// field exists to avoid. Set equality is also the honest predicate: the
-    /// security property being asserted is "these are the same validated
-    /// addresses", which says nothing about their order. The agent itself stays
-    /// pinned to the order it was BUILT with; that is safe because an equal set
-    /// means every address it holds was re-resolved and re-guarded this call.
+    /// The last agent built, with the address set (sorted, deduped — an
+    /// order-insensitive SET KEY) it was pinned to. Reused only when a fresh
+    /// resolve + SSRF-guard of the host yields the identical address set, so
+    /// the anti-rebinding guarantee is untouched: only the pooled TLS
+    /// connection is reused, never a stale, un-reguarded address. See
+    /// docs/online-agent-cache.md for why this exists and why the key is a
+    /// set rather than an ordered sequence.
     agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
 }
 
@@ -336,10 +260,9 @@ impl OnlineSource {
         }
     }
 
-    /// The agent pinned to `pinned` — the cached one when the address set is
-    /// unchanged, a fresh one otherwise (which then becomes the cached one).
-    /// Poisoning is recovered from: a panic elsewhere must not make every later
-    /// key request panic.
+    // The agent pinned to `pinned` — the cached one when the address set is
+    // unchanged, a fresh one otherwise. Poisoning is recovered from: a panic
+    // elsewhere must not make every later key request panic.
     fn agent_for(&self, pinned: Vec<SocketAddr>) -> Arc<ureq::Agent> {
         // Compare SETS, not sequences — see the `agent` field's doc.
         let key = {
@@ -359,52 +282,17 @@ impl OnlineSource {
         agent
     }
 
-    /// The server-resolved Unit Keys for this disc. Runs exactly one network
-    /// round-trip. The service returns either a terminal `UK` (used directly) or
-    /// a `VUK` (derived to Unit Keys locally via the disc's encrypted title keys
-    /// from `ctx`).
-    ///
-    /// The return type draws THE distinction this source exists to draw:
-    ///
-    /// * `Ok(non-empty)` — the service answered with a key.
-    /// * `Ok(empty)` — the service ANSWERED and holds no key for this disc, or
-    ///   this source had nothing to ask with (no service configured, a
-    ///   misconfigured URL, an over-cap MKB, too few samples). A genuine miss;
-    ///   the resolver moves to the next source and `E7022` is the right verdict.
-    /// * `Err(..)` — the service could not answer: unreachable, timed out, DNS
-    ///   failed, returned 5xx, rejected the token (401/403), rate-limited (429),
-    ///   or replied with something unreadable. NOTHING is known about whether a
-    ///   key exists. Collapsing this into `Ok(empty)` is the bug this signature
-    ///   fixes: a seven-hour run of HTTP 502s was reported to operators as
-    ///   `E7022 No key source has a decryption key for this disc`, and they went
-    ///   hunting for a VUK when the correct action was to wait.
-    ///
-    /// `&self`: one-shot is the resolver's contract (each source's
-    /// `get_unit_keys` is called once), so no per-call latch is needed.
+    // The server-resolved Unit Keys for this disc: one round-trip, returning
+    // a terminal `UK` or a `VUK` derived locally. `Ok`/`Err` draw the
+    // miss-vs-outage distinction — see docs/online-query-contract.md.
     fn query(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         // No configured service: nothing to resolve.
         if self.base_url.is_empty() {
             return Ok(Vec::new());
         }
-        // Refuse to transmit over plaintext. The request body always carries
-        // base64 AACS key material (inf/mkb/units/vid) and, when configured, a
-        // bearer token in a header — so an `http://` POST hands both to any
-        // on-path observer, and the token is replayable.
-        //
-        // There is no legitimate plaintext deployment to preserve here: the
-        // address guard below rejects loopback, RFC1918, ULA and link-local, so
-        // an `http://` URL can only ever reach the PUBLIC internet — the single
-        // worst case for cleartext. A self-hosted keyserver on a LAN is already
-        // impossible by that guard, whatever its scheme.
-        //
-        // Still falls THROUGH to the next key source (a local keydb) — an `Err`
-        // here does not block the chain, because `MultiSource::first_non_empty`
-        // returns any later source's non-empty key set outright and only
-        // surfaces the failure when nothing anywhere resolved. What it does stop
-        // is the silent case: a cleartext URL is the same permanent operator
-        // fault as the address-guard rejection below (see [`GuardFail`]), so it
-        // gets the same verdict. Returning `Ok(empty)` here made "we refused to
-        // ask" indistinguishable from "the service answered and has no key".
+        // Refuse to transmit over plaintext: the body carries base64 key
+        // material and, when configured, a replayable bearer token. `Err`,
+        // not `Ok(empty)` — see docs/online-query-guards.md.
         if !self.base_url.starts_with("https://") {
             tracing::error!(
                 target: "freemkv::keysource",
@@ -415,26 +303,9 @@ impl OnlineSource {
             return Err(Error::KeyServiceUnavailable);
         }
         let mkb = ctx.mkb().unwrap_or(&[]);
-        // THE LINE this source draws between its skips (written out after the
-        // `Config`-was-quieter-than-`Unreachable` bug), in three parts:
-        //
-        // * NO URL AT ALL is not a fault: the operator did not configure an
-        //   online source, so there is nothing to report. `Ok(empty)`, silently
-        //   (the first guard in this function).
-        // * A bad URL — wrong scheme, mistyped port, guard-blocked address — is
-        //   an OPERATOR FAULT. Every disc is affected, nothing was asked, and
-        //   the fix is to edit the config. That is `Err` (above).
-        // * An over-cap MKB or too few content samples is a property of THIS
-        //   DISC's inputs, not a fault: the request cannot be *formed* for this
-        //   disc, so this source has nothing for it and never will, whatever the
-        //   operator does and however long they wait. Reporting that as
-        //   `KeyServiceUnavailable` would send the operator waiting out an
-        //   outage that does not exist — the same mislabelling in the opposite
-        //   direction. These stay `Ok(empty)`, and stay logged.
-        //
-        // Log it: a silent empty return here is indistinguishable from "no key",
-        // so surface the real cause (the cap is 64 MiB, far above any real
-        // trimmed MKB).
+        // No-URL / bad-URL / over-cap-or-under-sampled draw three different
+        // verdicts — see docs/online-query-guards.md. Logged: a silent empty
+        // here reads as "no key", so the real cause (64 MiB cap) is surfaced.
         if mkb.len() > MAX_MKB_BYTES {
             tracing::warn!(
                 target: "freemkv::keysource",
@@ -444,12 +315,9 @@ impl OnlineSource {
             );
             return Ok(Vec::new());
         }
-        // Gather encrypted-content samples and prove the minimum by TYPE: a
-        // `DecodeSampleSet` only exists with >= MIN_SAMPLE_UNITS units, so from here
-        // on the request cannot be built under-sized. The service resolves a key by
-        // which submitted unit it decrypts, so a request carrying too few can return
-        // a key matching an incidental unit (a false positive, seen on FMTS variant
-        // units) — too few → skip this source and fall through to the next.
+        // Prove the minimum by TYPE: `DecodeSampleSet` only exists with >=
+        // MIN_SAMPLE_UNITS units, so the request can't be built under-sized
+        // (too few risks the service matching an incidental unit — FMTS).
         let gathered = ctx.samples(64).unwrap_or_default();
         let n = gathered.len();
         let Some(samples) = DecodeSampleSet::new(gathered) else {
@@ -488,15 +356,12 @@ impl OnlineSource {
             body["title"] = serde_json::Value::String(label.to_string());
         }
         // Resolve + SSRF-guard the host just before the POST; pin the
-        // validated addresses into a redirect-disabled agent so a DNS
-        // rebind between config time and fetch time can't redirect the
-        // request (and the bearer token) to an internal/metadata host.
+        // validated addresses so a DNS rebind between config time and fetch
+        // time can't redirect the request to an internal/metadata host.
         let pinned = match resolve_and_guard(&self.base_url) {
             Ok(addrs) => addrs,
-            // A host that did not RESOLVE is the service being unreachable, not a
-            // bad URL — DNS failure and DNS timeout are exactly what a key-service
-            // outage looks like from here, and reporting them as a genuine miss is
-            // the same conflation as reporting a 502 that way.
+            // Did-not-RESOLVE is the service unreachable, not a bad URL — see
+            // docs/online-guardfail.md.
             Err((GuardFail::Unreachable, _)) => {
                 tracing::warn!(
                     target: "freemkv::keysource",
@@ -507,37 +372,16 @@ impl OnlineSource {
                 return Err(Error::KeyServiceUnavailable);
             }
             Err((GuardFail::Config, _)) => {
-                // Log THAT the URL was rejected, never WHY: the guard's message
-                // names the resolved address, and an internal address must not
-                // reach a log an operator may paste into a bug report. The
-                // static label is enough to separate "misconfigured/blocked
-                // key-service URL" from "this disc has no key", which is the
-                // only distinction the operator needs here.
-                //
-                // `error!`, not `warn!`, and `Err`, not `Ok(empty)`. This arm
-                // used to return `Ok(Vec::new())`, which made the PERMANENT
-                // fault quieter than the transient one directly above it: the
-                // service was never asked, yet the composition was handed a
-                // clean empty and — with no other source holding the key — told
-                // the operator `E7022 no key for this disc`. Same lie as the
-                // seven-hour 502, from a config typo that never self-heals. A
-                // failure to ask is never evidence about the disc, so it leaves
-                // as `Err`; `MultiSource::first_non_empty` still lets a later
-                // source's real key win outright, so this cannot fail a rip that
-                // the local keydb could have served.
+                // Log THAT the URL was rejected, never WHY (the message names
+                // the address). `error!` + `Err`, not `Ok(empty)` — see
+                // docs/online-guardfail.md for the full rationale.
                 tracing::error!(
                     target: "freemkv::keysource",
                     phase = "keyserver_post",
                     "key-service URL failed the address guard — the service was NOT asked about this disc; \
                      this is a standing misconfiguration (fix the URL), not a disc without a key"
                 );
-                // NOTE (reported upstream): libfreemkv has no
-                // `KeyServiceMisconfigured` code, so the permanent fault borrows
-                // the transient E7028. E7028's contract — "the source never got
-                // as far as answering the question" — is exactly true here; only
-                // its "transient, retry later" hint is wrong, and the `error!`
-                // above carries the correcting detail until a 70xx config code
-                // exists.
+                // Borrows transient E7028 pending a 70xx config code upstream.
                 return Err(Error::KeyServiceUnavailable);
             }
         };
@@ -546,12 +390,9 @@ impl OnlineSource {
         if let Some(value) = bearer_header(&self.secret) {
             req = req.header("Authorization", &value);
         }
-        // Begin/end around the keyserver round-trip — a slow or unresponsive
-        // service is the suspected DVD-scan hang. The agent is built with a
-        // 10s connect + bounded read timeout (see `hardened_agent`), so this
-        // call can never block forever; we log the timing so a slow round-trip
-        // is visible. SECURITY: never log `body` — it carries base64 key
-        // material.
+        // Begin/end around the keyserver round-trip: bounded by
+        // `hardened_agent`'s connect/read timeouts, so this can never block
+        // forever. SECURITY: never log `body` — it carries base64 key material.
         tracing::info!(target: "freemkv::keysource", phase = "keyserver_post", "begin");
         let post_t0 = std::time::Instant::now();
         let sent = req.send_json(body);
@@ -559,17 +400,9 @@ impl OnlineSource {
     }
 }
 
-/// Map a key-service HTTP status the client never asked for into the operator
-/// action it implies. THE table this fix exists for — each arm is a different
-/// thing for a person to do, and none of them is "your disc has no key":
-///
-/// * 401 / 403 → the token is wrong or expired. Fix the credentials.
-/// * 429 → rate limited. Back off and retry more slowly.
-/// * 5xx → the service is down. Wait; this is the seven-hour-502 case.
-/// * anything else non-2xx → the service is misbehaving in a way this client
-///   cannot interpret. Treated as unavailable, deliberately: the genuine miss is
-///   a **200 with no key in the body**, so a non-2xx status is never evidence
-///   about this disc, and guessing "no key" from one is the original bug.
+// Map a key-service HTTP status into the operator action it implies: 401/403
+// fix credentials, 429 back off, 5xx wait — none of them is "no key" (the
+// genuine miss is a 200 with an empty body), the original bug this fixes.
 fn classify_http_status(code: u16) -> Error {
     match code {
         401 | 403 => Error::KeyServiceUnauthorized,
@@ -578,20 +411,9 @@ fn classify_http_status(code: u16) -> Error {
     }
 }
 
-/// Turn the raw outcome of the key-service POST into this source's answer.
-///
-/// Split out of [`OnlineSource::query`] so the reply → verdict mapping is
-/// testable WITHOUT a network: the SSRF guard in `resolve_and_guard` blocks
-/// loopback by design, so a stub HTTP server on 127.0.0.1 can never be reached
-/// through `query`, and this seam is the only honest way to drive "the service
-/// returned 502" and "the service returned 200 with no entry" through the same
-/// code the rip uses.
-///
-/// `elapsed_ms` is the round-trip time, for the timing logs only.
-///
-/// SECURITY: logs status codes, byte counts and static labels only. The request
-/// body carries base64 AACS key material and the reply carries keys — neither is
-/// ever logged, and nor is a serde parse error (it quotes the offending input).
+// Turn the raw key-service POST outcome into this source's answer. Split
+// out of `query` so the reply -> verdict mapping is testable WITHOUT a
+// network. SECURITY: logs status/byte-count/labels only — never `body`.
 fn interpret_reply(
     sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ctx: &dyn ResolveCtx,
@@ -600,17 +422,9 @@ fn interpret_reply(
     let mut resp = match sent {
         Ok(r) => r,
         Err(e) => {
-            // Record the HTTP status when the service actually answered:
-            // 401/403 (bad or expired token), 429 (rate limited) and
-            // 5xx (service down) are completely different operator actions,
-            // and collapsing them into one line is why a 502 was read as
-            // "this disc has no key". The status is the service's own
-            // response code — it carries no key material and no address.
-            // A transport error has no status; report it as such rather
-            // than inventing one.
-            //
-            // Each arm now RETURNS the classified error instead of an empty
-            // vec, so the distinction survives past this function.
+            // 401/403/429/5xx demand different operator actions; collapsing
+            // them is why a 502 was read as "no key". Each arm RETURNS the
+            // classified error, never an empty vec, so it survives past here.
             return Err(match e {
                 ureq::Error::StatusCode(code) => {
                     let err = classify_http_status(code);
@@ -624,13 +438,9 @@ fn interpret_reply(
                     );
                     err
                 }
-                // ureq 3 fans v2's single `Transport` variant out into `Io`,
-                // `Timeout`, `Tls`, `Protocol`, `HostNotFound` and more, and the
-                // enum is non_exhaustive. Every one of them means the same thing
-                // here — nothing answered, so nothing is known about this disc —
-                // and a catch-all is the only shape that stays correct as the
-                // enum grows. The status arm above is the sole case where the
-                // service actually replied.
+                // ureq 3's non_exhaustive transport-error enum (`Io`, `Timeout`,
+                // `Tls`, ...) all mean the same thing here — nothing answered —
+                // so a catch-all stays correct as the enum grows.
                 _ => {
                     tracing::warn!(
                         target: "freemkv::keysource",
@@ -674,10 +484,9 @@ fn interpret_reply(
     let json: serde_json::Value = match serde_json::from_slice(&buf) {
         Ok(j) => j,
         Err(_) => {
-            // Never log the parse error or the payload: a serde message
-            // quotes the offending input, which here is key material.
-            // Unparseable is not "no key" — it is the service answering in a
-            // language this client does not speak. Transient / a service bug.
+            // Never log the parse error or payload (a serde message quotes
+            // the offending input, i.e. key material). Unparseable is a
+            // service bug, not "no key".
             tracing::warn!(
                 target: "freemkv::keysource",
                 phase = "keyserver_post",
@@ -686,12 +495,9 @@ fn interpret_reply(
             return Err(Error::KeyServiceUnavailable);
         }
     };
-    // `UK` is an ARRAY of hex keys (the service always returns an array now,
-    // even of one). A single element is the base Unit Key. A full set (one per
-    // forensic index, ordered index 1..N) is returned for a forensic sample.
-    // Preserve array order and tag each key with its array position, so the
-    // caller can map position → index (element i = index i+1). A bare string is
-    // still accepted for backward compatibility.
+    // `UK` is an ARRAY of hex keys — one for the base Unit Key, or an
+    // ordered forensic-index set. Array position tags each key (i -> index
+    // i+1). A bare string is still accepted for backward compatibility.
     if let Some(uk) = json.get("UK") {
         let mut out = Vec::new();
         if let Some(s) = uk.as_str() {
@@ -699,12 +505,9 @@ fn interpret_reply(
                 out.push(UnitKey::new(0, k));
             }
         } else if let Some(arr) = uk.as_array() {
-            // A forensic set is only usable COMPLETE: the mux trusts any
-            // non-empty result as the whole set and never assumes 32 (see
-            // `get_fmts_indexes`). Skipping an unparseable element would
-            // hand back a short set that silently omits an index, so a
-            // malformed element rejects the whole reply — that is a service
-            // bug, not a usable answer, and therefore a source FAILURE.
+            // A forensic set is only usable COMPLETE (the mux trusts any
+            // non-empty result as the whole set). Skipping a bad element
+            // would silently omit an index, so reject the whole reply.
             let mut bad = false;
             for (i, v) in arr.iter().enumerate() {
                 match v.as_str().and_then(parse_uk) {
@@ -735,10 +538,8 @@ fn interpret_reply(
         match ctx.enc_title_keys() {
             Ok(enc) => return Ok(uks_from_vuk(&vuk, enc)),
             Err(_) => {
-                // The SERVICE answered correctly; the DISC's encrypted title keys
-                // are what could not be read. Not a service failure, so not an
-                // `Err` from this source — the disc-side reason is the library's
-                // to report.
+                // The SERVICE answered; the DISC's encrypted title keys are
+                // what could not be read — a disc-side reason, not `Err` here.
                 tracing::warn!(
                     target: "freemkv::keysource",
                     phase = "keyserver_post",
@@ -749,11 +550,9 @@ fn interpret_reply(
             }
         }
     }
-    // The genuine miss — and the ONLY path that returns `Ok(empty)` from a
-    // completed round-trip. Logged distinctly from every failure above so an
-    // operator can tell "the service has no key for this disc" from "the
-    // service did not answer"; collapsing the two is what made a 502 look like
-    // a missing key. This is the one case where `E7022` is the truth.
+    // The genuine miss — the ONLY path returning `Ok(empty)` from a completed
+    // round-trip, logged distinctly from every failure above so a 502 can
+    // never again look like a missing key. `E7022` is the truth here.
     tracing::info!(
         target: "freemkv::keysource",
         phase = "keyserver_post",
@@ -763,23 +562,16 @@ fn interpret_reply(
 }
 
 impl KeySource for OnlineSource {
-    /// Base per-CPS-unit Unit Keys: submit the ctx's content samples and take the
-    /// service's reply (a terminal `UK`, or a `VUK` derived locally). One network
-    /// round-trip. An empty `Ok` means the service ANSWERED and holds no key; an
-    /// `Err` means it could not answer (see [`OnlineSource::query`]). Both let the
-    /// resolver try the next source — the difference is what the operator is told
-    /// when no source has one.
+    // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service
+    // answered with no key, `Err` means it could not answer — see
+    // docs/online-query-contract.md.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         self.query(ctx)
     }
 
-    /// AACS 2.1 forensic index set: the mux injects an index-1 single-phase anchor
-    /// batch as the ctx's samples; the service maps it to the full ordered set of
-    /// forensic index keys, tagged by array position (element `i` → forensic index
-    /// `i + 1`). Same one round-trip as [`get_unit_keys`](Self::get_unit_keys) —
-    /// the difference is purely which samples the mux gathered and how the caller
-    /// reads the reply. The count is whatever the service returns; the mux trusts
-    /// any non-empty result as the complete set and never assumes 32.
+    // AACS 2.1 forensic index set: same `query` round-trip as
+    // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
+    // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         self.query(ctx)
     }
@@ -788,16 +580,13 @@ impl KeySource for OnlineSource {
         "online"
     }
 
-    // host_certs: the no-op default. The online service does not serve host
-    // certs today (no client-side fetch, no server-side endpoint), so the OEM
-    // cert route falls back to whatever other source (e.g. the keydb) supplies.
-    // No network is touched. (Future task: online host-cert serving.)
+    // host_certs: no-op default. No online cert fetch/endpoint today, so
+    // OEM certs fall back to another source (e.g. keydb); no network touched.
 }
 
-/// The `Authorization` header value for a key-service request, or `None` when no
-/// secret/token is configured (the request then goes out unauthenticated). The
-/// token — passed as `--key-auth` on the CLI or `keyserver_secret` in autorip —
-/// is sent verbatim as an HTTP Bearer credential.
+// The `Authorization` header value, or `None` when no secret is configured
+// (request goes out unauthenticated). Sent verbatim as an HTTP Bearer
+// credential — the token comes from `--key-auth` (CLI) / `keyserver_secret`.
 fn bearer_header(secret: &str) -> Option<String> {
     if secret.is_empty() {
         None
@@ -869,11 +658,9 @@ mod tests {
         ))));
     }
 
-    /// The online source serves NO host certs today (no fetch, no endpoint).
-    /// `host_certs()` must return empty WITHOUT touching the network, so the OEM
-    /// route falls back to whatever else (the keydb) supplies. Uses a non-empty
-    /// base URL to prove the empty result isn't merely "no service configured" —
-    /// it's the deliberate no-op stub.
+    // host_certs() must return empty WITHOUT touching the network. Uses a
+    // non-empty base URL to prove the empty result is the deliberate no-op
+    // stub, not merely "no service configured".
     #[test]
     fn host_certs_is_noop_empty_no_network() {
         let src = OnlineSource::new("http://example.test/keys", "secret");
@@ -907,10 +694,8 @@ mod tests {
         assert!(resolve_and_guard("").is_err());
     }
 
-    /// Malformed-authority edges that `resolve_and_guard` must reject BEFORE
-    /// ever touching DNS: an empty host after the scheme (`https://`), an
-    /// unterminated IPv6 literal (missing `]`), and a bare `host:` with an
-    /// empty host part.
+    // Malformed-authority edges rejected BEFORE touching DNS: empty host,
+    // unterminated IPv6 literal, and a bare `host:` with an empty host part.
     #[test]
     fn resolve_and_guard_rejects_malformed_authorities() {
         // Scheme with nothing after it at all.
@@ -923,11 +708,8 @@ mod tests {
         assert!(resolve_and_guard("https://:8080/keys").is_err());
     }
 
-    /// A host that genuinely does not resolve (RFC 6761 reserves `.test`
-    /// to never resolve in the public DNS) must be reported as
-    /// `GuardFail::Unreachable` — "the service is down", not
-    /// `GuardFail::Config` ("fix the URL"). No real network traffic beyond a
-    /// local DNS lookup that is guaranteed to fail.
+    // A host that genuinely does not resolve (RFC 6761 `.test`) must report
+    // `GuardFail::Unreachable` ("service is down"), not `Config`.
     #[test]
     fn resolve_and_guard_reports_unreachable_for_a_host_that_never_resolves() {
         let (kind, msg) = resolve_and_guard("https://this-host-does-not-exist.test/keys")
@@ -938,10 +720,8 @@ mod tests {
         assert!(msg.contains("resolve"), "message should explain: {msg}");
     }
 
-    /// `PinnedResolver` with an EMPTY address set — the state `agent_for`
-    /// would build if `resolve_and_guard` somehow returned no addresses —
-    /// must fail the resolve step with `HostNotFound` rather than silently
-    /// falling back to live DNS.
+    // An EMPTY pinned address set must fail the resolve step with
+    // `HostNotFound` rather than silently falling back to live DNS.
     #[test]
     fn pinned_resolver_with_no_addresses_fails_the_connection() {
         let result = hardened_agent(Vec::new())
@@ -966,24 +746,9 @@ mod tests {
         assert_eq!(addrs[0].port(), 8080);
     }
 
-    // ── the pin is actually consulted ──────────────────────────────────────
-    //
-    // `resolve_and_guard` VALIDATES addresses; `hardened_agent` PINS them, so a
-    // hostname cannot re-resolve to an internal address between validation and
-    // connection. The validation half is well covered above — but every one of
-    // those tests still passes if the pinned resolver is never consulted,
-    // because none of them makes a connection. Nothing else in this file proves
-    // the agent honours the pin, and a mis-wired resolver fails OPEN: the
-    // connection quietly falls back to live DNS and the rebinding window this
-    // module exists to close is reopened, with no visible symptom.
-    //
-    // The discriminator: pin the agent to a loopback listener this test owns,
-    // then ask it for a host that CANNOT resolve — `.test` is reserved by
-    // RFC 6761 and never resolves in the public DNS. Only a consulted resolver
-    // can turn that
-    // name into a connection; a fallback to live DNS fails instead. No network
-    // is touched, and `query` (whose guard blocks loopback by design) is not
-    // involved — this drives `hardened_agent` directly.
+    // The pin is actually consulted (a mis-wired resolver fails OPEN to
+    // live DNS with no symptom — see docs/online-ssrf-guard.md): pin to a
+    // loopback listener, then ask for a `.test` host that CANNOT resolve.
     #[test]
     fn hardened_agent_connects_to_the_pinned_address_not_dns() {
         use std::io::Write as _;
@@ -1068,13 +833,9 @@ mod tests {
         assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
     }
 
-    // ── the reply → verdict mapping (THE defect) ───────────────────────────
-    //
-    // Driven through `interpret_reply`, the seam `query` hands its round-trip
-    // to. A stub HTTP server is NOT usable here: `resolve_and_guard` blocks
-    // loopback by design (SSRF guard), so 127.0.0.1 can never be reached through
-    // `query`, and pointing the test at a public host would make it a network
-    // test. Everything from the response onward is this function.
+    // ── the reply → verdict mapping (THE defect) ──────────────────────────
+    // Driven through `interpret_reply` directly: a stub HTTP server is NOT
+    // usable here since `resolve_and_guard` blocks loopback by design.
 
     /// A `ResolveCtx` that carries nothing — enough for the reply paths that do
     /// not derive from a VUK.
@@ -1110,10 +871,9 @@ mod tests {
             .expect("stub response")
     }
 
-    /// THE regression. The key service returned HTTP 502 for ~seven hours and
-    /// the CLI told operators the disc had no key, so they went hunting for a
-    /// VUK that was never missing. A 5xx must be a source FAILURE, and it must
-    /// be distinguishable from the service answering 200 with no entry.
+    // THE regression: a 5xx for ~seven hours was reported as "no key" and
+    // sent operators hunting a VUK that was never missing. A 5xx must be a
+    // source FAILURE, distinguishable from a 200 with no entry.
     #[test]
     fn http_5xx_is_a_source_failure_not_a_missing_key() {
         for status in [500u16, 502, 503, 504] {
@@ -1139,10 +899,8 @@ mod tests {
         );
     }
 
-    /// Each status the service can return maps to a DIFFERENT operator action:
-    /// fix the token (401/403), back off (429), wait (5xx). A non-2xx status is
-    /// never evidence about this disc, so anything else is "unavailable" too —
-    /// guessing "no key" from a status code is the original bug.
+    // Each status maps to a DIFFERENT operator action: fix the token
+    // (401/403), back off (429), wait (5xx) — never "no key" from a status.
     #[test]
     fn http_status_maps_to_the_operator_action() {
         let cases: &[(u16, u16)] = &[
@@ -1168,10 +926,9 @@ mod tests {
         }
     }
 
-    /// A transport failure — nothing answered at all — is the same verdict as a
-    /// 5xx and equally not a missing key. Uses a refused connection to
-    /// 127.0.0.1:1 to obtain a REAL transport-class error; this touches no
-    /// network and never reaches `query`, so the SSRF guard is not involved.
+    // A transport failure is the same verdict as a 5xx. Uses a refused
+    // connection to 127.0.0.1:1 for a REAL transport-class error; never
+    // reaches `query`, so the SSRF guard is not involved.
     #[test]
     fn transport_failure_is_a_source_failure() {
         let config = Config::builder()
@@ -1180,11 +937,9 @@ mod tests {
         let sent = ureq::Agent::new_with_config(config)
             .post("http://127.0.0.1:1/")
             .send("{}");
-        // ureq 3 split v2's single `Transport` variant across `Io`,
-        // `ConnectionFailed`, `Timeout` and friends, and which one a refused
-        // connection produces is a platform detail. The claim that matters is
-        // unchanged and is what this asserts: it failed, and NOT with a status
-        // code — nothing on the other end ever answered.
+        // Which transport variant a refused connection produces is a
+        // platform detail; what matters (asserted below) is that it failed,
+        // and NOT with a status code — nothing on the other end answered.
         assert!(
             !matches!(sent, Ok(_) | Err(ureq::Error::StatusCode(_))),
             "a refused connection must fail as transport, never as an HTTP status"
@@ -1260,10 +1015,8 @@ mod tests {
         assert_eq!(keys[0].key[0], 0x00);
     }
 
-    /// A malformed `"UK"` STRING (not the array form) parses to nothing and
-    /// falls through to the genuine-miss path — proven distinct from the
-    /// array form's "reject the whole reply" behaviour, since a bad scalar
-    /// string has no partial set to protect.
+    // A malformed `"UK"` STRING falls through to the genuine-miss path,
+    // distinct from the array form's "reject the whole reply" behaviour.
     #[test]
     fn uk_as_an_unparseable_string_falls_through_to_a_miss() {
         let keys = interpret_reply(Ok(reply(200, r#"{"UK":"not hex"}"#)), &BareCtx, 1)
@@ -1369,25 +1122,9 @@ mod tests {
         }
     }
 
-    // ── The pre-flight guards in `query` (nothing leaves the process) ───────
-    //
-    // Each of the three guards below fires BEFORE any address is resolved and
-    // before anything is sent. None was exercised: a reordering that let the
-    // cleartext POST through would have shipped green, and that POST carries the
-    // bearer token plus base64 key material.
-    //
-    // Their VERDICTS differ on purpose (see the comment above the MKB cap in
-    // `query`): the cleartext-scheme guard is an operator fault and yields
-    // `Err`, while the two input-shaped guards yield `Ok(empty)` — this source
-    // has nothing for THIS disc, permanently, and calling that an outage would
-    // send the operator waiting for nothing.
-    //
-    // The discriminator in all three: the configured host is `.test`, which
-    // RFC 6761 guarantees never resolves. On the guarded path nothing resolves
-    // it, so the test touches no network and returns `Ok(empty)`. Remove the
-    // guard and control reaches `resolve_and_guard`, which fails as
-    // `Unreachable` → `Err(KeyServiceUnavailable)` — a different Result, so the
-    // mutation cannot pass.
+    // ── The pre-flight guards in `query` (nothing leaves the process) ──────
+    // See docs/online-preflight-guard-tests.md — why each guard's verdict
+    // differs and why `.test` is the discriminator host used below.
 
     /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
     struct GuardCtx {
@@ -1415,20 +1152,9 @@ mod tests {
         }
     }
 
-    /// An `http://` key-service URL must never be POSTed to: the body carries
-    /// base64 AACS key material and the header carries a replayable bearer
-    /// token. The source refuses — and, because refusing means the service was
-    /// never asked, says so with `Err` rather than an empty that reads as "this
-    /// disc has no key". A later source's real key still wins
-    /// (`MultiSource::first_non_empty`), so refusing does not fail a rip the
-    /// local keydb can serve.
-    ///
-    /// Catches two mutations: sending the request anyway (the host is `.test`
-    /// and would surface as `Unreachable`, but the assertion below would still
-    /// hold, which is why `too_few_samples_skips_the_request` guards the
-    /// send-path ordering) and — the one this test was rewritten for — returning
-    /// `Ok(Vec::new())`, which made a permanent cleartext misconfiguration
-    /// indistinguishable from a genuine miss.
+    // An `http://` key-service URL must never be POSTed to; the source
+    // refuses with `Err`, not an empty that reads as "no key" — see
+    // docs/online-query-guards.md.
     #[test]
     fn cleartext_http_url_is_refused_before_anything_is_sent() {
         let src = OnlineSource::new("http://keyserver.test/keys", "s3cr3t");
@@ -1481,20 +1207,13 @@ mod tests {
         );
     }
 
-    // ── MAX_RESPONSE_BYTES: the stated anti-OOM defence ─────────────────────
-
-    /// The reply cap is the crate's only defence against a hostile or broken
-    /// key service driving the client to OOM with an unbounded body, and it had
-    /// never been exercised. Both edges are asserted so the `+1` read cannot
-    /// quietly become a truncating read (which would hand a half-body to the
-    /// JSON parser) or an off-by-one that rejects a legal reply.
+    // ── MAX_RESPONSE_BYTES: the anti-OOM defence, both edges asserted so
+    // `+1` can't quietly truncate, nor an off-by-one reject a legal reply.
     #[test]
     fn over_cap_reply_is_rejected_and_an_at_cap_reply_still_parses() {
-        // The over-cap body is deliberately VALID, key-bearing JSON. A body of
-        // junk would be rejected by the JSON parser whether or not the cap
-        // exists, so the test would pass with the cap deleted — worthless. This
-        // one is only rejectable BY the cap: remove the bounded read and it
-        // parses into a key.
+        // The over-cap body is deliberately VALID, key-bearing JSON — junk
+        // would be rejected by the parser regardless of the cap. This one is
+        // only rejectable BY the cap.
         let head = r#"{"UK":["000102030405060708090a0b0c0d0e0f"],"pad":""#;
         let tail = r#""}"#;
         let over = format!(
@@ -1521,12 +1240,8 @@ mod tests {
 
     // ── A bad port is CONFIG, not an outage ────────────────────────────────
 
-    /// `https://example.com:notaport/keys` is a typo in the operator's config.
-    /// The unparseable port used to make the WHOLE authority (port text
-    /// included) the hostname, which of course never resolved — so a standing
-    /// misconfiguration was reported as `Unreachable`, i.e. as the key service
-    /// being down. The two demand OPPOSITE actions (fix the URL vs. wait), which
-    /// is precisely what `GuardFail`'s doc says must not be collapsed.
+    // A typo'd port must be `Config`, not `Unreachable` — see
+    // docs/online-guardfail.md for why collapsing the two is the bug.
     #[test]
     fn unparseable_port_is_a_config_fault_not_an_outage() {
         for url in [
@@ -1545,15 +1260,9 @@ mod tests {
         assert_eq!(addrs[0].port(), 8443);
     }
 
-    /// The same distinction as seen by a caller — and the CRITICAL half of it:
-    /// separating a config fault from an outage must never make the config fault
-    /// quieter. A mistyped port means the service was never asked, so the caller
-    /// gets `Err`, exactly like an outage; only the log text differs.
-    ///
-    /// Catches the mutation that returns `Ok(Vec::new())` from the
-    /// `GuardFail::Config` arm of `query` (which is what this code did, and is
-    /// how a permanent misconfiguration became an `E7022 no key for this disc`
-    /// with no `Err` for `MultiSource::first_non_empty` to surface).
+    // The caller-visible half: a mistyped port must get `Err`, exactly like
+    // an outage (only the log text differs) — catches the `Ok(Vec::new())`
+    // regression from `GuardFail::Config` (docs/online-guardfail.md).
     #[test]
     fn query_with_a_mistyped_port_reports_a_failure_not_a_miss() {
         let src = OnlineSource::new("https://example.com:notaport/keys", "s3cr3t");
@@ -1569,14 +1278,9 @@ mod tests {
         );
     }
 
-    /// A guard-BLOCKED address (the SSRF/metadata case) travels the same
-    /// `GuardFail::Config` arm and must be just as loud: the POST never left the
-    /// process, so nothing is known about this disc. Distinct from the mistyped
-    /// port above because it fails AFTER resolution, on the address check.
-    ///
-    /// Catches the mutation that makes only the parse-level config faults `Err`
-    /// while letting the resolved-to-private-address case fall back to
-    /// `Ok(empty)`.
+    // A guard-BLOCKED address travels the same `GuardFail::Config` arm and
+    // must be just as loud — distinct from the mistyped port above because
+    // it fails AFTER resolution, on the address check.
     #[test]
     fn query_against_a_guard_blocked_address_reports_a_failure_not_a_miss() {
         // 127.0.0.1 needs no DNS and is unconditionally rejected by is_blocked_ip.
@@ -1593,9 +1297,8 @@ mod tests {
         );
     }
 
-    /// `get_fmts_indexes` shares `query` with `get_unit_keys` — never
-    /// separately exercised. Same guard-blocked, no-network path as the
-    /// `get_unit_keys` tests above proves it is wired up.
+    // `get_fmts_indexes` shares `query` with `get_unit_keys` — same
+    // guard-blocked, no-network path proves it is wired up.
     #[test]
     fn get_fmts_indexes_shares_the_same_query_path() {
         let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
@@ -1611,10 +1314,8 @@ mod tests {
         );
     }
 
-    /// A host that genuinely does not resolve travels `query`'s OWN
-    /// `GuardFail::Unreachable` arm (distinct from the `Config` arm covered
-    /// above) — still `Err`, since "did not resolve" is what a key-service
-    /// outage looks like from here, never a genuine miss.
+    // A host that does not resolve travels `query`'s OWN `Unreachable` arm
+    // (distinct from `Config` above) — still `Err`, never a genuine miss.
     #[test]
     fn query_against_an_unresolvable_host_reports_unreachable_as_a_failure() {
         let src = OnlineSource::new("https://this-host-does-not-exist.test/keys", "s3cr3t");
@@ -1630,11 +1331,9 @@ mod tests {
         );
     }
 
-    /// The request body's `vid_b64` and `title` fields are assembled BEFORE
-    /// the address guard runs (see `query`'s ordering), so a ctx that
-    /// supplies a VID and a title still exercises that assembly even when
-    /// the guard then rejects the address — proven through the same
-    /// deterministic guard-blocked path the tests above use (no network).
+    // `vid_b64`/`title` are assembled BEFORE the address guard runs, so a
+    // VID+title ctx still exercises that assembly even when the guard then
+    // rejects the address (same deterministic guard-blocked path, no network).
     #[test]
     fn query_assembles_vid_and_title_before_the_address_guard_runs() {
         struct VidTitleCtx;
@@ -1700,19 +1399,9 @@ mod tests {
         assert!(src.get_unit_keys(&WhitespaceTitleCtx).is_err());
     }
 
-    // ── One agent per address set, not one per query ────────────────────────
-
-    /// A round-robin keyserver returns the SAME addresses in a different order
-    /// on each lookup. That is the same validated set, so it must reuse the
-    /// agent — an ordered `==` on the cache key missed on every single query
-    /// against exactly the deployment the cache was written for, silently
-    /// reverting to a fresh TLS handshake per request.
-    ///
-    /// Catches the mutation that drops the sort/dedup from `agent_for`'s key
-    /// (the reversed order would then build a second agent) and, via the second
-    /// half, the mutation that "fixes" order-sensitivity by comparing only
-    /// lengths or the first element — which would wrongly reuse an agent pinned
-    /// to a DIFFERENT address.
+    // ── One agent per address set, not one per query ──────────────────────
+    // A round-robin keyserver reorders the SAME addresses; still the same
+    // set, so it must reuse the agent — see docs/online-agent-cache.md.
     #[test]
     fn a_reordered_but_identical_address_set_reuses_the_agent() {
         let src = OnlineSource::new("https://keyserver.test/keys", "");
@@ -1742,12 +1431,9 @@ mod tests {
         );
     }
 
-    /// An FMTS disc calls `query` twice per rip (`get_unit_keys` +
-    /// `get_fmts_indexes`), and a fresh `ureq::Agent` per call throws away the
-    /// connection pool with it — a second full TLS handshake to the same host
-    /// for nothing. The agent is reused only while the freshly guarded address
-    /// set is IDENTICAL, so the anti-rebinding guarantee is untouched: a
-    /// different address set builds (and re-pins) a new agent.
+    // An FMTS disc calls `query` twice per rip; the agent is reused only
+    // while the freshly guarded address set is IDENTICAL — see
+    // docs/online-agent-cache.md.
     #[test]
     fn the_agent_is_reused_per_address_set_only() {
         let src = OnlineSource::new("https://keyserver.test/keys", "");
