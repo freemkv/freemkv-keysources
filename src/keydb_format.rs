@@ -6,18 +6,7 @@
 //! standalone [`std::io::Result`] here instead of `libfreemkv::error::Result`
 //! (so the format crate carries no dependency on libfreemkv's error type).
 //
-// The parser is copied verbatim, so it carries the full KeyDb/DiscEntry API
-// even though this crate's consumer (`keydb.rs`) only exercises a subset
-// (`load`, `find_disc`, `iter_disc_entries`, and the public fields read by
-// `KeydbSource::unit_keys_from` / `KeydbSource::host_certs`). NOTE: an earlier
-// revision of this comment cited a `candidates_from` function — no such
-// function has ever existed in this crate; the real consumer is
-// `KeydbSource::unit_keys_from` (keydb.rs), which reads `unit_keys`, `vuk`,
-// `media_key` AND `vid` (`vid` is load-bearing for the MK+VID derivation the
-// kat_c / kat_d KATs pin — it is NOT unused). The genuinely unused items —
-// `empty`, `find_vuk`, `DiscEntry::title` — are part of the faithful copy and
-// are retained rather than pruned; allow dead_code so the byte-for-byte copy
-// compiles clean without diverging from the libfreemkv original.
+// See docs/keydb-format.md — why the full parser API (incl. dead_code items) is retained.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -28,10 +17,9 @@ use libfreemkv::aacs::types::{DeviceKey, HostCert};
 /// A keydb per-disc unit key: the CPS-unit number paired with its 16-byte key.
 pub type NumberedUnitKey = (u32, [u8; 16]);
 
-/// Upper bound on the on-disk keydb.cfg size accepted by [`KeyDb::load`].
-/// The public UHD keydb is ~62 MiB and growing; 128 MiB is generous
-/// headroom while still bounding the worst-case allocation from a hostile or
-/// corrupt file.
+// Upper bound on the on-disk keydb.cfg size accepted by `KeyDb::load`. The
+// public UHD keydb is ~62 MiB and growing; 128 MiB bounds worst-case
+// allocation from a hostile or corrupt file.
 const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Upper bound on parsed disc entries. The real public keydb carries
@@ -64,18 +52,9 @@ pub struct KeyDb {
     pub disc_entries: HashMap<Arc<str>, DiscEntry>,
 }
 
-// Key material must never reach a log, a panic message, or a bug report. Both
-// types below carry raw AACS key bytes, and both are public API, so a
-// `#[derive(Debug)]` on either is a leak of the crown jewels: `{:?}` on a
-// loaded `KeyDb` printed every processing key plus every disc's Media Key,
-// VID, VUK and Unit Keys. libfreemkv's equivalent types (`aacs::types`:
-// `DeviceKey`, `HostCert`, `Vid`, `MediaKey`, `Vuk`, `ProcessingKey`,
-// `UnitKey`, its own `DiscEntry`) all hand-write a redacting `Debug` for
-// exactly this reason; this crate's copy of the parser dropped that
-// convention when it was relocated. These restore it, field-for-field in the
-// same style (`<redacted>` for key bytes, a `_len` for key-bearing
-// collections). Pinned by `keydb_debug_is_redacted` /
-// `disc_entry_debug_is_redacted`.
+// Key material must never leak via `{:?}`; both types below carry raw AACS
+// key bytes. See docs/keydb-format.md for why these hand-write a redacting
+// `Debug` instead of deriving it. Pinned by `keydb_debug_is_redacted` / `disc_entry_debug_is_redacted`.
 
 impl std::fmt::Debug for KeyDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,25 +128,17 @@ pub struct DiscEntry {
     pub is_uhd: bool,
 }
 
-/// Parse a hex string like "0xABCD..." into bytes.
-///
-/// Operates on bytes, not `&str` char boundaries: the keydb is
-/// third-party content, so a non-ASCII scalar (e.g. a 4-byte UTF-8
-/// codepoint) must not panic on a mid-codepoint slice. Any non-hex
-/// byte yields `None`.
+// Parse a hex string like "0xABCD..." into bytes. Operates on bytes, not
+// `&str` char boundaries: the keydb is third-party content, so a non-ASCII
+// scalar must not panic on a mid-codepoint slice. Non-hex byte -> `None`.
 pub(crate) fn parse_hex(s: &str) -> Option<Vec<u8>> {
     // The one workspace hex parser (strips an optional 0x/0X, byte-based).
     libfreemkv::hex::parse_hex_bytes(s)
 }
 
-/// Read the run of consecutive ASCII decimal digits immediately following the
-/// first occurrence of `marker` in `text`, parsing them with `parse`.
-///
-/// Operates on raw bytes so untrusted third-party comment text (which may carry
-/// non-ASCII scalars) never panics on a char boundary. Returns `None` when the
-/// marker is absent or no digits follow it. Whitespace between the marker and
-/// the digits is skipped, so this serves both `MKBv<N>` (no gap) and
-/// `VolumeSize: <N>` (a space before the number).
+// Read digits right after the first `marker` in `text`. Byte-based so
+// untrusted comment text never panics on a char boundary; skips whitespace
+// before the digits, serving both `MKBv<N>` and `VolumeSize: <N>`.
 fn parse_digits_after<T: std::str::FromStr>(text: &str, marker: &str) -> Option<T> {
     let bytes = text.as_bytes();
     let start = text.find(marker)? + marker.len();
@@ -205,20 +176,9 @@ pub(crate) fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     libfreemkv::hex::parse_hex_fixed::<20>(s)
 }
 
-/// What [`KeyDb::parse`] threw away, by reason.
-///
-/// The parser is fed a THIRD-PARTY file: a mirror can serve a truncated or
-/// byte-shifted download that is still valid UTF-8, still contains enough
-/// recognisable rows to pass `KeydbSource::save`'s "at least one entry" check,
-/// and is then atomically committed as the new keydb — after which every disc
-/// past the corruption point silently resolves nothing. Before this counter,
-/// each malformed `| DK` / `| PK` / `| HC` / `| HC2` / `0x…` row was dropped by
-/// an `if let Some(..) = .. { }` with no `else`, no counter and no log, so that
-/// file was indistinguishable from a healthy one at every layer above.
-///
-/// The counts are logged ONCE per parse (a per-line log would be 181k lines on
-/// a real keydb, which is why the rate limit is "one summary", never "hide the
-/// count").
+// What `KeyDb::parse` threw away, by reason. See docs/keydb-format.md — why
+// this counter exists (silent corruption on a third-party keydb) and why
+// it's logged once per parse rather than per-line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParseStats {
     /// `| DK` rows that parsed as neither a positioned nor an orphan device key.
@@ -251,16 +211,9 @@ impl ParseStats {
             + self.disc_over_cap
     }
 
-    /// Emit the one summary line, if there is anything to say. Returns whether
-    /// a line was emitted — the only way a test can observe the warning without
-    /// a `tracing` subscriber dependency, and the seam
-    /// [`crate::KeydbSource::cached_db`] counts to prove the warning survives
-    /// the cache.
-    ///
-    /// `pub(crate)` because [`crate::KeydbSource`] re-emits it on a CACHE HIT
-    /// too: the cache short-circuits `parse`, so without that the corruption
-    /// summary for a given file fired once per process and a long-running daemon
-    /// went on serving the damaged keydb in silence forever after.
+    // Emit the one summary line, if there is anything to say; returns whether
+    // it fired (tests use this). `pub(crate)` so `KeydbSource` can re-emit it
+    // on a cache hit too, keeping the warning from going silent forever.
     pub(crate) fn log(&self) -> bool {
         if self.rejected() == 0 && self.disc_duplicate == 0 {
             return false;
@@ -280,13 +233,9 @@ impl ParseStats {
     }
 }
 
-/// True when `line` opens a per-disc row. The `0x` prefix is matched
-/// CASE-INSENSITIVELY: `parse_hex` in this same file deliberately tolerates
-/// `0x` and `0X` (and is tested for it), so a case-sensitive `starts_with("0x")`
-/// here would drop an uppercase `0X…` disc row on the floor with no diagnostic
-/// while every other hex field in the format accepted it. Shared with
-/// `KeydbSource::save`, whose entry count must stay in EXACT lockstep with what
-/// this parser accepts.
+// True when `line` opens a per-disc row. Matches `0x`/`0X` case-insensitively
+// (like `parse_hex`) so an uppercase row isn't silently dropped. Shared with
+// `KeydbSource::save`, whose entry count must match what this parser accepts.
 pub(crate) fn is_disc_entry_line(line: &str) -> bool {
     (line.starts_with("0x") || line.starts_with("0X")) && line.contains(" = ")
 }
@@ -333,14 +282,9 @@ impl KeyDb {
                 continue;
             }
 
-            // Device Key.
-            // Two shapes are accepted:
-            //   1. Positioned DK: `| DK | DEVICE_KEY 0x... | DEVICE_NODE 0x... | KEY_UV 0x... | KEY_U_MASK_SHIFT 0x...`
-            //      → loaded into `device_keys` (deterministic tree walk via `calc_pk_from_dk`).
-            //   2. Orphan DK: `| DK | DEVICE_KEY 0x...` with no position fields.
-            //      → loaded into `processing_keys` (brute walker / terminal validation).
-            // Per AACS spec a "PK" IS a DK at terminal position, so both row types
-            // are DKs in the unified model; only the metadata differs.
+            // Device Key: positioned rows -> `device_keys` (tree walk); orphan
+            // rows (no position fields) -> `processing_keys` (brute walker).
+            // Per AACS a "PK" IS a DK at terminal position, so both are DKs here.
             if line.starts_with("| DK") {
                 if let Some(dk) = Self::parse_device_key(line) {
                     db.device_keys.push(dk);
@@ -362,23 +306,17 @@ impl KeyDb {
                 continue;
             }
 
-            // Host Certificate (AACS 2.0).
-            //
-            // An HC2 row normally augments the preceding HC (AACS 1.0) row.
-            // KEYDB line ordering is third-party, so an HC2 row may appear
-            // before any HC row; rather than silently dropping the AACS 2.0
-            // credentials, carry them on a fresh HostCert with an empty v1
-            // cert (the v1 private_key/certificate stay zero/empty and are
-            // ignored by the v1 handshake, which guards on cert length).
+            // Host Certificate (AACS 2.0). Normally augments the preceding HC
+            // (AACS 1.0) row, but an HC2 row may appear first (third-party line
+            // ordering); then it's carried on a fresh HostCert with an empty v1 cert.
             if line.starts_with("| HC2") {
                 if let Some((pk, cert, revoked_at_mkb)) = Self::parse_host_cert_v2(line) {
                     if let Some(hc) = db.host_certs.last_mut() {
                         hc.cert.private_key_v2 = Some(pk);
                         hc.cert.certificate_v2 = Some(cert);
-                        // The `; Revoked in MKBv<N>` annotation can live on the
-                        // HC2 line rather than the preceding HC line; carry it
-                        // onto the combined cert if the HC line had none, so the
-                        // revocation isn't silently dropped.
+                        // The revocation annotation can live on the HC2 line
+                        // instead of the HC line; carry it onto the combined
+                        // cert if the HC line had none, so it isn't lost.
                         if hc.revoked_at_mkb.is_none() {
                             hc.revoked_at_mkb = revoked_at_mkb;
                         }
@@ -452,30 +390,16 @@ impl KeyDb {
         Ok(db)
     }
 
-    /// [`Self::load`] from an ALREADY-OPEN file, without the log.
-    ///
-    /// Two callers need this seam, both in [`crate::KeydbSource`]:
-    ///
-    /// * The identity stamp and the bytes must come from the SAME descriptor.
-    ///   Stat-the-path-then-load-the-path is two independent resolutions of one
-    ///   name, so an atomic rename landing between them stored a stamp
-    ///   describing one file next to the parsed contents of another — and the
-    ///   cache then served that pairing until the stamp changed again. `fstat`
-    ///   on the open handle cannot be pointed at a different inode.
-    /// * The rejection counts have to be RETAINED, not just logged, so a cache
-    ///   hit can re-emit them.
+    // `Self::load` from an ALREADY-OPEN file, without the log. See
+    // docs/keydb-format.md — why the same descriptor must supply both the
+    // identity stamp and the bytes, and why rejection counts are retained here.
     pub(crate) fn load_counted(
         f: std::fs::File,
         path: &std::path::Path,
     ) -> std::io::Result<(Self, ParseStats)> {
-        // Read through a hard `take` cap rather than trusting a stat. A
-        // `metadata` pre-check is only advisory: it is skipped entirely when the
-        // stat fails, and it reports len 0 for a FIFO or character device, so
-        // `--keydb /dev/zero` passed the guard and then read forever (NUL is
-        // valid UTF-8, so it did not even fail the decode — it just grew until
-        // the process was OOM-killed). Reading one byte past the cap accepts an
-        // exactly-at-cap file and rejects anything larger, matching
-        // `read_capped_to_string` on the download path.
+        // Read through a hard `take` cap rather than trusting a stat: a
+        // `metadata` pre-check reports len 0 for a FIFO/char device (e.g. would
+        // read `/dev/zero` forever). One byte past cap matches `read_capped_to_string`.
         use std::io::Read;
         let mut buf = Vec::new();
         f.take(MAX_KEYDB_BYTES + 1).read_to_end(&mut buf)?;
@@ -504,10 +428,9 @@ impl KeyDb {
             .to_lowercase()
             .trim_start_matches("0x")
             .to_string();
-        // Try with 0x prefix and without. parse_disc_entry only stores keys
-        // from lines that began with "0x", so every stored key carries the
-        // prefix and the no-prefix fallback is currently unreachable; it is
-        // retained as a defensive match for the prefix-agnostic lookup contract.
+        // Try with 0x prefix and without; every stored key currently carries
+        // the prefix, so the no-prefix fallback is a defensive match kept for
+        // the prefix-agnostic lookup contract.
         self.disc_entries
             .get(format!("0x{hash}").as_str())
             .or_else(|| self.disc_entries.get(hash.as_str()))
@@ -521,9 +444,8 @@ impl KeyDb {
             .to_lowercase()
             .trim_start_matches("0x")
             .to_string();
-        // The no-prefix fallback below is currently unreachable (every stored
-        // key carries the "0x" prefix, see find_vuk); kept as a defensive
-        // match for the prefix-agnostic lookup contract.
+        // No-prefix fallback below (every stored key carries "0x", see
+        // find_vuk); kept as a defensive match for the lookup contract.
         self.disc_entries
             .get(format!("0x{hash}").as_str())
             .or_else(|| self.disc_entries.get(hash.as_str()))
@@ -586,12 +508,8 @@ impl KeyDb {
     /// every field (see `round_trips_through_parse`). Used by the key-import tool
     /// to export a complete keydb.cfg (keys + host certs + VIDs).
     ///
-    /// The trailing `; <comment>` (MKB version / volume size / UHD) is emitted
-    /// ONLY after a `U` (unit-keys) field — that is the one place the parser
-    /// splits the value on `;`. Gluing a comment onto an `M`/`I`/`V` value would
-    /// make `parse_hex16` reject the whole field, so a comment-bearing entry that
-    /// has no unit keys drops its comment (keys always survive; the metadata is a
-    /// derivable hint). Real per-disc rows that carry metadata also carry keys.
+    /// See docs/keydb-format.md for why the trailing `; <comment>` is only
+    /// emitted after a `U` (unit-keys) field.
     pub fn to_keydb_cfg(&self) -> String {
         fn hx(b: &[u8]) -> String {
             use std::fmt::Write;
@@ -739,12 +657,9 @@ impl KeyDb {
         None
     }
 
-    /// Parse an orphan DK row: a `| DK |` line carrying only the
-    /// `DEVICE_KEY` field (no position metadata). The key is then
-    /// treated like a terminal/unpositioned label by the resolver
-    /// (Path 2's brute walker). Returns `None` if the line carries
-    /// any position field — those are positioned DKs and parsed by
-    /// [`Self::parse_device_key`] instead.
+    // Parse an orphan DK row: `| DK |` with only `DEVICE_KEY` (no position
+    // metadata), treated as terminal/unpositioned by the brute walker. `None`
+    // if a position field is present — those are positioned DKs (`parse_device_key`).
     fn parse_orphan_dk(line: &str) -> Option<[u8; 16]> {
         if line.contains("DEVICE_NODE")
             || line.contains("KEY_UV")
@@ -838,26 +753,16 @@ impl KeyDb {
         let (hash_part, rest) = line.split_once(" = ")?;
         let disc_hash: Arc<str> = Arc::from(hash_part.trim().to_lowercase());
 
-        // The trailing `;` comment (e.g.
-        // "; MKBv76/BEE/FindVUK 1.74 - VolumeSize: 81309007872 (UHD)") carries
-        // metadata the key fields don't. Capture everything after the FIRST ';'
-        // on the line, then extract MKB version / volume size / UHD flag.
+        // The trailing `;` comment (e.g. "; MKBv76/BEE/FindVUK 1.74 -
+        // VolumeSize: 81309007872 (UHD)") carries metadata the key fields
+        // don't; capture everything after the FIRST ';' on the line.
         let comment = line.split_once(';').map(|(_, c)| c).unwrap_or("");
-        // MKBv token: literal "MKBv" immediately followed by decimal digits.
         let mkb_version: Option<u32> = parse_digits_after(comment, "MKBv");
-        // VolumeSize token: "VolumeSize:" then whitespace then a byte count.
         let volume_size: Option<u64> = parse_digits_after(comment, "VolumeSize:");
-        // UHD flag: literal "(UHD)" anywhere in the comment.
         let is_uhd = comment.contains("(UHD)");
 
-        // Title = everything between `= ` and the first ` | ` field (or the
-        // trailing `;` comment), kept VERBATIM (trimmed). This is a FAITHFUL copy
-        // of the keydb title, so it must round-trip exactly: a previous version
-        // extracted a `(...)` substring as a "display title", but that TRUNCATED
-        // real titles that legitimately contain parentheses ("Lawrence of Arabia
-        // (Restored Version) – Disc 2 …" → "Restored Version") and broke
-        // serialize→parse idempotence. Display prettification, if wanted, belongs
-        // in the title-display layer, NOT this codec.
+        // Title kept VERBATIM (trimmed), a faithful copy for exact round-trip.
+        // See docs/keydb-format.md — why display prettification does NOT belong here.
         let before_fields = rest.split(" | ").next().unwrap_or("");
         // A title-only entry (no key fields) carries its `;` comment on the same
         // chunk — strip it so the comment doesn't leak into the title.
@@ -875,19 +780,15 @@ impl KeyDb {
         let mut unit_keys = Vec::new();
 
         let parts: Vec<&str> = rest.split(" | ").collect();
-        // Field scan starts at index 1: `parts[0]` is ALWAYS the title chunk and
-        // must be excluded, otherwise a disc whose title happens to be a field tag
-        // letter ("M", "I", "V", "U", "D") — e.g. `= M | M | 0x…` — would have the
-        // title eaten as a tag and shadow the real field. (Broke round-trip.)
+        // Field scan starts at index 1: `parts[0]` is ALWAYS the title chunk;
+        // excluding it stops a title matching a field-tag letter ("M"/"I"/"V"/
+        // "U"/"D") from being eaten as a tag and shadowing the real field.
         let mut i = 1;
         while i < parts.len() {
             match parts[i].trim() {
-                // M/I/V strip a trailing `; comment` before hex-parsing, exactly
-                // as the U arm below does: when the disc row's LAST field is one
-                // of these (no U field after it), a real keydb.cfg glues the
-                // `; MKBv…` comment onto that value, and parse_hex16 of
-                // "0x… ; MKBv64" fails — silently dropping a key the file
-                // actually holds. A hex16 never contains ';', so the split is safe.
+                // M/I/V strip a trailing `; comment` before hex-parsing (like the
+                // U arm below): when one of these is the row's LAST field, the
+                // comment gets glued on and parse_hex16 would otherwise fail.
                 "M" => {
                     if i + 1 < parts.len() {
                         media_key =
@@ -944,15 +845,9 @@ impl KeyDb {
 mod tests {
     use super::*;
 
-    /// `load` must enforce `MAX_KEYDB_BYTES` through a bounded read, not a stat.
-    ///
-    /// Regression: the cap used to be a `std::fs::metadata` pre-check followed by
-    /// an unbounded `read_to_string`. That is not a cap — it is skipped when the
-    /// stat fails, and a FIFO or character device reports len 0, so the guard
-    /// passed and the read never terminated. NUL bytes are valid UTF-8, so
-    /// `--keydb /dev/zero` did not even fail the decode; it allocated until the
-    /// process died. Asserts both edges of the boundary so a future cap change
-    /// cannot quietly re-introduce an off-by-one.
+    // `load` must enforce `MAX_KEYDB_BYTES` through a bounded read, not a stat
+    // (a prior metadata-based cap was skippable via a FIFO/char device
+    // reporting len 0). Asserts both edges of the boundary.
     #[test]
     fn load_enforces_the_size_cap_at_both_edges() {
         let dir = std::env::temp_dir()
@@ -981,11 +876,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `to_keydb_cfg` is the exact inverse of `parse`: parse a known line set,
-    /// serialize it, re-parse, and every field survives — device key, processing
-    /// key, host cert (priv key + cert + revocation), and the per-disc M/I(vid)/V/U
-    /// keys plus the MKBv/UHD comment metadata. Both sides go through `parse`, so
-    /// internal key forms (e.g. the `0x`-prefixed disc-hash) match by construction.
+    // `to_keydb_cfg` is the exact inverse of `parse`: parse a known line set,
+    // serialize, re-parse, and every field survives (keys, host cert, and the
+    // MKBv/UHD comment metadata).
     #[test]
     fn to_keydb_cfg_round_trips_through_parse() {
         let h = |b: u8, n: usize| format!("{b:02x}").repeat(n);
@@ -1053,23 +946,9 @@ mod tests {
         assert_eq!(b.host_certs[0].revoked_at_mkb, Some(72));
     }
 
-    /// REAL-DATA IDEMPOTENCE — the "load + serialize back-to-back" check.
-    ///
-    /// Parse the full keydb → serialize (S1) → parse S1 → serialize again (S2).
-    /// S1 MUST equal S2 byte-for-byte. This is the right invariant: a raw
-    /// keydb.cfg has formatting variance (whitespace, optional fields, comment
-    /// style) that our CANONICAL serializer normalizes, so `text == to_keydb_cfg`
-    /// is NOT expected — but once normalized, a re-load+re-serialize must be
-    /// stable. Idempotence here proves `parse` is lossless on its own output and
-    /// `to_keydb_cfg` is deterministic. Also asserts no rows are dropped.
-    /// REQUIRES a real keydb; `#[ignore]` by default. Run with:
-    /// `KEYDB_PATH=/path/to/keydb.cfg cargo test --release -- --ignored`.
-    ///
-    /// It used to carry no `#[ignore]` and `return` early when `KEYDB_PATH` was
-    /// unset — so CI ran it, asserted NOTHING about 181k-entry behaviour, and
-    /// reported green. A skip has to be visible in the test output to mean
-    /// anything, and an ignored test that is RUN without its fixture must fail
-    /// loudly rather than silently pass.
+    // REAL-DATA IDEMPOTENCE: parse → serialize (S1) → parse → serialize (S2);
+    // S1 must equal S2 byte-for-byte. REQUIRES a real keydb (KEYDB_PATH env);
+    // `#[ignore]` by default. See docs/keydb-format.md.
     #[test]
     #[ignore = "needs a real keydb.cfg: KEYDB_PATH=<path> cargo test -- --ignored"]
     fn to_keydb_cfg_is_idempotent_on_real_keydb() {
@@ -1095,12 +974,9 @@ mod tests {
         assert_eq!(db1.host_certs.len(), db2.host_certs.len(), "HC drift");
     }
 
-    /// REAL-SCALE parser health: a genuine published keydb must parse with ZERO
-    /// rejected rows. This is the assertion the rejection counter exists to
-    /// make possible — a corrupt or byte-shifted mirror download differs from a
-    /// healthy one precisely here, and nothing above the parser can tell them
-    /// apart. `#[ignore]` by default; run with:
-    /// `KEYDB_PATH=/path/to/keydb.cfg cargo test --release -- --ignored`.
+    // REAL-SCALE parser health: a genuine published keydb must parse with ZERO
+    // rejected rows — the assertion the rejection counter exists to make
+    // possible. `#[ignore]` by default; run with KEYDB_PATH set.
     #[test]
     #[ignore = "needs a real keydb.cfg: KEYDB_PATH=<path> cargo test -- --ignored"]
     fn a_real_keydb_parses_with_no_rejected_rows() {
@@ -1129,13 +1005,9 @@ mod tests {
         if path.exists() { Some(path) } else { None }
     }
 
-    /// The real keydb for the `#[ignore]`d real-scale tests, or a LOUD failure.
-    ///
-    /// The old pattern (`match keydb_path() { Some(p) => p, None => return }`)
-    /// on a non-ignored test is the worst of both worlds: CI ran the test,
-    /// asserted nothing, and reported success. These tests are `#[ignore]`d, so
-    /// running one at all is an explicit request — and an explicit request with
-    /// no fixture must fail, not quietly pass.
+    // The real keydb for the `#[ignore]`d real-scale tests, or a LOUD failure.
+    // See docs/keydb-format.md — why silent `return` on a missing fixture is
+    // wrong here.
     fn real_keydb_path() -> std::path::PathBuf {
         keydb_path().expect(
             "KEYDB_PATH must point at a real keydb.cfg; run: \
@@ -1161,11 +1033,9 @@ mod tests {
 
     #[test]
     fn disc_entry_strips_a_comment_glued_to_a_trailing_v_field() {
-        // A real keydb.cfg row whose LAST field is V (no U after it) with the
-        // `; MKBv…` comment glued straight onto the hex value. The U arm already
-        // strips such a comment; before M/I/V did too, parse_hex16 saw
-        // "0x00… ; MKBv64" and silently dropped the VUK — the disc then reported
-        // no key despite the file holding one.
+        // A row whose LAST field is V (no U after it) with the `; MKBv…`
+        // comment glued onto the hex value; before M/I/V stripped it too,
+        // parse_hex16 silently dropped the VUK.
         let z40 = "00".repeat(20);
         let z32 = "00".repeat(16);
         let line =
@@ -1178,10 +1048,9 @@ mod tests {
         );
     }
 
-    // NOTE: key fields below use obvious repeated-byte / zero placeholders
-    // (0x01.., 0x02.., 0x03.., 0x00..). NEVER put real — or real-looking — host,
-    // device, or processing key material in code; these tests exercise the
-    // parser's field-splitting only, not any genuine key.
+    // NOTE: key fields below use obvious repeated-byte / zero placeholders.
+    // NEVER put real — or real-looking — key material in code; these tests
+    // exercise the parser's field-splitting only.
 
     #[test]
     fn test_parse_device_key() {
@@ -1193,10 +1062,8 @@ mod tests {
 
     #[test]
     fn test_orphan_dk_row_loads_into_processing_keys() {
-        // `| DK |` row without position fields = an orphan DK. Per the
-        // unified model the resolver treats it like a terminal/PK
-        // candidate: it lands in `processing_keys` and the brute walker
-        // handles it.
+        // `| DK |` row without position fields = an orphan DK; it lands in
+        // `processing_keys` and the brute walker handles it.
         let cfg = r#"
 | DK | DEVICE_KEY 0x01010101010101010101010101010101 ; orphan, no position fields
 | DK | DEVICE_KEY 0x02020202020202020202020202020202 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17 ; positioned MKBv01-MKBv48
@@ -1340,18 +1207,9 @@ mod tests {
         );
     }
 
-    /// `load_counted` must read the HANDLE it was given, never re-resolve the
-    /// path. `KeydbSource::cached_db` stamps the open file with `fstat` and then
-    /// parses from that same descriptor precisely so the recorded identity and
-    /// the parsed bytes cannot describe two different files; the moment this
-    /// function re-opens the path, that guarantee is gone and an atomic rename
-    /// landing in between stores one file's stamp beside another file's keys —
-    /// a mismatch the cache then serves as if it were valid.
-    ///
-    /// The race itself cannot be scheduled deterministically in-process, so the
-    /// SEAM is what is pinned: with the path already replaced, the handle's
-    /// contents must still win. Catches the mutation that restores an internal
-    /// `File::open(path)`.
+    // `load_counted` must read the HANDLE it was given, never re-resolve the
+    // path (identity stamp + bytes must match). See docs/keydb-format.md.
+    // With the path already replaced, the handle's contents must still win.
     #[cfg(unix)]
     #[test]
     fn load_counted_reads_the_handle_not_the_path() {
@@ -1401,14 +1259,9 @@ mod tests {
             !rendered.contains("5a") && !rendered.contains("5A"),
             "{what} Debug leaked a hex key byte: {rendered}"
         );
-        // A derived `Debug` over `[u8; 16]` / `Vec<[u8; 16]>` renders a byte
-        // array — `[90, 90, ...]`. A redacting impl never emits one. Matched as
-        // "a `[` immediately followed by a digit" rather than "any `[`", because
-        // callers legitimately render a `Vec` OF redacting structs
-        // (`{:?}` on `KeyDb::host_certs`), whose own `[` opens a list of
-        // `Name { .. }` — never a byte. Every byte-array rendering, decimal or
-        // nested, still starts `[<digit>` (or `[[<digit>`), and the two byte
-        // checks above catch the payload independently.
+        // A derived `Debug` over a byte array renders `[90, 90, ...]`; matched
+        // as "`[` immediately followed by a digit" rather than "any `[`",
+        // since callers legitimately render a `Vec` of redacting structs.
         let bytes = rendered.as_bytes();
         assert!(
             !rendered
@@ -1418,10 +1271,8 @@ mod tests {
         );
     }
 
-    /// `{:?}` on a `DiscEntry` must not print the Media Key, VID, VUK or any
-    /// Unit Key. Catches the mutation that restores `#[derive(Debug)]`: the
-    /// derive renders `media_key: Some([90, 90, ...])`, so a single `{:?}` in a
-    /// caller's log or panic message published a disc's whole key set.
+    // `{:?}` on a `DiscEntry` must not print the Media Key, VID, VUK or any
+    // Unit Key. Catches the mutation that restores `#[derive(Debug)]`.
     #[test]
     fn disc_entry_debug_is_redacted() {
         let e = DiscEntry {
@@ -1489,25 +1340,9 @@ mod tests {
         );
     }
 
-    /// The SIBLING type. `KeyDb`'s hand-written `Debug` prints
-    /// `host_certs_len`, so it protects the whole-db rendering and nothing else
-    /// — [`KeyDb::host_certs`] is a public field, and `{:?}` on ONE element of
-    /// it walks a completely different code path: `KeydbHostCert`'s derive,
-    /// then `HostCert`'s impl. That path carries the AACS host PRIVATE key, the
-    /// only key material in the crate that authenticates US rather than opening
-    /// a disc.
-    ///
-    /// It is safe today only because `libfreemkv::HostCert` hand-writes a
-    /// redacting `Debug` (`aacs::types`, `private_key: "<redacted>"` +
-    /// `certificate_len`) — an EXTERNAL guarantee this crate silently inherits
-    /// through the derive, with nothing on this side pinning it. This test pins
-    /// it: it catches a libfreemkv upgrade that swaps that impl for
-    /// `#[derive(Debug)]`, which would leak the host private key out of this
-    /// crate's public API with no diff in this repository at all.
-    ///
-    /// Rendered three ways because callers reach the cert three ways: the whole
-    /// `Vec` (`?db.host_certs`), one element, and the inner `HostCert` a caller
-    /// gets back from `KeyDb::host_certs(mkb)`.
+    // The SIBLING type: `KeyDb`'s hand-written `Debug` protects the whole-db
+    // rendering only; `{:?}` on one `KeydbHostCert` element walks a different
+    // path carrying the AACS host PRIVATE key. See docs/keydb-format.md.
     #[test]
     fn host_cert_debug_is_redacted_including_the_sibling_wrapper() {
         let hc = KeydbHostCert {
@@ -1553,14 +1388,9 @@ mod tests {
         assert_no_key_bytes("Vec<DeviceKey>", &format!("{:?}", vec![dk]));
     }
 
-    // ── Parser rejection accounting ────────────────────────────────────────
-
-    /// Every malformed row the parser drops must be COUNTED, per reason. The
-    /// mutation this catches: restoring the bare `if let Some(x) = .. { }` with
-    /// no `else`, which is how a byte-shifted mirror download passed `save()`'s
-    /// "at least one entry" validation, was atomically committed as the new
-    /// keydb, and then resolved nothing for every disc past the damage — with
-    /// not one line of log to notice it by.
+    // ── Parser rejection accounting ── every malformed row must be COUNTED,
+    // per reason. Catches restoring a bare `if let Some(x) = .. { }` with no
+    // `else`, which let a byte-shifted download resolve nothing with zero log.
     #[test]
     fn parse_counts_every_rejected_row_by_reason() {
         let good_pk = format!("| PK | 0x{}", "ab".repeat(16));
@@ -1629,26 +1459,18 @@ mod tests {
     /// dropped by the cap.
     #[test]
     fn parse_counts_unparseable_disc_row() {
-        // ` = ` present (so it IS a disc row) but `split_once(" = ")` succeeds
-        // and the entry parses — to get a genuine rejection the row must fail
-        // `parse_disc_entry`, which only returns None without a " = ". Nothing
-        // in today's grammar can be a disc row AND fail, so the counter is
-        // proven by construction elsewhere; assert the healthy case is zero so
-        // a future parser change that starts rejecting rows cannot do it
-        // silently.
+        // Nothing in today's grammar can be a disc row AND fail
+        // `parse_disc_entry`, so assert the healthy case is zero, so a future
+        // parser change that starts rejecting rows cannot do it silently.
         let k = "01".repeat(16);
         let (_, stats) = KeyDb::parse_counted(&format!("0xAAAA = T | U | 1-0x{k}\n"));
         assert_eq!(stats.rejected(), 0, "a healthy keydb rejects nothing");
         assert_eq!(stats.disc_duplicate, 0);
     }
 
-    // ── `0X` disc rows / the save() lockstep ────────────────────────────────
-
-    /// The disc-row test is `starts_with("0x")` — CASE-SENSITIVE, while
-    /// `parse_hex` in this same file deliberately accepts `0x` AND `0X` (and is
-    /// tested for it). An uppercase `0X…` row was therefore dropped with no
-    /// diagnostic at all: not parsed, not counted, not logged. Catches the
-    /// mutation that removes the `0X` arm of `is_disc_entry_line`.
+    // ── `0X` disc rows / the save() lockstep ── an uppercase row was once
+    // dropped with no diagnostic. Catches the mutation that removes the `0X`
+    // arm of `is_disc_entry_line`.
     #[test]
     fn disc_row_with_uppercase_0x_prefix_is_parsed() {
         let v = "33".repeat(16);
@@ -1666,12 +1488,9 @@ mod tests {
         assert!(!is_disc_entry_line("0XAABBCC"));
     }
 
-    // ── One allocation per disc hash, not two ──────────────────────────────
-
-    /// The map key and the entry's own `disc_hash` must be the SAME allocation.
-    /// They used to be two `String`s (`insert(entry.disc_hash.clone(), entry)`),
-    /// ~13 MB of duplicate hash text across the real keydb's 181k entries — now
-    /// resident for the process lifetime, since `KeydbSource` caches the parse.
+    // ── One allocation per disc hash, not two ── map key and entry's own
+    // `disc_hash` must be the SAME allocation (used to be a clone, ~13 MB of
+    // duplicate text across the real keydb's 181k entries).
     #[test]
     fn disc_hash_is_stored_once_not_twice() {
         let v = "33".repeat(16);
@@ -1683,11 +1502,7 @@ mod tests {
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // Hardening additions
-    // ════════════════════════════════════════════════════════════════════
-
-    // ── parse_hex / parse_hex16 / parse_hex20 ──────────────────────────────
+    // ══ Hardening additions ══ parse_hex / parse_hex16 / parse_hex20 ══
 
     #[test]
     fn parse_hex_strips_lower_and_upper_prefixes() {
@@ -1870,11 +1685,9 @@ mod tests {
 
     #[test]
     fn parse_device_key_requires_all_four_fields() {
-        // Missing KEY_U_MASK_SHIFT → parse_device_key returns None; with no
-        // position fields at all it would be an orphan DK instead. Here the
-        // line has DEVICE_NODE + KEY_UV but no shift → neither parser accepts
-        // it as a positioned DK, and parse_orphan_dk rejects it (has position
-        // fields), so nothing is loaded.
+        // Missing KEY_U_MASK_SHIFT → parse_device_key returns None; it has
+        // DEVICE_NODE + KEY_UV so parse_orphan_dk also rejects it (has
+        // position fields), so nothing is loaded.
         let line = "| DK | DEVICE_KEY 0x00000000000000000000000000000000 | DEVICE_NODE 0x0800 | KEY_UV 0x00000400";
         assert!(KeyDb::parse_device_key(line).is_none());
         let db = KeyDb::parse(line);
@@ -1884,10 +1697,9 @@ mod tests {
 
     #[test]
     fn parse_device_key_accepts_uppercase_0x_prefix() {
-        // Regression: node/uv/shift parsed via a case-sensitive
-        // `trim_start_matches("0x")`, so an uppercase `0X` prefix was not
-        // stripped, `from_str_radix` failed, and the WHOLE device key was
-        // silently dropped. All four fields must parse regardless of prefix case.
+        // Regression: a case-sensitive `trim_start_matches("0x")` left an
+        // uppercase `0X` prefix unstripped, so `from_str_radix` failed and
+        // the WHOLE device key was silently dropped.
         let line = "| DK | DEVICE_KEY 0x000102030405060708090A0B0C0D0E0F \
                     | DEVICE_NODE 0X0001 | KEY_UV 0X00000002 | KEY_U_MASK_SHIFT 0X03";
         let dk = KeyDb::parse_device_key(line).expect("uppercase 0X prefix must parse");
@@ -2116,10 +1928,9 @@ mod tests {
         assert_eq!(hashes, vec!["0xaaaa", "0xbbbb"]);
     }
 
-    /// `to_keydb_cfg` emits the sibling `| HC2 |` line for a host cert that
-    /// carries AACS 2.0 credentials, and a `parse` of the output recovers
-    /// them. Also: an empty title serializes as the literal `Unknown` (the
-    /// inverse of the parser's own convention).
+    // `to_keydb_cfg` emits the sibling `| HC2 |` line for AACS 2.0
+    // credentials, recovered by re-`parse`; also an empty title serializes
+    // as the literal `Unknown`.
     #[test]
     fn to_keydb_cfg_emits_hc2_and_unknown_for_empty_title() {
         let h = |b: u8, n: usize| format!("{b:02x}").repeat(n);
@@ -2160,10 +1971,9 @@ mod tests {
         );
     }
 
-    /// `to_keydb_cfg`'s comment clause is written piecewise (MKBv, then
-    /// VolumeSize, then UHD) — exercise each optional sub-field independently
-    /// (not just all-three-true) so every combination of the trailing
-    /// `; comment` assembly is proven, not just the "everything present" case.
+    // `to_keydb_cfg`'s comment clause is written piecewise (MKBv, VolumeSize,
+    // UHD); exercise each optional sub-field independently, not just
+    // all-three-true.
     #[test]
     fn to_keydb_cfg_comment_fields_are_independent() {
         let k = "0a".repeat(16);
@@ -2193,15 +2003,8 @@ mod tests {
         assert_eq!(eb2.volume_size, None);
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // KEYDB-parser integration tests relocated from libfreemkv.
-    //
-    // These exercise the parser (KeyDb::load) end-to-end against a real
-    // keydb.cfg and feed its material into libfreemkv's AACS crypto
-    // (derive_vuk, then decrypt_unit + is_clean_ts). They live here now that the
-    // parser lives here. All are KEYDB_PATH-env-gated and no-op in CI when
-    // the env is unset; they must still COMPILE.
-    // ════════════════════════════════════════════════════════════════════
+    // KEYDB-parser integration tests relocated from libfreemkv; exercise the
+    // parser end-to-end against a real keydb.cfg. See docs/keydb-format.md.
 
     /// REQUIRES a real keydb; `#[ignore]` by default. Run with:
     /// `KEYDB_PATH=/path/to/keydb.cfg cargo test --release -- --ignored`.
@@ -2241,10 +2044,8 @@ mod tests {
     #[ignore = "needs KEYDB_PATH + ENCRYPTED_UNIT_PATH: cargo test -- --ignored"]
     fn test_decrypt_real_unit() {
         // Try decrypting a real encrypted aligned unit from a UHD sample.
-        // This disc is AACS 2.0 (BEE) so unit key alone won't work —
-        // we need bus decryption first. But this verifies the pipeline.
-        // Path comes from ENCRYPTED_UNIT_PATH (same env-driven pattern as the
-        // KEYDB_PATH fixture); no-ops in CI when unset.
+        // This disc is AACS 2.0 (BEE) so unit key alone won't work — bus
+        // decryption is needed first — but this verifies the pipeline.
         let unit_path = std::path::PathBuf::from(
             std::env::var("ENCRYPTED_UNIT_PATH")
                 .expect("ENCRYPTED_UNIT_PATH must point at an encrypted aligned unit"),
@@ -2302,16 +2103,9 @@ mod tests {
             }
         }
 
-        // Reaching here is the EXPECTED outcome for the AACS 2.0 (BEE) sample
-        // this test was written against: the unit is still bus-encrypted, so no
-        // unit key alone can open it. That makes "no key worked" an unusable
-        // assertion — which is exactly why this test used to end in an
-        // `eprintln!` and fall off the end, i.e. pass unconditionally. A no-op
-        // `decrypt_unit`, an `is_clean` stuck at `false`, or a parser that
-        // yielded zero keys would all have produced this same clean exit.
-        //
-        // What CAN be asserted regardless of the sample: the pipeline actually
-        // ran, and the decrypt primitive actually transformed the bytes.
+        // Reaching here is the EXPECTED outcome for this AACS 2.0 (BEE) sample.
+        // See docs/keydb-format.md for why "no key worked" alone would be an
+        // unusable assertion, and what is asserted instead.
         assert!(attempts > 0, "no unit key was tried at all");
         assert!(
             any_key_changed_the_unit,
@@ -2333,13 +2127,9 @@ mod tests {
         let path = real_keydb_path();
         let db = KeyDb::load(&path).unwrap();
 
-        // Find any BD entry that carries a VUK and unit keys, then exercise
-        // the lookup-by-hash + VUK-derivation chain against it.
-        // `expect`, not an early `return`: returning here asserted NOTHING while
-        // reporting success, so a parser regression that stopped populating
-        // `vid`/`vuk` — the very fields this test exists to exercise — would make
-        // the `find` miss and ship green. If the fixture genuinely has no such
-        // entry, that is a broken fixture and must be loud.
+        // Find any BD entry with a VUK and unit keys. `expect`, not an early
+        // `return`: a `return` here would ship green even if a parser
+        // regression stopped populating `vid`/`vuk` entirely.
         let entry = db
             .disc_entries
             .values()
