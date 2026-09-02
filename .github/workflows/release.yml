@@ -29,7 +29,7 @@ jobs:
 
   # Tests run as a PARALLEL TRIPWIRE: they fail the run if they fail, but the
   # release job does NOT `needs:` this job. The tag decision was already gated by
-  # the local precommit (same Rust 1.86, same commit).
+  # the local precommit (same MSRV, same commit).
   #
   # freemkv-keysources is a library — Cargo.lock isn't tracked, so --locked
   # would always fail (no lockfile to lock against on a fresh runner). Its
@@ -41,7 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - id: msrv
+        shell: bash
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
