@@ -1,16 +1,12 @@
 //! Where the `keydb.cfg` lives: local to the executable, local ONLY.
 //!
-//! Key-path policy belongs with the key sources (this crate), not the library:
-//! libfreemkv is handed a path and reads it. The CLI/app asks here for the
-//! list of locations to *search* (first existing wins) and for the single
-//! *default* location to write to (e.g. `update-keys`/save).
+//! Key-path policy belongs here (key sources), not in libfreemkv, which
+//! just reads a handed-in path. This module gives the *search* list (first
+//! existing wins) and the single *default* write location.
 //!
-//! freemkv is a portable, standalone binary: the `keydb.cfg` lives *next to*
-//! the executable — `<dir of current exe>/keydb.cfg` — and nowhere else. There
-//! is no OS-specific config-dir lookup (`%APPDATA%`, `%USERPROFILE%\.config`,
-//! `$XDG_CONFIG_HOME`, `$HOME/.config`). Drop the exe and its `keydb.cfg` in
-//! the same folder and it works. Callers needing a custom location pass
-//! `--keydb PATH`, which bypasses this module entirely.
+//! freemkv is portable: `keydb.cfg` lives next to the exe —
+//! `<dir of current exe>/keydb.cfg` — with no OS config-dir fallback.
+//! `--keydb PATH` bypasses this module. See docs/paths.md for rationale.
 
 use std::path::PathBuf;
 

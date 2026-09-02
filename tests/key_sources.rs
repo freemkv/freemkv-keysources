@@ -1,15 +1,12 @@
 //! Fixture-based integration tests for the published key sources.
 //!
 //! These exercise the *public* surface of `freemkv-keysources` end-to-end —
-//! real files on disk, the real `KeyDb` parser from libfreemkv, and
-//! the `KeySource` trait (`get_unit_keys` over a `ResolveCtx`) the applications drive.
-//!
-//! Covered:
-//! - `KeydbSource`: terminal unit-key lookup by disc hash through a real
-//!   `keydb.cfg`; the exe-local path helpers; MKB-aware host-cert serving.
-//! - `OnlineSource`: SSRF/scheme validation and the unconfigured no-op.
-//! - `MultiSource`: caller-supplied ordering / precedence, host-cert UNION,
-//!   and nesting.
+//! real files on disk, the real `KeyDb` parser from libfreemkv, and the
+//! `KeySource` trait (`get_unit_keys` over a `ResolveCtx`) the applications
+//! drive. Covered: `KeydbSource` terminal unit-key lookup by disc hash
+//! (plus exe-local path helpers and MKB-aware host-cert serving);
+//! `OnlineSource` SSRF/scheme validation and the unconfigured no-op; and
+//! `MultiSource` ordering/precedence, host-cert UNION, and nesting.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -372,12 +369,8 @@ fn multi_source_real_keydb_resolves_through_chain() {
 }
 
 // ── MultiSource: a source that could not ANSWER is not a source that said no ─
-//
-// `MultiSource` re-collapsed the Ok/Err distinction `OnlineSource` was
-// engineered to draw: `if let Ok(uks) = s.get_unit_keys(ctx)` discarded every
-// `Err`, so a composition whose sources ALL failed returned `Ok(Vec::new())` —
-// which the resolver reports as `E7022 No key source has a decryption key for
-// this disc`. That is the seven-hour-502 incident reproduced one layer up.
+// See docs/multi-source-failure-collapse.md — the Ok/Err collapse incident
+// this section's tests exist to catch.
 
 /// A source that always fails, with a chosen error — the key-service outage.
 struct FailingSource {
@@ -405,10 +398,8 @@ fn unauthorized() -> libfreemkv::Error {
     libfreemkv::Error::KeyServiceUnauthorized
 }
 
-/// THE regression, one layer up from `interpret_reply`: when no source holds a
-/// key AND a source could not answer, the composition must report the FAILURE,
-/// never a clean "no key". Catches the mutation that restores
-/// `if let Ok(uks) = ..` (which drops the `Err` and returns `Ok(empty)`).
+// See docs/multi-source-failure-collapse.md — must report FAILURE, not a
+// clean "no key", when no source holds a key and one could not answer.
 #[test]
 fn multi_source_reports_a_source_failure_instead_of_a_clean_no_key() {
     let multi = MultiSource::new(vec![

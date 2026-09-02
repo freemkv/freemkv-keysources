@@ -1,24 +1,11 @@
 //! Pluggable AACS key sources for libfreemkv.
 //!
-//! libfreemkv owns the AACS crypto; this crate provides the published
-//! [`KeySource`] implementations that look a disc up and drive the boil-down
-//! primitives down to terminal Unit Keys:
-//!
-//! - [`KeydbSource`] — a local `keydb.cfg` (source #1).
-//! - [`OnlineSource`] — a remote key service (source #2).
-//!
-//! Applications (autorip, the `freemkv` CLI) choose and order the sources from
-//! their own config — the local-vs-online policy is just which impls they plug
-//! in — then resolve and hand the resulting key to `Disc::decrypt_with`.
-//!
-//! Each source resolves a disc's terminal **Unit Keys** in one shot via
-//! [`KeySource::get_unit_keys`], driving libfreemkv's boil-down crypto primitives for
-//! whatever level of material it holds. Compose several with [`MultiSource`] in
-//! the caller's chosen order. Reading the encrypted content-sample units a key
-//! server validates on, and applying the resolved keys against a disc, is
-//! decryption *mechanism* — it lives in the library
-//! (`libfreemkv::resolve_and_apply`, `libfreemkv::read_encrypted_units`), not
-//! here.
+//! libfreemkv owns the AACS crypto; this crate provides [`KeySource`] impls
+//! that look a disc up and drive the boil-down primitives to terminal Unit
+//! Keys: [`KeydbSource`] (local `keydb.cfg`) and [`OnlineSource`] (remote key
+//! service). Applications choose and order sources, then resolve and hand
+//! the key to `Disc::decrypt_with`; compose several with [`MultiSource`].
+//! See docs/lib-scope.md for the mechanism-vs-policy split with libfreemkv.
 
 mod keydb;
 /// The `keydb.cfg` parser (`KeyDb`, `DiscEntry`, …). Public: parsing the keydb
@@ -39,10 +26,9 @@ pub use libfreemkv::aacs::types::UnitKey;
 pub use libfreemkv::keysource::ResolveCtx;
 pub use libfreemkv::{DiscInputs, KeySource};
 
-/// VUK → the disc's terminal Unit Keys (positional index), one AES-ECB-decrypt
-/// per encrypted title key. Composes the raw `aacs::derive::decrypt_unit_key`
-/// primitive directly — replaces the removed libfreemkv `aacs::boil::uk_from_vuk`
-/// wrapper (that veneer is gone; libfreemkv owns only the AES).
+// VUK -> the disc's terminal Unit Keys (positional index), one AES-ECB-decrypt
+// per encrypted title key, via `aacs::derive::decrypt_unit_key`. Replaces the
+// removed libfreemkv `aacs::boil::uk_from_vuk` wrapper.
 pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<UnitKey> {
     enc_title_keys
         .iter()
@@ -52,24 +38,14 @@ pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<U
 }
 
 /// An ordered composition of key sources, driven as one.
-/// [`MultiSource::get_unit_keys`] tries each inner source in order and returns
-/// the first non-empty Unit Key set (and [`MultiSource::get_fmts_indexes`] does
-/// the same for the forensic set). **The caller supplies the list AND the
-/// order** — local-first `[Keydb,
-/// Online]`, online-first `[Online, Keydb]`, etc. —
-/// so the "which sources, in what order" policy lives entirely with the
-/// application, not the library. `MultiSource` is itself a [`KeySource`], so it
-/// nests and composes.
 ///
-/// **A source that could not ANSWER is not a source that answered "no key".**
-/// When no inner source produces keys, the composition returns `Err` if any
-/// inner source failed, and `Ok(empty)` only when every source genuinely
-/// answered and none held a key. This mirrors libfreemkv's own resolver
-/// (`keysource::drive_unit_keys`, which tracks an `errored` flag, and
-/// `source_failure`, which stamps the first failure onto the disc) — a
-/// composition that swallowed the `Err` would hand the resolver a clean
-/// `Ok(empty)`, and an outage would once again be reported to the operator as
-/// `E7022 No key source has a decryption key for this disc`.
+/// [`MultiSource::get_unit_keys`] tries each inner source in order and
+/// returns the first non-empty Unit Key set (and
+/// [`MultiSource::get_fmts_indexes`] does the same for the forensic set). The
+/// caller supplies the list AND the order — local-first `[Keydb, Online]`,
+/// online-first `[Online, Keydb]`, etc. `MultiSource` is itself a
+/// [`KeySource`], so it nests and composes. See docs/lib-scope.md for the
+/// `Err`-vs-`Ok(empty)` failure contract.
 pub struct MultiSource {
     sources: Vec<Box<dyn KeySource>>,
 }
@@ -81,19 +57,9 @@ impl MultiSource {
     }
 }
 
-/// Drive `sources` in order and return the first non-empty result — preserving
-/// the Ok/Err distinction when nothing resolves.
-///
-/// A source failure never BLOCKS the chain (a later source is still tried, and a
-/// later success still wins outright, error or no error), but it is not
-/// forgotten either: with no keys anywhere, the FIRST failure is returned. First
-/// (not last) matches libfreemkv's `source_failure` rule, so the most-preferred
-/// source's reason is the one the operator is told about, in the same order the
-/// caller expressed a preference for successes.
-///
-/// `get` selects which trait method to drive, so the base and forensic paths
-/// share ONE implementation of this rule and cannot drift apart — the forensic
-/// half carried the identical bug.
+// Drive `sources` in order, returning the first non-empty result and
+// preserving Ok/Err when nothing resolves. `get` selects the trait method so
+// the base and forensic paths share one implementation. See docs/lib-scope.md.
 fn first_non_empty(
     sources: &[Box<dyn KeySource>],
     get: impl Fn(&dyn KeySource, &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error>,
@@ -121,19 +87,16 @@ fn first_non_empty(
 }
 
 impl KeySource for MultiSource {
-    /// Try each inner source in order; the FIRST to return a non-empty base Unit
-    /// Key set wins, even if an earlier source failed. All sources exhausted →
-    /// `Ok(empty)` if they all ANSWERED, or the first source failure if any could
-    /// not (see [`MultiSource`]).
+    // First inner source to return a non-empty base Unit Key set wins. All
+    // exhausted -> `Ok(empty)` if all answered, else the first failure (see
+    // [`MultiSource`]).
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         first_non_empty(&self.sources, |s, c| s.get_unit_keys(c), ctx)
     }
 
-    /// Forensic-index counterpart: try each inner source's `get_fmts_indexes` in
-    /// the same order and return the first non-empty set, under the same
-    /// failure-preserving rule. A source with no forensic material (the keydb,
-    /// via the trait default) contributes empty and is skipped; on today's discs
-    /// the online source answers.
+    // Forensic-index counterpart to `get_unit_keys`, same failure-preserving
+    // rule. A source with no forensic material (keydb, via the trait default)
+    // contributes empty and is skipped; today the online source answers.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
         first_non_empty(&self.sources, |s, c| s.get_fmts_indexes(c), ctx)
     }
