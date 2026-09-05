@@ -362,13 +362,30 @@ impl KeydbSource {
         // 1. Terminal Unit Keys stored in the entry — directly usable, no
         //    derivation. Preserve the keydb's CPS numbering (idx = num - 1).
         for (num, key) in &entry.unit_keys {
-            keys.push(UnitKey::new(num.saturating_sub(1), *key));
+            // A valid CPS unit number is >= 1; num 0 would collide with unit 1
+            // at idx 0 (num - 1), so skip it rather than mis-map two units.
+            if *num == 0 {
+                continue;
+            }
+            keys.push(UnitKey::new(num - 1, *key));
         }
 
         // The disc's encrypted title keys (from Unit_Key_RO.inf). Empty when
         // the scan captured none, in which case only the stored list (1)
         // contributes.
-        let enc_title_keys = ctx.enc_title_keys().unwrap_or(&[]);
+        let enc_title_keys = match ctx.enc_title_keys() {
+            Ok(k) => k,
+            Err(e) => {
+                // Mirror online.rs: surface the read failure, then fall back to
+                // empty (only the stored unit-key list can contribute).
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    error = %e,
+                    "keydb: disc encrypted title keys unreadable; deriving without them"
+                );
+                &[]
+            }
+        };
         if !enc_title_keys.is_empty() {
             // VUK path, else MK path (stored/PK/DK) → VUK. See
             // docs/keydb.md#unit-keys-vuk-or-mk for the VID rules.
@@ -376,7 +393,19 @@ impl KeydbSource {
                 uks_from_vuk(&vuk, enc_title_keys)
             } else {
                 let vid = ctx.vid().or_else(|| entry.vid.map(Vid));
-                let mkb = ctx.mkb().unwrap_or(&[]);
+                let mkb = match ctx.mkb() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // Mirror online.rs: log the failure, then fall back to
+                        // empty (PK/DK derivation may then find no Media Key).
+                        tracing::warn!(
+                            target: "freemkv::keysource",
+                            error = %e,
+                            "keydb: disc MKB unreadable; media-key derivation may fail"
+                        );
+                        &[]
+                    }
+                };
                 let mk: Option<MediaKey> = entry
                     .media_key
                     .map(MediaKey)
@@ -670,6 +699,22 @@ mod tests {
             vec![(1u32, [0xA0u8; 16]), (2u32, [0xB1u8; 16])],
             "terminal keydb unit keys must commit byte-identically to the stored (cps, key) pairs"
         );
+    }
+
+    // A CPS unit number of 0 is invalid (valid numbering is >= 1); it must be
+    // skipped, not mapped to idx 0 where `num - 1` would collide with unit 1.
+    #[test]
+    fn stored_unit_key_with_cps_number_zero_is_skipped() {
+        let mut e = blank_entry(HASH);
+        e.unit_keys = vec![(0, [0xEEu8; 16]), (1, [0xA0u8; 16])];
+        let db = db_with(e, Vec::new());
+        let got = KeydbSource::unit_keys_from(&db, &ctx(HASH, Vec::new(), None));
+        let keys: Vec<[u8; 16]> = got.iter().map(|u| u.key).collect();
+        assert!(
+            !keys.contains(&[0xEEu8; 16]),
+            "a unit-0 key must be dropped, never mapped onto idx 0"
+        );
+        assert_eq!(committed(&got), vec![(1u32, [0xA0u8; 16])]);
     }
 
     // Orphan-unit completeness (the real keydb bug): a PARTIAL stored list
