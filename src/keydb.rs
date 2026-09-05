@@ -443,6 +443,20 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
         ))
     };
     let write_result = (|| -> std::io::Result<()> {
+        // The temp file is renamed onto keydb.cfg, which holds AACS key
+        // material and the host private key/cert — create it 0600 on Unix so
+        // umask can't leave the keys world-readable. Non-unix keeps create().
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
