@@ -174,20 +174,36 @@ impl KeydbSource {
         let file = std::fs::File::open(&self.path)?;
         let stamp = FileStamp::of(&file.metadata()?);
         let stamped_at = std::time::SystemTime::now();
+        // Fast path: a settled cache hit under a brief lock (stamp compare +
+        // Arc clone). Re-emit the rejection summary on EVERY hit — a hit skips
+        // `KeyDb::parse`, else a corrupt keydb warns once then serves silently.
+        {
+            let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_ref()
+                && entry.stamp == stamp
+                && entry.is_settled(self.mtime_granularity)
+            {
+                self.emit_parse_stats(&entry.stats);
+                return Ok(entry.db.clone());
+            }
+        }
+        // Miss: parse the ~62 MiB file OUTSIDE the lock so a reparse can't stall
+        // every other worker. Stamp (fstat) and bytes still come from the ONE
+        // open handle, preserving the one-open-one-identity invariant.
+        let (db, stats) = KeyDb::load_counted(file, &self.path)?;
+        let db = Arc::new(db);
+        // Re-acquire and double-check: a peer may have installed the same
+        // settled stamp while we parsed — adopt theirs and drop our redundant
+        // parse rather than racing a lost update.
         let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.as_ref()
             && entry.stamp == stamp
             && entry.is_settled(self.mtime_granularity)
         {
-            // Re-emit the rejection summary on EVERY hit, not just the parse
-            // that produced it (a hit skips `KeyDb::parse`) — otherwise a
-            // corrupt keydb warns once, then serves silently. See docs/keydb.md#cached-db-reemit.
             self.emit_parse_stats(&entry.stats);
             return Ok(entry.db.clone());
         }
-        let (db, stats) = KeyDb::load_counted(file, &self.path)?;
         self.emit_parse_stats(&stats);
-        let db = Arc::new(db);
         self.parses.fetch_add(1, Ordering::Relaxed);
         *guard = Some(CacheEntry {
             stamp,
