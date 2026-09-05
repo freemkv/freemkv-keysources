@@ -153,8 +153,21 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     // resolver timeout and freeze the calling rip thread, so run it on a
     // spawned thread with a bounded deadline (mirrors autorip/libfreemkv).
     let addrs: Vec<SocketAddr> = {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
         const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+        // Each resolver thread can hang for the OS timeout and is never joined,
+        // so a black-holed keyserver leaks one thread+stack per attempt. Cap the
+        // outstanding ones; over the cap, report the host unreachable instead.
+        const MAX_DNS_THREADS: usize = 4;
+        static DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
+        if DNS_THREADS.fetch_add(1, Ordering::SeqCst) >= MAX_DNS_THREADS {
+            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
+            return Err((
+                GuardFail::Unreachable,
+                "too many concurrent DNS resolutions in flight".into(),
+            ));
+        }
         let host = host.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -163,6 +176,9 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
                 .map(|it| it.collect::<Vec<SocketAddr>>());
             // Receiver may be gone after the timeout — ignore the send error.
             let _ = tx.send(res);
+            // Decrement only when the (possibly long-hung) lookup actually
+            // returns, so the cap reflects threads truly in flight.
+            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
         });
         match rx.recv_timeout(DNS_TIMEOUT) {
             Ok(Ok(addrs)) => addrs,
