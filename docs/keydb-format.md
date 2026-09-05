@@ -10,10 +10,12 @@ revision of this comment cited a `candidates_from` function — no such
 function has ever existed in this crate; the real consumer is
 `KeydbSource::unit_keys_from` (keydb.rs), which reads `unit_keys`, `vuk`,
 `media_key` AND `vid` (`vid` is load-bearing for the MK+VID derivation the
-kat_c / kat_d KATs pin — it is NOT unused). The genuinely unused items —
-`empty`, `find_vuk`, `DiscEntry::title` — are part of the faithful copy and
-are retained rather than pruned; allow dead_code so the byte-for-byte copy
-compiles clean without diverging from the libfreemkv original.
+kat_c / kat_d KATs pin — it is NOT unused). `DiscEntry::title` is likewise
+read — by `to_keydb_cfg` and the redacting `Debug` impl — so it is not
+unused either. The genuinely unused items — `empty` and `find_vuk` — are
+part of the faithful copy and are retained rather than pruned; allow
+dead_code so the byte-for-byte copy compiles clean without diverging from
+the libfreemkv original.
 
 ## ParseStats — what `KeyDb::parse` threw away
 

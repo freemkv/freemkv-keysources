@@ -21,9 +21,9 @@ use libfreemkv::{Error, KeySource};
 
 use crate::keydb_format::KeyDb;
 
-// Upper bound on decompressed keydb size: caps a decompression bomb (a tiny
-// zip/gz could otherwise inflate to GiB and OOM the daily refresh thread).
-// The public UHD keydb is ~62 MiB and growing; 128 MiB leaves headroom.
+// Upper bound on decompressed keydb size (decompression-bomb cap): a tiny
+// zip/gz could otherwise inflate to GiB and OOM the refresh thread. Mirrors
+// keydb_format::MAX_KEYDB_BYTES (the on-disk load cap); keep the two equal.
 const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Result of a KEYDB save/update -- path written, entry count, and byte size.

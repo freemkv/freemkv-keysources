@@ -1049,8 +1049,16 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].idx, 0);
         assert_eq!(keys[1].idx, 1);
-        assert_eq!(keys[0].key[0], 0x00);
-        assert_eq!(keys[1].key[0], 0x0f);
+        // Full 16 bytes of each key, not just byte 0 — a byte-transposition bug
+        // would pass a first-byte-only check.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(
+            keys[1].key,
+            [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+        );
     }
 
     /// Backward-compatible form: `"UK"` as a bare hex STRING (not an array)
@@ -1065,7 +1073,11 @@ mod tests {
         .expect("a string UK must still resolve");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].idx, 0);
-        assert_eq!(keys[0].key[0], 0x00);
+        // Full 16-byte key, not just byte 0.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
     }
 
     // A malformed `"UK"` STRING falls through to the genuine-miss path,
@@ -1117,6 +1129,12 @@ mod tests {
         );
         assert_eq!(keys[0].idx, 0);
         assert_eq!(keys[1].idx, 1);
+        // Full-byte KAT: the derived keys must equal the local VUK boil over
+        // the disc's encrypted title keys (the same primitive the code calls).
+        let vuk = parse_uk(vuk_hex).unwrap();
+        let expected = crate::uks_from_vuk(&vuk, &[[0x11u8; 16], [0x22u8; 16]]);
+        assert_eq!(keys[0].key, expected[0].key);
+        assert_eq!(keys[1].key, expected[1].key);
     }
 
     /// The service answered correctly with a VUK, but the DISC's encrypted
@@ -1289,6 +1307,12 @@ mod tests {
         let keys = interpret_reply(Ok(reply(200, &at_cap)), &BareCtx, 1)
             .expect("a reply exactly at the cap is legal and must be read");
         assert_eq!(keys.len(), 1, "the key in an at-cap reply must survive");
+        // The surviving key must be the planted UK bytes, not merely present.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the at-cap key must be the exact planted UK"
+        );
     }
 
     // ── A bad port is CONFIG, not an outage ────────────────────────────────
