@@ -17,9 +17,9 @@ use libfreemkv::aacs::types::{DeviceKey, HostCert};
 /// A keydb per-disc unit key: the CPS-unit number paired with its 16-byte key.
 pub type NumberedUnitKey = (u32, [u8; 16]);
 
-// Upper bound on the on-disk keydb.cfg size accepted by `KeyDb::load`. The
-// public UHD keydb is ~62 MiB and growing; 128 MiB bounds worst-case
-// allocation from a hostile or corrupt file.
+// Upper bound on the on-disk keydb.cfg size accepted by `KeyDb::load` (the
+// public UHD keydb is ~62 MiB; 128 MiB bounds a hostile/corrupt file).
+// Mirror of keydb.rs's MAX_KEYDB_BYTES decompression cap; keep them equal.
 const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Upper bound on parsed disc entries. The real public keydb carries
@@ -1017,18 +1017,23 @@ mod tests {
 
     #[test]
     fn test_parse_disc_entry() {
-        // All-zero placeholders — synthetic; no real key material in code.
+        // Synthetic placeholders, DISTINCT per field so a field mix-up (M read
+        // as V, I as U, …) is caught — no real key material in code.
         let z40 = "00".repeat(20);
-        let z32 = "00".repeat(16);
+        let mk = "11".repeat(16);
+        let id = "22".repeat(16);
+        let vuk = "33".repeat(16);
+        let uk = "44".repeat(16);
         let line = format!(
-            "0x{z40} = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x{z32} | I | 0x{z32} | V | 0x{z32} | U | 1-0x{z32} ; MKBv77"
+            "0x{z40} = SAMPLE_FILM (Sample Film) | D | 2024-01-01 | M | 0x{mk} | I | 0x{id} | V | 0x{vuk} | U | 1-0x{uk} ; MKBv77"
         );
         let entry = KeyDb::parse_disc_entry(&line).unwrap();
         assert_eq!(entry.title, "SAMPLE_FILM (Sample Film)"); // faithful, verbatim
-        assert!(entry.media_key.is_some());
-        assert!(entry.vuk.is_some());
-        assert_eq!(entry.unit_keys.len(), 1);
-        assert_eq!(entry.unit_keys[0].0, 1);
+        assert_eq!(entry.media_key, Some([0x11u8; 16]), "M field");
+        assert_eq!(entry.vid, Some([0x22u8; 16]), "I field");
+        assert_eq!(entry.vuk, Some([0x33u8; 16]), "V field");
+        assert_eq!(entry.unit_keys, vec![(1u32, [0x44u8; 16])], "U field");
+        assert_eq!(entry.mkb_version, Some(77));
     }
 
     #[test]
