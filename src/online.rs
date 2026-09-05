@@ -56,13 +56,24 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || v4.octets()[0] >= 240
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // 6to4 (2002::/16) embeds an IPv4 in segments[1..3]; Teredo
+            // (2001:0000::/32) embeds the client IPv4 in the last two segments,
+            // each XOR 0xffff. Both must be re-checked as their embedded IPv4.
+            let sixtofour = (seg[0] == 0x2002)
+                .then(|| std::net::Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32)));
+            let teredo = (seg[0] == 0x2001 && seg[1] == 0x0000).then(|| {
+                std::net::Ipv4Addr::from(
+                    (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
+                )
+            });
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 // Unique-local fc00::/7.
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xfe00) == 0xfc00
                 // Link-local fe80::/10.
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfe80
                 // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x,
                 // deprecated by RFC 4291 §2.5.5.1) — to_ipv4() returns Some for
                 // both forms; re-check the embedded address as IPv4.
@@ -70,6 +81,8 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                     .to_ipv4()
                     .map(|m| is_blocked_ip(&IpAddr::V4(m)))
                     == Some(true)
+                || sixtofour.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+                || teredo.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -140,8 +153,21 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     // resolver timeout and freeze the calling rip thread, so run it on a
     // spawned thread with a bounded deadline (mirrors autorip/libfreemkv).
     let addrs: Vec<SocketAddr> = {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
         const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+        // Each resolver thread can hang for the OS timeout and is never joined,
+        // so a black-holed keyserver leaks one thread+stack per attempt. Cap the
+        // outstanding ones; over the cap, report the host unreachable instead.
+        const MAX_DNS_THREADS: usize = 4;
+        static DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
+        if DNS_THREADS.fetch_add(1, Ordering::SeqCst) >= MAX_DNS_THREADS {
+            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
+            return Err((
+                GuardFail::Unreachable,
+                "too many concurrent DNS resolutions in flight".into(),
+            ));
+        }
         let host = host.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -150,6 +176,9 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
                 .map(|it| it.collect::<Vec<SocketAddr>>());
             // Receiver may be gone after the timeout — ignore the send error.
             let _ = tx.send(res);
+            // Decrement only when the (possibly long-hung) lookup actually
+            // returns, so the cap reflects threads truly in flight.
+            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
         });
         match rx.recv_timeout(DNS_TIMEOUT) {
             Ok(Ok(addrs)) => addrs,
@@ -648,6 +677,30 @@ mod tests {
         ))));
     }
 
+    // 6to4 (2002::/16) and Teredo (2001:0000::/32) tunnel an IPv4 inside an
+    // IPv6 address; the guard must decode and re-check that embedded IPv4 or an
+    // internal target slips through the tunnel.
+    #[test]
+    fn ssrf_guard_blocks_embedded_ipv4_via_6to4_and_teredo() {
+        // 6to4 for 127.0.0.1: 2002:7f00:0001:: (embedded in segments[1..3]).
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0
+        ))));
+        // 6to4 for 169.254.169.254 (cloud metadata): 2002:a9fe:a9fe::.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
+        ))));
+        // Teredo for 127.0.0.1: client IPv4 lives in the last two segments XOR
+        // 0xffff, so 0x7f00^0xffff=0x80ff and 0x0001^0xffff=0xfffe.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0000, 0, 0, 0, 0, 0x80ff, 0xfffe
+        ))));
+        // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
+        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
+        ))));
+    }
+
     #[test]
     fn ssrf_guard_allows_public_ips() {
         assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
@@ -996,8 +1049,16 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].idx, 0);
         assert_eq!(keys[1].idx, 1);
-        assert_eq!(keys[0].key[0], 0x00);
-        assert_eq!(keys[1].key[0], 0x0f);
+        // Full 16 bytes of each key, not just byte 0 — a byte-transposition bug
+        // would pass a first-byte-only check.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(
+            keys[1].key,
+            [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+        );
     }
 
     /// Backward-compatible form: `"UK"` as a bare hex STRING (not an array)
@@ -1012,7 +1073,11 @@ mod tests {
         .expect("a string UK must still resolve");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].idx, 0);
-        assert_eq!(keys[0].key[0], 0x00);
+        // Full 16-byte key, not just byte 0.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
     }
 
     // A malformed `"UK"` STRING falls through to the genuine-miss path,
@@ -1064,6 +1129,12 @@ mod tests {
         );
         assert_eq!(keys[0].idx, 0);
         assert_eq!(keys[1].idx, 1);
+        // Full-byte KAT: the derived keys must equal the local VUK boil over
+        // the disc's encrypted title keys (the same primitive the code calls).
+        let vuk = parse_uk(vuk_hex).unwrap();
+        let expected = crate::uks_from_vuk(&vuk, &[[0x11u8; 16], [0x22u8; 16]]);
+        assert_eq!(keys[0].key, expected[0].key);
+        assert_eq!(keys[1].key, expected[1].key);
     }
 
     /// The service answered correctly with a VUK, but the DISC's encrypted
@@ -1236,6 +1307,12 @@ mod tests {
         let keys = interpret_reply(Ok(reply(200, &at_cap)), &BareCtx, 1)
             .expect("a reply exactly at the cap is legal and must be read");
         assert_eq!(keys.len(), 1, "the key in an at-cap reply must survive");
+        // The surviving key must be the planted UK bytes, not merely present.
+        assert_eq!(
+            keys[0].key,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            "the at-cap key must be the exact planted UK"
+        );
     }
 
     // ── A bad port is CONFIG, not an outage ────────────────────────────────
