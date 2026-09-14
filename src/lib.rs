@@ -17,7 +17,10 @@ mod paths;
 
 pub use keydb::{KeydbSource, UpdateResult};
 pub use keydb_format::{DiscEntry, KeyDb};
-pub use online::{MIN_SAMPLE_UNITS, OnlineSource, validate_keyserver_url};
+pub use online::{
+    DecodeReachability, MIN_SAMPLE_UNITS, OnlineSource, take_last_decode_reachability,
+    validate_keyserver_url,
+};
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 
 // Re-exported for downstream convenience so apps need only depend on this crate

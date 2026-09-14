@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.2] — UNRELEASED
+
+### Added
+
+- `OnlineSource` now records the reachability outcome of its actual `/decode` POST (an HTTP `Status(code)` for any answer, including 200/404/422/429/5xx, or `Transport` for a connect/timeout/DNS/TLS failure) in a per-thread slot, readable via the new `take_last_decode_reachability()` / `DecodeReachability`. This lets a caller (autorip) classify a no-key result from the REAL decode's outcome instead of firing a second, redundant probe against the POST-only endpoint. No behavioural change to key resolution itself.
+
 ## [1.7.1] — UNRELEASED
 
 ### Changed
