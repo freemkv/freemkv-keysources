@@ -315,6 +315,10 @@ impl OnlineSource {
     // a terminal `UK` or a `VUK` derived locally. `Ok`/`Err` draw the
     // miss-vs-outage distinction — see docs/online-query-contract.md.
     fn query(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+        // Reset the per-thread decode-reachability slot so it reflects ONLY this
+        // query afterwards: `Some(..)` once a POST answers/transport-fails, `None`
+        // if we short-circuit before the network. See `take_last_decode_reachability`.
+        clear_decode_reachability();
         // No configured service: nothing to resolve.
         if self.base_url.is_empty() {
             return Ok(Vec::new());
@@ -392,6 +396,10 @@ impl OnlineSource {
             // Did-not-RESOLVE is the service unreachable, not a bad URL — see
             // docs/online-guardfail.md.
             Err((GuardFail::Unreachable, _)) => {
+                // The host did not resolve — the service never answered, so this
+                // is a transport-class outcome for the decode-reachability slot
+                // (transient/down), the same verdict a refused connection gets.
+                record_decode_reachability(DecodeReachability::Transport);
                 tracing::warn!(
                     target: "freemkv::keysource",
                     phase = "keyserver_post",
@@ -429,6 +437,48 @@ impl OnlineSource {
     }
 }
 
+/// The reachability outcome of a single online `/decode` POST — the raw signal
+/// a caller needs to tell a *genuine no-key* (the service answered, e.g. a 200
+/// with no entry or a definitive 422/404) from a *transient outage* (it did not
+/// — transport failure or a 5xx) WITHOUT firing a second probe. Recorded per
+/// thread by [`OnlineSource`] on every decode attempt; read (and cleared) with
+/// [`take_last_decode_reachability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeReachability {
+    /// The service answered with this HTTP status — any 2xx/3xx/4xx/5xx,
+    /// including a 200 no-key, a 404/422 ("licensed but unresolved"), a 429, or
+    /// a 502. The caller maps the code to a verdict.
+    Status(u16),
+    /// No HTTP answer at all — connection refused, timeout, DNS/TLS failure, so
+    /// the request was sent (or attempted) but nothing on the other end replied.
+    Transport,
+}
+
+thread_local! {
+    // The reachability of the most recent decode POST on THIS thread. A
+    // thread-local (not a struct field) because resolution runs synchronously on
+    // the caller's thread while `OnlineSource` is boxed behind `dyn KeySource`.
+    static LAST_DECODE_REACHABILITY: std::cell::Cell<Option<DecodeReachability>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn clear_decode_reachability() {
+    LAST_DECODE_REACHABILITY.with(|c| c.set(None));
+}
+
+fn record_decode_reachability(outcome: DecodeReachability) {
+    LAST_DECODE_REACHABILITY.with(|c| c.set(Some(outcome)));
+}
+
+/// Take — read and clear — the reachability outcome of the most recent online
+/// `/decode` POST made ON THIS THREAD, or `None` if no decode reached the
+/// network since the last take (the online source was not attempted, or a
+/// short-circuit path that never POSTed). Lets a caller classify a no-key result
+/// from the REAL decode's HTTP outcome instead of a second, redundant probe.
+pub fn take_last_decode_reachability() -> Option<DecodeReachability> {
+    LAST_DECODE_REACHABILITY.with(std::cell::Cell::take)
+}
+
 // Map a key-service HTTP status into the operator action it implies: 401/403
 // fix credentials, 429 back off, 5xx wait — none of them is "no key" (the
 // genuine miss is a 200 with an empty body), the original bug this fixes.
@@ -449,8 +499,21 @@ fn interpret_reply(
     elapsed_ms: u64,
 ) -> Result<Vec<UnitKey>, Error> {
     let mut resp = match sent {
-        Ok(r) => r,
+        Ok(r) => {
+            // The service answered — record its status for the reachability slot
+            // (a 200/404/422 is "up"; a 5xx is "down"), read by the caller so a
+            // no-key needs no second probe.
+            record_decode_reachability(DecodeReachability::Status(r.status().as_u16()));
+            r
+        }
         Err(e) => {
+            // A 4xx/5xx is still an ANSWER (record its status); a transport
+            // error is not (record `Transport`). Kept separate from the
+            // error-mapping below, which is unchanged.
+            record_decode_reachability(match &e {
+                ureq::Error::StatusCode(code) => DecodeReachability::Status(*code),
+                _ => DecodeReachability::Transport,
+            });
             // 401/403/429/5xx demand different operator actions; collapsing
             // them is why a 502 was read as "no key". Each arm RETURNS the
             // classified error, never an empty vec, so it survives past here.
@@ -1002,6 +1065,65 @@ mod tests {
                 .expect_err("an unreachable service must not look like an answer")
                 .code(),
             libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        );
+    }
+
+    // The decode POST records its reachability so the caller can classify a
+    // no-key from the REAL answer instead of firing a second empty probe: an
+    // HTTP answer (200/404/422) → `Status(code)`, a transport failure →
+    // `Transport`. This is the signal that removes autorip's redundant probe.
+    #[test]
+    fn interpret_reply_records_the_decode_reachability() {
+        // A 200 with no entry — the service answered; record its status.
+        let _ = interpret_reply(Ok(reply(200, "{}")), &BareCtx, 1);
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(200)),
+            "a 200 answer must record Status(200)"
+        );
+        // take clears the slot — a second take sees nothing.
+        assert_eq!(
+            take_last_decode_reachability(),
+            None,
+            "take must clear the slot"
+        );
+
+        // A definitive 422 ("licensed but unresolved") / 404 is still an ANSWER:
+        // record the status so the caller reads it as reachable (genuine no-key).
+        for status in [404u16, 422] {
+            let _ = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1);
+            assert_eq!(
+                take_last_decode_reachability(),
+                Some(DecodeReachability::Status(status)),
+                "HTTP {status} must record Status({status}) — a reachable answer"
+            );
+        }
+
+        // A 5xx is an answer too — Status(502); the caller maps 5xx to down.
+        let _ = interpret_reply(Err(ureq::Error::StatusCode(502)), &BareCtx, 1);
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(502)),
+            "a 5xx must record its status, not Transport"
+        );
+
+        // A transport failure (refused connection) records `Transport` — no
+        // HTTP answer, so the caller treats it as a transient outage.
+        let config = Config::builder()
+            .timeout_connect(Some(Duration::from_secs(2)))
+            .build();
+        let sent = ureq::Agent::new_with_config(config)
+            .post("http://127.0.0.1:1/")
+            .send("{}");
+        assert!(
+            !matches!(sent, Ok(_) | Err(ureq::Error::StatusCode(_))),
+            "a refused connection must be a transport error"
+        );
+        let _ = interpret_reply(sent, &BareCtx, 1);
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Transport),
+            "a transport failure must record Transport, never a Status"
         );
     }
 
