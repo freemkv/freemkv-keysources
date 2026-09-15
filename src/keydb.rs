@@ -20,11 +20,11 @@ use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
 
 use crate::keydb_format::KeyDb;
-
 // Upper bound on decompressed keydb size (decompression-bomb cap): a tiny
-// zip/gz could otherwise inflate to GiB and OOM the refresh thread. Mirrors
-// keydb_format::MAX_KEYDB_BYTES (the on-disk load cap); keep the two equal.
-const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
+// zip/gz could otherwise inflate to GiB and OOM the refresh thread. The SAME
+// constant `KeyDb::load` uses as the on-disk load cap — defined once in
+// keydb_format so the two can never drift apart.
+use crate::keydb_format::MAX_KEYDB_BYTES;
 
 /// Result of a KEYDB save/update -- path written, entry count, and byte size.
 #[derive(Debug)]
@@ -96,10 +96,27 @@ impl CacheEntry {
     // Proof, cost, and the clock caveat are in docs/keydb.md#settle-proof;
     // don't weaken this without re-reading them.
     fn is_settled(&self, granularity: std::time::Duration) -> bool {
-        self.stamp
+        match self
+            .stamp
             .modified
             .and_then(|m| self.stamped_at.duration_since(m).ok())
-            .is_some_and(|age| age >= granularity)
+        {
+            // The normal case: a real mtime that was already `granularity` in
+            // the past when we stamped it, so any later write bumps the mtime
+            // past our stamp and is detected. Trust it.
+            Some(age) => age >= granularity,
+            // No mtime at all (an mtime-less filesystem) OR an mtime in the
+            // FUTURE relative to stamped_at (clock skew) — `duration_since`
+            // yielded None either way. The mtime is useless as a change
+            // discriminator, so fall back to the inode identity (dev+ino, which
+            // an atomic rename always changes) and treat the entry as settled
+            // only once THIS observation has itself aged past the granularity.
+            // Without this, such a file's cache entry was NEVER settled, forcing
+            // a full ~62 MiB re-parse on every get_unit_keys/host_certs call.
+            None => std::time::SystemTime::now()
+                .duration_since(self.stamped_at)
+                .is_ok_and(|age| age >= granularity),
+        }
     }
 }
 
@@ -278,16 +295,12 @@ impl KeydbSource {
 
         let entries = text
             .lines()
-            .filter(|l| {
-                let t = l.trim();
-                // Mirror KeyDb::parse's disc-entry rule EXACTLY by CALLING it,
-                // so save() never persists content that parses to zero usable
-                // entries. See docs/keydb.md#save-mirror-parse.
-                crate::keydb_format::is_disc_entry_line(t)
-                    || t.starts_with("| DK")
-                    || t.starts_with("| PK")
-                    || t.starts_with("| HC")
-            })
+            // Mirror KeyDb::parse's ACCEPTANCE rule EXACTLY by running the same
+            // parsers (not just a `| DK`/`| PK`/`| HC` prefix check): a row with
+            // the right prefix but malformed hex / a short cert parses to
+            // nothing, so counting it by prefix let unparseable content slip
+            // past the `entries > 0` guard. See docs/keydb.md#save-mirror-parse.
+            .filter(|l| crate::keydb_format::is_parseable_entry_line(l))
             .count();
 
         if entries == 0 {
@@ -995,6 +1008,54 @@ mod tests {
         assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
     }
 
+    // A cache entry whose stamp has NO mtime (mtime-less filesystem) or a mtime
+    // in the FUTURE (clock skew) must not be stuck un-settled forever — that
+    // forced a full ~62 MiB re-parse on every lookup. It now settles via the
+    // inode-identity fallback once the observation has aged past the granularity.
+    #[test]
+    fn is_settled_falls_back_when_mtime_is_absent_or_in_the_future() {
+        use std::time::{Duration, SystemTime};
+        let entry = |modified: Option<SystemTime>, stamped_at: SystemTime| CacheEntry {
+            stamp: FileStamp {
+                dev: 1,
+                ino: 2,
+                len: 3,
+                modified,
+            },
+            stamped_at,
+            db: Arc::new(KeyDb::empty()),
+            stats: crate::keydb_format::ParseStats::default(),
+        };
+        let gran = Duration::from_secs(2);
+        let now = SystemTime::now();
+
+        // None mtime, stamped well in the past → settled via the fallback.
+        assert!(
+            entry(None, now - Duration::from_secs(3600)).is_settled(gran),
+            "a mtime-less entry must settle once it has aged past the granularity"
+        );
+        // None mtime, just stamped → still inside the settle window, NOT settled.
+        assert!(
+            !entry(None, now).is_settled(gran),
+            "a freshly stamped mtime-less entry is too young to trust yet"
+        );
+        // A FUTURE mtime (clock skew) with an old stamp → still settles via the
+        // fallback rather than being wedged un-settled forever.
+        assert!(
+            entry(
+                Some(now + Duration::from_secs(3600)),
+                now - Duration::from_secs(3600)
+            )
+            .is_settled(gran),
+            "a future mtime must not wedge the entry un-settled forever"
+        );
+        // Sanity: a real past mtime still settles the normal way.
+        assert!(
+            entry(Some(now - Duration::from_secs(3600)), now).is_settled(gran),
+            "a normal past mtime still settles"
+        );
+    }
+
     /// No keydb → no host credentials, not an error (inherent and trait forms).
     #[test]
     fn host_certs_empty_when_keydb_missing() {
@@ -1429,6 +1490,42 @@ mod tests {
         let src = KeydbSource::new(dir.join("k.cfg"));
         let garbage = b"this is not a keydb\njust random text\n";
         assert!(matches!(src.save(garbage), Err(Error::KeydbInvalid)));
+    }
+
+    /// DK/PK/HC rows with the RIGHT prefix but MALFORMED content (bad hex, a
+    /// short cert) parse to nothing, so `save` must count zero real entries and
+    /// reject — a prefix-only count let unparseable content persist past the
+    /// `entries > 0` guard.
+    #[test]
+    fn save_rejects_prefixed_but_unparseable_dk_pk_hc_rows() {
+        let dir = scratch("save-prefixed-junk");
+        let src = KeydbSource::new(dir.join("k.cfg"));
+        // Each line has a valid keydb PREFIX but content no parser accepts:
+        //  - PK: not 16 bytes of hex
+        //  - DK: DEVICE_KEY not valid hex
+        //  - HC: cert far shorter than the 92-byte minimum
+        let junk = b"| PK | 0xnothex\n\
+                     | DK | DEVICE_KEY 0xZZ | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17\n\
+                     | HC | HOST_PRIV_KEY 0x00 | HOST_CERT 0x0011\n";
+        assert!(
+            matches!(src.save(junk), Err(Error::KeydbInvalid)),
+            "prefixed-but-unparseable rows must not count as entries"
+        );
+
+        // Contrast: the SAME shapes, but well-formed, ARE counted and saved.
+        let good = format!(
+            "| PK | 0x{}\n| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "11".repeat(16),
+            "00".repeat(20),
+            "00".repeat(92),
+        );
+        let ok = src
+            .save(good.as_bytes())
+            .expect("well-formed rows must save");
+        assert_eq!(
+            ok.entries, 2,
+            "one PK + one HC row are the two real entries"
+        );
     }
 
     // A keydb.cfg over the size cap or not valid UTF-8 must surface as a

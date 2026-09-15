@@ -1276,3 +1276,7 @@ version = "1.7.1"
 [[patch.unused]]
 name = "freemkv-i18n"
 version = "1.7.1"
+
+[[patch.unused]]
+name = "freemkv-unlock"
+version = "1.7.1"

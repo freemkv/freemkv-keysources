@@ -17,10 +17,12 @@ use libfreemkv::aacs::types::{DeviceKey, HostCert};
 /// A keydb per-disc unit key: the CPS-unit number paired with its 16-byte key.
 pub type NumberedUnitKey = (u32, [u8; 16]);
 
-// Upper bound on the on-disk keydb.cfg size accepted by `KeyDb::load` (the
-// public UHD keydb is ~62 MiB; 128 MiB bounds a hostile/corrupt file).
-// Mirror of keydb.rs's MAX_KEYDB_BYTES decompression cap; keep them equal.
-const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
+/// Upper bound on the keydb.cfg byte size (the public UHD keydb is ~62 MiB;
+/// 128 MiB bounds a hostile/corrupt file). The SINGLE definition for the crate:
+/// [`KeyDb::load`] uses it as the on-disk load cap and [`crate::KeydbSource`]
+/// re-uses it as the decompression-bomb cap on the save/update path, so the two
+/// can never drift out of lockstep.
+pub(crate) const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Upper bound on parsed disc entries. The real public keydb carries
 /// ~170k+ entries, so the cap sits well above that while still bounding
@@ -238,6 +240,35 @@ impl ParseStats {
 // `KeydbSource::save`, whose entry count must match what this parser accepts.
 pub(crate) fn is_disc_entry_line(line: &str) -> bool {
     (line.starts_with("0x") || line.starts_with("0X")) && line.contains(" = ")
+}
+
+/// True when `line` is a row `KeyDb::parse` would actually ACCEPT into the db —
+/// a disc row OR a DK/PK/HC/HC2 row that its real parser accepts, not merely one
+/// carrying the right `| XX` prefix. `KeydbSource::save`'s "won't persist
+/// unparseable content" guard counts entries with THIS, so a syntactically
+/// prefixed but malformed DK/PK/HC row (right prefix, bad hex/short cert) can no
+/// longer inflate the entry count past the `entries > 0` check. Mirrors the
+/// dispatch in [`KeyDb::parse_counted`] exactly. See docs/keydb.md#save-mirror-parse.
+pub(crate) fn is_parseable_entry_line(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+        return false;
+    }
+    // Order matches `parse_counted`: HC2 before HC (both share the `| HC`
+    // prefix); an orphan DK (no position fields) still counts as a DK.
+    if line.starts_with("| DK") {
+        return KeyDb::parse_device_key(line).is_some() || KeyDb::parse_orphan_dk(line).is_some();
+    }
+    if line.starts_with("| PK") {
+        return KeyDb::parse_processing_key(line).is_some();
+    }
+    if line.starts_with("| HC2") {
+        return KeyDb::parse_host_cert_v2(line).is_some();
+    }
+    if line.starts_with("| HC") {
+        return KeyDb::parse_host_cert(line).is_some();
+    }
+    is_disc_entry_line(line) && KeyDb::parse_disc_entry(line).is_some()
 }
 
 impl KeyDb {
@@ -2006,6 +2037,202 @@ mod tests {
         assert!(eb2.is_uhd);
         assert_eq!(eb2.mkb_version, None);
         assert_eq!(eb2.volume_size, None);
+    }
+
+    // ── HC line: full parse into (priv[20], cert[92], revoked) ──────────────
+
+    /// A real-world-shaped `| HC |` line — a 20-byte private key, a 92-byte
+    /// cert that begins with the AACS host-cert header `02 01 00 5c ff ff 80 00
+    /// 02 10 …`, and a `; Revoked in MKBv72` note — must parse to exactly those
+    /// three: 20-byte key, 92-byte cert, and `revoked_at_mkb = Some(72)`.
+    #[test]
+    fn hc_line_parses_into_key_cert_and_revocation_generation() {
+        // Cert = 4-byte header + 6-byte host id + filler to the 92-byte length.
+        // Synthetic bytes only; no real key material.
+        let mut cert = vec![0x02u8, 0x01, 0x00, 0x5c, 0xff, 0xff, 0x80, 0x00, 0x02, 0x10];
+        cert.resize(92, 0xcc);
+        let cert_hex: String = cert.iter().map(|b| format!("{b:02x}")).collect();
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{cert_hex} ; Revoked in MKBv72",
+            "88".repeat(20),
+        );
+        let hc = KeyDb::parse_host_cert(&line).expect("a well-formed HC line must parse");
+        assert_eq!(hc.cert.private_key, [0x88u8; 20], "20-byte private key");
+        assert_eq!(hc.cert.certificate.len(), 92, "AACS 1.0 cert is 92 bytes");
+        assert_eq!(
+            &hc.cert.certificate[..4],
+            &[0x02, 0x01, 0x00, 0x5c],
+            "header preserved"
+        );
+        assert_eq!(
+            hc.revoked_at_mkb,
+            Some(72),
+            "the ; Revoked in MKBvN note captures N"
+        );
+        // A 1.0 HC line carries no AACS 2.0 credentials.
+        assert!(hc.cert.private_key_v2.is_none());
+        assert!(hc.cert.certificate_v2.is_none());
+    }
+
+    /// A `| HC |` line with NO `; Revoked …` note is live: `revoked_at_mkb`
+    /// is `None`, so `host_certs` returns it at every generation.
+    #[test]
+    fn hc_line_without_note_is_live() {
+        let line = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}",
+            "00".repeat(20),
+            "ab".repeat(92),
+        );
+        let hc = KeyDb::parse_host_cert(&line).unwrap();
+        assert_eq!(hc.revoked_at_mkb, None, "no note ⇒ never revoked");
+    }
+
+    // ── host_certs(mkb): the exact per-generation revocation filter ─────────
+
+    /// The hardware-critical filter: several certs revoked at DIFFERENT
+    /// generations plus one live cert. Each cert carries a distinct marker byte
+    /// so the returned SET is identified exactly, not merely counted. A cert
+    /// revoked at generation R is usable iff the disc's generation is `< R`.
+    #[test]
+    fn host_certs_filters_several_certs_across_mkb_generations() {
+        let hc = |marker: u8, note: &str| {
+            format!(
+                "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}{}\n",
+                "00".repeat(20),
+                format!("{marker:02x}").repeat(92),
+                note
+            )
+        };
+        let cfg = format!(
+            "{}{}{}{}{}",
+            hc(0x53, " ; Revoked in MKBv53"),
+            hc(0x58, " ; Revoked in MKBv58"),
+            hc(0x70, " ; Revoked in MKBv70"),
+            hc(0x72, " ; Revoked in MKBv72"),
+            hc(0x11, ""), // live: no revocation note
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 5);
+
+        // The first cert byte of each cert host_certs(mkb) hands back, sorted.
+        let markers = |mkb: Option<u32>| {
+            let mut m: Vec<u8> = db
+                .host_certs(mkb)
+                .iter()
+                .map(|c| c.certificate[0])
+                .collect();
+            m.sort_unstable();
+            m
+        };
+
+        // gen 77: every revocation has fired; only the live cert survives.
+        assert_eq!(markers(Some(77)), vec![0x11]);
+        // gen 50: below every revocation ⇒ all five are usable.
+        assert_eq!(markers(Some(50)), vec![0x11, 0x53, 0x58, 0x70, 0x72]);
+        // gen 58: revoked-at-53 and revoked-at-58 are out at the boundary
+        // (disc_gen < revoked is false); 70, 72 and the live cert remain.
+        assert_eq!(markers(Some(58)), vec![0x11, 0x70, 0x72]);
+        // gen 70: 70 itself is out at its own generation; only 72 + live remain.
+        assert_eq!(markers(Some(70)), vec![0x11, 0x72]);
+        // unknown disc MKB ⇒ cannot filter ⇒ every cert is returned.
+        assert_eq!(markers(None), vec![0x11, 0x53, 0x58, 0x70, 0x72]);
+    }
+
+    // ── Cert selection by the embedded 6-byte Host ID ──────────────────────
+
+    /// The AACS host ID lives INSIDE the 92-byte cert (offset 4, 6 bytes): a
+    /// cert beginning `02 01 00 5c ff ff 80 00 02 10 …` carries host id
+    /// `ff ff 80 00 02 10`. The parser keeps the cert bytes verbatim, so a
+    /// caller can select the cert for a specific host by that embedded id.
+    #[test]
+    fn host_cert_selected_by_embedded_6_byte_host_id() {
+        let cert_hex = |host_id: [u8; 6]| {
+            let mut bytes = vec![0x02u8, 0x01, 0x00, 0x5c]; // 4-byte header
+            bytes.extend_from_slice(&host_id); // host id at offset 4
+            bytes.resize(92, 0xcc); // pad to the 92-byte AACS 1.0 cert length
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let id_a = [0xff, 0xff, 0x80, 0x00, 0x02, 0x10];
+        let id_b = [0xff, 0xff, 0x80, 0x00, 0x02, 0x11];
+        let cfg = format!(
+            "| HC | HOST_PRIV_KEY 0x{p} | HOST_CERT 0x{a}\n\
+             | HC | HOST_PRIV_KEY 0x{p} | HOST_CERT 0x{b}\n",
+            p = "00".repeat(20),
+            a = cert_hex(id_a),
+            b = cert_hex(id_b),
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 2);
+
+        let find = |want: [u8; 6]| {
+            db.host_certs
+                .iter()
+                .find(|hc| hc.cert.certificate.get(4..10) == Some(&want[..]))
+        };
+        let hit = find(id_b).expect("the cert carrying host id …0211 must be found");
+        assert_eq!(&hit.cert.certificate[4..10], &id_b);
+        assert_eq!(hit.cert.certificate.len(), 92);
+        // A host id no cert carries selects nothing — and the byte-range slice
+        // must not panic when it does not match.
+        assert!(find([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).is_none());
+    }
+
+    /// A 1.0-only keydb (only `| HC |` rows, no `| HC2 |`) must leave every
+    /// cert's AACS 2.0 fields empty — no phantom v2 credentials appear.
+    #[test]
+    fn keydb_with_only_hc_rows_yields_no_v2_certs() {
+        let cfg = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n\
+             | HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(20),
+            "ab".repeat(92),
+            "01".repeat(20),
+            "cd".repeat(92),
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 2);
+        assert!(
+            db.host_certs
+                .iter()
+                .all(|hc| hc.cert.private_key_v2.is_none()),
+            "no HC2 rows ⇒ no v2 private keys"
+        );
+        assert!(
+            db.host_certs
+                .iter()
+                .all(|hc| hc.cert.certificate_v2.is_none()),
+            "no HC2 rows ⇒ no v2 certs"
+        );
+    }
+
+    /// The HC2 (AACS 2.0, type 0x11) slot: a full HC + HC2 pair parses into the
+    /// 1.0 fields AND the v2 fields, with the v2 private key exactly 32 bytes
+    /// and the v2 cert 132 bytes. Complements the field-ordering HC2 tests by
+    /// asserting the concrete v2 byte lengths a valid slot must yield.
+    #[test]
+    fn hc2_slot_parses_into_v2_key_and_cert_with_correct_lengths() {
+        let cfg = format!(
+            "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n\
+             | HC2 | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+            "00".repeat(20),
+            "00".repeat(92),
+            "5b".repeat(32),
+            "6c".repeat(132),
+        );
+        let db = KeyDb::parse(&cfg);
+        assert_eq!(db.host_certs.len(), 1, "HC2 augments the preceding HC");
+        let c = &db.host_certs[0].cert;
+        assert_eq!(c.certificate.len(), 92, "1.0 cert retained");
+        assert_eq!(
+            c.private_key_v2,
+            Some([0x5bu8; 32]),
+            "32-byte v2 private key"
+        );
+        assert_eq!(
+            c.certificate_v2.as_ref().map(|v| v.len()),
+            Some(132),
+            "132-byte v2 cert"
+        );
     }
 
     // KEYDB-parser integration tests relocated from libfreemkv; exercise the
