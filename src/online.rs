@@ -74,6 +74,11 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                     (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
                 )
             });
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embeds the IPv4 in
+            // the last 32 bits (segments[6..8]); re-check it too so an internal
+            // target does not slip through a NAT64 translator.
+            let nat64 = (seg[0] == 0x0064 && seg[1] == 0xff9b)
+                .then(|| std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32)));
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -90,6 +95,7 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                     == Some(true)
                 || sixtofour.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
                 || teredo.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+                || nat64.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
         }
     }
 }
@@ -239,7 +245,8 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
 }
 
 /// Validate a key-service base URL before it is handed to [`OnlineSource`].
-/// Requires an `http(s)` scheme, extracts the host, and rejects any host that
+/// Requires an `https` scheme (cleartext `http` is rejected as a `Config`
+/// fault — see `resolve_and_guard`), extracts the host, and rejects any host that
 /// is — or resolves to — a loopback / link-local (incl. the 169.254.169.254
 /// cloud-metadata endpoint) / RFC1918 / ULA / other non-public address (SSRF /
 /// metadata-exfiltration guard). Returns `Ok(())` on success so a caller can
@@ -810,6 +817,25 @@ mod tests {
         // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
         assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
             0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
+        ))));
+    }
+
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) translates IPv4 targets
+    // into IPv6; the guard must decode the trailing IPv4 and re-check it or an
+    // internal address slips through the translator.
+    #[test]
+    fn ssrf_guard_blocks_nat64_wellknown_prefix() {
+        // NAT64 for 169.254.169.254 (cloud metadata): 64:ff9b::a9fe:a9fe.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
+        ))));
+        // NAT64 for 127.0.0.1: 64:ff9b::7f00:0001.
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001
+        ))));
+        // NAT64 wrapping a PUBLIC IPv4 (8.8.8.8 → 64:ff9b::0808:0808) is allowed.
+        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
         ))));
     }
 
