@@ -52,6 +52,13 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
                 // "This network" 0.0.0.0/8.
                 || v4.octets()[0] == 0
+                // Benchmarking 198.18.0.0/15 (RFC 2544) — 198.18.x and 198.19.x
+                // (the /15 second octet is 18 with the low bit free, i.e. 18|19).
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+                // IETF protocol assignments 192.0.0.0/24 (RFC 6890), which
+                // includes 192.0.0.170/171 (NAT64/DNS64 discovery). Distinct
+                // from 192.0.2.0/24 TEST-NET-1, already caught by is_documentation.
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
                 // Class E reserved 240.0.0.0/4.
                 || v4.octets()[0] >= 240
         }
@@ -104,17 +111,19 @@ enum GuardFail {
 // returns pinned socket addrs or a rejection reason + message. SECURITY: the
 // message names the address — log only at config time, never in `query`.
 fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> {
-    let rest = if let Some(r) = url.strip_prefix("https://") {
-        (r, 443u16)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (r, 80u16)
-    } else {
+    // ONLY https is accepted. The POST body carries base64 key material and a
+    // replayable bearer token, so cleartext `http://` is refused — and refused
+    // HERE, in the shared guard, so `validate_keyserver_url` catches it ONCE at
+    // config time rather than every rip tripping `query`'s runtime https check
+    // and reporting a transient error for a permanent misconfiguration. Any
+    // non-https scheme is a standing operator fault (`Config`), never an outage.
+    let Some(authority) = url.strip_prefix("https://") else {
         return Err((
             GuardFail::Config,
-            "URL must start with http:// or https://".into(),
+            "URL scheme must be https:// (cleartext http:// is refused)".into(),
         ));
     };
-    let (authority, default_port) = rest;
+    let default_port = 443u16;
     let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
     let authority = authority.rsplit('@').next().unwrap_or(authority);
     if authority.is_empty() {
@@ -123,14 +132,19 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     let (host, port): (String, u16) = if let Some(stripped) = authority.strip_prefix('[') {
         match stripped.split_once(']') {
             Some((h, after)) => {
-                let p = after
-                    .strip_prefix(':')
-                    .map(|s| {
-                        s.parse::<u16>()
-                            .map_err(|_| (GuardFail::Config, "invalid port".to_string()))
-                    })
-                    .transpose()?
-                    .unwrap_or(default_port);
+                // The only thing allowed after `]` is an optional `:port`. A
+                // non-empty tail that is NOT `:port` (e.g. `[::1]extra`) is
+                // garbage — reject it as a `Config` fault instead of silently
+                // dropping it and connecting on the default port.
+                let p = if after.is_empty() {
+                    default_port
+                } else if let Some(port_str) = after.strip_prefix(':') {
+                    port_str
+                        .parse::<u16>()
+                        .map_err(|_| (GuardFail::Config, "invalid port".to_string()))?
+                } else {
+                    return Err((GuardFail::Config, "malformed IPv6 authority".into()));
+                };
                 (h.to_string(), p)
             }
             None => return Err((GuardFail::Config, "malformed IPv6 host".into())),
@@ -153,20 +167,27 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     // resolver timeout and freeze the calling rip thread, so run it on a
     // spawned thread with a bounded deadline (mirrors autorip/libfreemkv).
     let addrs: Vec<SocketAddr> = {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
         const DNS_TIMEOUT: Duration = Duration::from_secs(10);
         // Each resolver thread can hang for the OS timeout and is never joined,
         // so a black-holed keyserver leaks one thread+stack per attempt. Cap the
-        // outstanding ones; over the cap, report the host unreachable instead.
-        const MAX_DNS_THREADS: usize = 4;
-        static DNS_THREADS: AtomicUsize = AtomicUsize::new(0);
-        if DNS_THREADS.fetch_add(1, Ordering::SeqCst) >= MAX_DNS_THREADS {
-            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
-            return Err((
-                GuardFail::Unreachable,
-                "too many concurrent DNS resolutions in flight".into(),
-            ));
+        // outstanding ones — but PER HOST, not process-globally: a global cap
+        // lets 4 hung lookups to one dead keyserver starve resolution of a
+        // healthy DIFFERENT keyserver. Over the per-host cap, report only THAT
+        // host unreachable. `BTreeMap::new` is const, so no lazy init is needed.
+        const MAX_DNS_THREADS_PER_HOST: usize = 4;
+        static DNS_INFLIGHT: Mutex<std::collections::BTreeMap<String, usize>> =
+            Mutex::new(std::collections::BTreeMap::new());
+        {
+            let mut inflight = DNS_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let n = inflight.entry(host.clone()).or_insert(0);
+            if *n >= MAX_DNS_THREADS_PER_HOST {
+                return Err((
+                    GuardFail::Unreachable,
+                    "too many concurrent DNS resolutions in flight for this host".into(),
+                ));
+            }
+            *n += 1;
         }
         let host = host.clone();
         let (tx, rx) = mpsc::channel();
@@ -176,9 +197,15 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
                 .map(|it| it.collect::<Vec<SocketAddr>>());
             // Receiver may be gone after the timeout — ignore the send error.
             let _ = tx.send(res);
-            // Decrement only when the (possibly long-hung) lookup actually
-            // returns, so the cap reflects threads truly in flight.
-            DNS_THREADS.fetch_sub(1, Ordering::SeqCst);
+            // Release this host's slot only when the (possibly long-hung) lookup
+            // actually returns, so the cap reflects lookups truly in flight.
+            let mut inflight = DNS_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = inflight.get_mut(&host) {
+                *n -= 1;
+                if *n == 0 {
+                    inflight.remove(&host);
+                }
+            }
         });
         match rx.recv_timeout(DNS_TIMEOUT) {
             Ok(Ok(addrs)) => addrs,
@@ -740,6 +767,28 @@ mod tests {
         ))));
     }
 
+    // Benchmarking 198.18.0.0/15 (RFC 2544) and IETF protocol assignments
+    // 192.0.0.0/24 (RFC 6890, incl. the 192.0.0.170/171 NAT64/DNS64 anycast)
+    // are non-public and must be blocked outbound.
+    #[test]
+    fn ssrf_guard_blocks_benchmarking_and_protocol_assignment_ranges() {
+        // 198.18.0.0/15 spans 198.18.x AND 198.19.x — both octets blocked.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 18, 255, 255))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 19, 200, 5))));
+        // 198.17.x and 198.20.x are OUTSIDE the /15 — must stay allowed.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 17, 0, 1))));
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1))));
+        // 192.0.0.0/24, including 192.0.0.170 / 192.0.0.171.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 170))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 171))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 255))));
+        // The adjacent 192.0.1.0 is a different block — not covered here.
+        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 1, 1))));
+    }
+
     // 6to4 (2002::/16) and Teredo (2001:0000::/32) tunnel an IPv4 inside an
     // IPv6 address; the guard must decode and re-check that embedded IPv4 or an
     // internal target slips through the tunnel.
@@ -794,12 +843,14 @@ mod tests {
 
     #[test]
     fn resolve_and_guard_rejects_internal_literals() {
-        // Numeric literals resolve without DNS — must still be rejected.
-        assert!(resolve_and_guard("http://127.0.0.1/keys").is_err());
-        assert!(resolve_and_guard("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(resolve_and_guard(&format!("http://{}.{}.{}.{}:8080/keys", 10, 0, 0, 5)).is_err());
+        // Numeric literals resolve without DNS — must still be rejected. All
+        // https:// so the rejection is the SSRF address guard, not the scheme
+        // check (cleartext http:// is covered by its own test below).
+        assert!(resolve_and_guard("https://127.0.0.1/keys").is_err());
+        assert!(resolve_and_guard("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(resolve_and_guard(&format!("https://{}.{}.{}.{}:8080/keys", 10, 0, 0, 5)).is_err());
         assert!(resolve_and_guard(&format!("https://{}.{}.{}.{}/keys", 192, 168, 0, 1)).is_err());
-        assert!(resolve_and_guard("http://[::1]:9000/keys").is_err());
+        assert!(resolve_and_guard("https://[::1]:9000/keys").is_err());
     }
 
     #[test]
@@ -819,7 +870,7 @@ mod tests {
         // Scheme immediately followed by a path — empty authority.
         assert!(resolve_and_guard("https:///keys").is_err());
         // Bracketed IPv6 host missing its closing `]`.
-        assert!(resolve_and_guard("http://[::1/keys").is_err());
+        assert!(resolve_and_guard("https://[::1/keys").is_err());
         // `host:port` split with an empty host before the colon.
         assert!(resolve_and_guard("https://:8080/keys").is_err());
     }
@@ -857,7 +908,7 @@ mod tests {
         assert_eq!(addrs[0].port(), 443);
 
         let addrs =
-            resolve_and_guard("http://1.1.1.1:8080/keys").expect("public IP with port accepted");
+            resolve_and_guard("https://1.1.1.1:8080/keys").expect("public IP with port accepted");
         assert!(!addrs.is_empty());
         assert_eq!(addrs[0].port(), 8080);
     }
@@ -939,14 +990,53 @@ mod tests {
     #[test]
     fn validate_keyserver_url_rejects_internal_and_bad_scheme() {
         // Mirrors resolve_and_guard: the public wrapper rejects the same hosts.
-        assert!(validate_keyserver_url("http://127.0.0.1/keys").is_err());
-        assert!(validate_keyserver_url("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_keyserver_url(&format!("http://{}.{}.{}.{}/k", 10, 0, 0, 5)).is_err());
-        assert!(validate_keyserver_url("http://[::1]:9000/keys").is_err());
+        assert!(validate_keyserver_url("https://127.0.0.1/keys").is_err());
+        assert!(validate_keyserver_url("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_keyserver_url(&format!("https://{}.{}.{}.{}/k", 10, 0, 0, 5)).is_err());
+        assert!(validate_keyserver_url("https://[::1]:9000/keys").is_err());
         assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
         assert!(validate_keyserver_url("").is_err());
         // A public literal IP passes (no DNS needed, deterministic).
         assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
+    }
+
+    // Cleartext http:// must be refused at CONFIG time (validate_keyserver_url),
+    // not per-rip: the body carries base64 key material and a replayable bearer
+    // token, and `query` hard-refuses non-https at runtime. Catching it once
+    // here turns a permanent misconfig into a config error instead of a
+    // transient failure on every rip. A public host proves it's the SCHEME
+    // being rejected, not the address guard.
+    #[test]
+    fn non_https_scheme_is_rejected_at_config_time() {
+        // A perfectly reachable public host — only the http:// scheme is wrong.
+        assert!(validate_keyserver_url("http://8.8.8.8/keys").is_err());
+        assert!(resolve_and_guard("http://8.8.8.8/keys").is_err());
+        // The rejection is a standing Config fault, never a transient outage.
+        let (kind, _msg) = resolve_and_guard("http://8.8.8.8/keys")
+            .expect_err("cleartext http:// must be refused");
+        assert_eq!(kind, GuardFail::Config);
+        // https:// for the same public host is accepted.
+        assert!(validate_keyserver_url("https://8.8.8.8/keys").is_ok());
+    }
+
+    // A non-empty, non-`:port` tail after a bracketed IPv6 authority (e.g.
+    // `[::1]extra`) must be rejected as a Config fault, not silently dropped
+    // with a fall back to the default port.
+    #[test]
+    fn resolve_and_guard_rejects_garbage_after_bracketed_ipv6() {
+        // `[::1]junk` — junk after the closing bracket.
+        let (kind, _) = resolve_and_guard("https://[::1]junk/keys")
+            .expect_err("garbage after ] must be rejected");
+        assert_eq!(kind, GuardFail::Config);
+        // A public v6 literal with a trailing garbage tail is likewise rejected
+        // (so the garbage can't slip a request out on the default port).
+        assert!(resolve_and_guard("https://[2606:4700:4700::1111]extra/keys").is_err());
+        // Sanity: the same public v6 literal WITHOUT the tail is accepted.
+        assert!(resolve_and_guard("https://[2606:4700:4700::1111]/keys").is_ok());
+        // And an explicit :port after ] still parses.
+        let addrs = resolve_and_guard("https://[2606:4700:4700::1111]:8443/keys")
+            .expect("bracketed v6 with :port must parse");
+        assert_eq!(addrs[0].port(), 8443);
     }
 
     // ── the reply → verdict mapping (THE defect) ──────────────────────────
