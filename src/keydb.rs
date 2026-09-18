@@ -20,10 +20,9 @@ use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{Error, KeySource};
 
 use crate::keydb_format::KeyDb;
-// Upper bound on decompressed keydb size (decompression-bomb cap): a tiny
-// zip/gz could otherwise inflate to GiB and OOM the refresh thread. The SAME
-// constant `KeyDb::load` uses as the on-disk load cap — defined once in
-// keydb_format so the two can never drift apart.
+// Decompression-bomb cap on decompressed keydb size: a tiny zip/gz could
+// inflate to GiB and OOM the refresh thread. Same constant `KeyDb::load`
+// uses on-disk, defined once in keydb_format so the two can't drift.
 use crate::keydb_format::MAX_KEYDB_BYTES;
 
 /// Result of a KEYDB save/update -- path written, entry count, and byte size.
@@ -105,14 +104,9 @@ impl CacheEntry {
             // the past when we stamped it, so any later write bumps the mtime
             // past our stamp and is detected. Trust it.
             Some(age) => age >= granularity,
-            // No mtime at all (an mtime-less filesystem) OR an mtime in the
-            // FUTURE relative to stamped_at (clock skew) — `duration_since`
-            // yielded None either way. The mtime is useless as a change
-            // discriminator, so fall back to the inode identity (dev+ino, which
-            // an atomic rename always changes) and treat the entry as settled
-            // only once THIS observation has itself aged past the granularity.
-            // Without this, such a file's cache entry was NEVER settled, forcing
-            // a full ~62 MiB re-parse on every get_unit_keys/host_certs call.
+            // No mtime (mtime-less FS) or a future mtime (clock skew): `duration_since`
+            // yields None, so the mtime can't discriminate change — settle via inode
+            // identity once this observation has itself aged past the granularity.
             None => std::time::SystemTime::now()
                 .duration_since(self.stamped_at)
                 .is_ok_and(|age| age >= granularity),
@@ -295,11 +289,9 @@ impl KeydbSource {
 
         let entries = text
             .lines()
-            // Mirror KeyDb::parse's ACCEPTANCE rule EXACTLY by running the same
-            // parsers (not just a `| DK`/`| PK`/`| HC` prefix check): a row with
-            // the right prefix but malformed hex / a short cert parses to
-            // nothing, so counting it by prefix let unparseable content slip
-            // past the `entries > 0` guard. See docs/keydb.md#save-mirror-parse.
+            // Mirror KeyDb::parse by running the same parsers, not a prefix check: a
+            // right-prefix row with bad hex / short cert parses to nothing, so a prefix
+            // count let junk past `entries > 0`. See docs/keydb.md#save-mirror-parse.
             .filter(|l| crate::keydb_format::is_parseable_entry_line(l))
             .count();
 
@@ -1008,10 +1000,9 @@ mod tests {
         assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
     }
 
-    // A cache entry whose stamp has NO mtime (mtime-less filesystem) or a mtime
-    // in the FUTURE (clock skew) must not be stuck un-settled forever — that
-    // forced a full ~62 MiB re-parse on every lookup. It now settles via the
-    // inode-identity fallback once the observation has aged past the granularity.
+    // A stamp with no mtime (mtime-less FS) or a future mtime (clock skew) must
+    // not be stuck un-settled forever — it now settles via the inode-identity
+    // fallback once the observation has aged past the granularity.
     #[test]
     fn is_settled_falls_back_when_mtime_is_absent_or_in_the_future() {
         use std::time::{Duration, SystemTime};
@@ -1500,10 +1491,9 @@ mod tests {
     fn save_rejects_prefixed_but_unparseable_dk_pk_hc_rows() {
         let dir = scratch("save-prefixed-junk");
         let src = KeydbSource::new(dir.join("k.cfg"));
-        // Each line has a valid keydb PREFIX but content no parser accepts:
-        //  - PK: not 16 bytes of hex
-        //  - DK: DEVICE_KEY not valid hex
-        //  - HC: cert far shorter than the 92-byte minimum
+        // Each line has a valid keydb PREFIX but content no parser accepts: PK not
+        // 16 bytes of hex, DK's DEVICE_KEY not valid hex, HC cert far shorter than
+        // the 92-byte minimum.
         let junk = b"| PK | 0xnothex\n\
                      | DK | DEVICE_KEY 0xZZ | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17\n\
                      | HC | HOST_PRIV_KEY 0x00 | HOST_CERT 0x0011\n";

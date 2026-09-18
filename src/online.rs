@@ -117,12 +117,9 @@ enum GuardFail {
 // returns pinned socket addrs or a rejection reason + message. SECURITY: the
 // message names the address — log only at config time, never in `query`.
 fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> {
-    // ONLY https is accepted. The POST body carries base64 key material and a
-    // replayable bearer token, so cleartext `http://` is refused — and refused
-    // HERE, in the shared guard, so `validate_keyserver_url` catches it ONCE at
-    // config time rather than every rip tripping `query`'s runtime https check
-    // and reporting a transient error for a permanent misconfiguration. Any
-    // non-https scheme is a standing operator fault (`Config`), never an outage.
+    // ONLY https: the POST body carries base64 key material and a replayable
+    // bearer token, so cleartext `http://` is refused here in the shared guard —
+    // a standing operator fault (`Config`) caught once at config time, not per rip.
     let Some(authority) = url.strip_prefix("https://") else {
         return Err((
             GuardFail::Config,
@@ -138,10 +135,9 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     let (host, port): (String, u16) = if let Some(stripped) = authority.strip_prefix('[') {
         match stripped.split_once(']') {
             Some((h, after)) => {
-                // The only thing allowed after `]` is an optional `:port`. A
-                // non-empty tail that is NOT `:port` (e.g. `[::1]extra`) is
-                // garbage — reject it as a `Config` fault instead of silently
-                // dropping it and connecting on the default port.
+                // The only thing allowed after `]` is an optional `:port`. A non-empty
+                // tail that isn't `:port` (e.g. `[::1]extra`) is garbage — reject as
+                // `Config` rather than silently drop it and connect on the default port.
                 let p = if after.is_empty() {
                     default_port
                 } else if let Some(port_str) = after.strip_prefix(':') {
@@ -175,12 +171,9 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     let addrs: Vec<SocketAddr> = {
         use std::sync::mpsc;
         const DNS_TIMEOUT: Duration = Duration::from_secs(10);
-        // Each resolver thread can hang for the OS timeout and is never joined,
-        // so a black-holed keyserver leaks one thread+stack per attempt. Cap the
-        // outstanding ones — but PER HOST, not process-globally: a global cap
-        // lets 4 hung lookups to one dead keyserver starve resolution of a
-        // healthy DIFFERENT keyserver. Over the per-host cap, report only THAT
-        // host unreachable. `BTreeMap::new` is const, so no lazy init is needed.
+        // Resolver threads can hang for the OS timeout and are never joined, leaking
+        // a thread+stack per attempt — so cap outstanding ones PER HOST (a global cap
+        // lets one dead keyserver starve a healthy different one). Const-init map.
         const MAX_DNS_THREADS_PER_HOST: usize = 4;
         static DNS_INFLIGHT: Mutex<std::collections::BTreeMap<String, usize>> =
             Mutex::new(std::collections::BTreeMap::new());
@@ -245,15 +238,13 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
 }
 
 /// Validate a key-service base URL before it is handed to [`OnlineSource`].
-/// Requires an `https` scheme (cleartext `http` is rejected as a `Config`
-/// fault — see `resolve_and_guard`), extracts the host, and rejects any host that
-/// is — or resolves to — a loopback / link-local (incl. the 169.254.169.254
-/// cloud-metadata endpoint) / RFC1918 / ULA / other non-public address (SSRF /
-/// metadata-exfiltration guard). Returns `Ok(())` on success so a caller can
-/// gate `OnlineSource` construction; the error string explains the rejection.
+/// Requires `https` (cleartext `http` is rejected as a `Config` fault — see
+/// `resolve_and_guard`), extracts the host, and rejects any host that is — or
+/// resolves to — loopback / link-local (incl. 169.254.169.254 cloud metadata)
+/// / RFC1918 / ULA / other non-public address (SSRF guard). Returns `Ok(())`
+/// so a caller can gate `OnlineSource`; the error string says why.
 ///
-/// This is the *config-time* check; [`OnlineSource`] re-resolves and
-/// re-guards the host again before each POST, closing the DNS-rebind window.
+/// The *config-time* check; [`OnlineSource`] re-guards before each POST, closing the DNS-rebind window.
 pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
     resolve_and_guard(url).map(|_| ()).map_err(|(_, msg)| msg)
 }
@@ -1027,11 +1018,8 @@ mod tests {
     }
 
     // Cleartext http:// must be refused at CONFIG time (validate_keyserver_url),
-    // not per-rip: the body carries base64 key material and a replayable bearer
-    // token, and `query` hard-refuses non-https at runtime. Catching it once
-    // here turns a permanent misconfig into a config error instead of a
-    // transient failure on every rip. A public host proves it's the SCHEME
-    // being rejected, not the address guard.
+    // not per-rip — the body carries key material + a replayable token. A public
+    // host proves it's the SCHEME being rejected, not the address guard.
     #[test]
     fn non_https_scheme_is_rejected_at_config_time() {
         // A perfectly reachable public host — only the http:// scheme is wrong.
