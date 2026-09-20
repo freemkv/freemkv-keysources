@@ -24,11 +24,6 @@ pub type NumberedUnitKey = (u32, [u8; 16]);
 /// can never drift out of lockstep.
 pub(crate) const MAX_KEYDB_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Upper bound on parsed disc entries. The real public keydb carries
-/// ~170k+ entries, so the cap sits well above that while still bounding
-/// memory against a pathological input. Surplus lines are ignored.
-const MAX_DISC_ENTRIES: usize = 500_000;
-
 /// Parsed AACS key database.
 ///
 /// NO `#[derive(Debug)]`: see the hand-written redacting impl below. The
@@ -193,8 +188,6 @@ pub(crate) struct ParseStats {
     pub hc2_rejected: usize,
     /// `0x… = …` disc rows the field parser refused outright.
     pub disc_rejected: usize,
-    /// Disc rows dropped because [`MAX_DISC_ENTRIES`] was already reached.
-    pub disc_over_cap: usize,
     /// Disc rows that REPLACED an earlier row with the same hash (last wins).
     /// Not necessarily corruption, but never something to discover silently:
     /// a duplicated hash means one of the two rows' keys is now unreachable.
@@ -210,7 +203,6 @@ impl ParseStats {
             + self.hc_rejected
             + self.hc2_rejected
             + self.disc_rejected
-            + self.disc_over_cap
     }
 
     // Emit the one summary line, if there is anything to say; returns whether
@@ -227,7 +219,6 @@ impl ParseStats {
             hc_rejected = self.hc_rejected,
             hc2_rejected = self.hc2_rejected,
             disc_rejected = self.disc_rejected,
-            disc_over_cap = self.disc_over_cap,
             disc_duplicate = self.disc_duplicate,
             "keydb.cfg lines were rejected while parsing; the file may be truncated or corrupt (keys past the damage will not resolve)"
         );
@@ -305,6 +296,11 @@ impl KeyDb {
             disc_entries: HashMap::new(),
         };
 
+        // Strip a leading UTF-8 BOM (U+FEFF): it is NOT trim()-able whitespace, so
+        // it would cling to line 1's `0x…` hash and silently drop the first disc
+        // row (a keydb saved by a Windows editor).
+        let data = data.strip_prefix('\u{feff}').unwrap_or(data);
+
         for line in data.lines() {
             let line = line.trim();
 
@@ -378,15 +374,10 @@ impl KeyDb {
                 continue;
             }
 
-            // Disc entry: starts with 0x / 0X (see `is_disc_entry_line`).
-            if is_disc_entry_line(line) {
-                // The cap is a memory bound against a pathological file, but
-                // hitting it means real discs are being dropped — count it, the
-                // way `load`'s size/UTF-8 caps produce a diagnostic.
-                if db.disc_entries.len() >= MAX_DISC_ENTRIES {
-                    stats.disc_over_cap += 1;
-                    continue;
-                }
+            // Gate on the `0x` PREFIX alone (not `is_disc_entry_line`, which also
+            // needs " = "): a malformed `0x…` row is COUNTED as rejected, never
+            // silently dropped. No entry cap — a keydb must hold every row.
+            if line.starts_with("0x") || line.starts_with("0X") {
                 match Self::parse_disc_entry(line) {
                     // The map key IS the entry's own `disc_hash` allocation
                     // (`Arc` clone, no second copy of the string).
@@ -1443,12 +1434,16 @@ mod tests {
         assert_eq!(stats.pk_rejected, 1, "the bad PK row must be counted");
         assert_eq!(stats.hc_rejected, 1, "the short HC row must be counted");
         assert_eq!(stats.hc2_rejected, 1, "the short HC2 row must be counted");
-        assert_eq!(stats.rejected(), 4, "four rows rejected in total");
+        // A `0x…` row missing " = " is malformed (a hash the user sees but that
+        // never resolves); it is COUNTED now, not silently ignored — exactly the
+        // "hash in the file but nothing resolves" bug class.
+        assert_eq!(
+            stats.disc_rejected, 1,
+            "a prefixed row missing \" = \" is counted"
+        );
+        assert_eq!(stats.rejected(), 5, "five rows rejected in total");
         // The one GOOD row still loaded — counting must not change parsing.
         assert_eq!(db.processing_keys, vec![[0xABu8; 16]]);
-        // A `0x` line with no " = " is not a disc row at all, so it is not a
-        // rejection (it is a comment-shaped line the format allows).
-        assert_eq!(stats.disc_rejected, 0);
     }
 
     /// A duplicated disc hash silently last-wins through `HashMap::insert`:
@@ -1469,26 +1464,132 @@ mod tests {
         assert_eq!(db.get_uk("0xaaaa"), vec![(1, [0x02u8; 16])]);
     }
 
-    /// Hitting `MAX_DISC_ENTRIES` drops real discs, so it must produce a
-    /// diagnostic like `load`'s size / UTF-8 caps do — not a bare `continue`.
-    /// Driven through the cap constant itself so it cannot rot if the cap moves.
+    /// A keydb is a database: EVERY disc row must load, with no count-based cap
+    /// silently dropping entries. Regression guard for the removed
+    /// `MAX_DISC_ENTRIES` cap — a disc verifiably in the file must resolve.
     #[test]
-    fn parse_counts_disc_rows_dropped_over_the_entry_cap() {
+    fn parse_keeps_every_disc_row_no_entry_cap() {
         let k = "01".repeat(16);
-        let mut cfg = String::with_capacity((MAX_DISC_ENTRIES + 2) * 16);
-        for i in 0..MAX_DISC_ENTRIES + 2 {
+        let n = 600_000; // comfortably past the old 500k cap
+        let mut cfg = String::with_capacity(n * 16);
+        for i in 0..n {
             cfg.push_str(&format!("0x{i:x} = T | U | 1-0x{k}\n"));
         }
         let (db, stats) = KeyDb::parse_counted(&cfg);
-        assert_eq!(
-            db.disc_entries.len(),
-            MAX_DISC_ENTRIES,
-            "cap still enforced"
+        assert_eq!(db.disc_entries.len(), n, "every disc row must be kept");
+        assert_eq!(stats.rejected(), 0, "no row dropped");
+    }
+
+    // ── whole-flow robustness: every way a row a user can SEE in the file could
+    //    silently fail to load. Each is a regression guard for a real gap. ──
+
+    /// A minimal, well-formed disc row for `hash` (lowercase hex, no 0x).
+    fn disc_line(hash: &str) -> String {
+        let uk = "01".repeat(16);
+        let vuk = "02".repeat(16);
+        format!("0x{hash} = TITLE | V | 0x{vuk} | U | 1-0x{uk}")
+    }
+
+    /// A UTF-8 BOM on the first line must not eat the first disc row.
+    #[test]
+    fn parse_strips_leading_bom_first_row_survives() {
+        let h = "aa".repeat(20);
+        let cfg = format!("\u{feff}{}\n", disc_line(&h));
+        let (db, stats) = KeyDb::parse_counted(&cfg);
+        assert_eq!(db.disc_entries.len(), 1, "BOM must not drop the first row");
+        assert!(db.find_disc(&format!("0x{h}")).is_some());
+        assert_eq!(stats.rejected(), 0);
+    }
+
+    /// CRLF (`\r\n`) line endings must load — `.lines()` + `trim()` handle the `\r`.
+    #[test]
+    fn parse_handles_crlf_line_endings() {
+        let h = "bb".repeat(20);
+        let cfg = format!("{}\r\n{}\r\n", disc_line(&h), disc_line(&"cc".repeat(20)));
+        let (db, _) = KeyDb::parse_counted(&cfg);
+        assert_eq!(db.disc_entries.len(), 2);
+        assert!(db.find_disc(&format!("0x{h}")).is_some());
+    }
+
+    /// Leading whitespace on a disc row must not drop it (trim covers it).
+    #[test]
+    fn parse_tolerates_leading_whitespace() {
+        let h = "dd".repeat(20);
+        let cfg = format!("   \t{}\n", disc_line(&h));
+        let (db, _) = KeyDb::parse_counted(&cfg);
+        assert!(db.find_disc(&format!("0x{h}")).is_some());
+    }
+
+    /// An uppercase `0X` prefix AND uppercase hash must load and be findable by
+    /// any case / prefix form (the lookup normalizes).
+    #[test]
+    fn parse_and_lookup_are_case_and_prefix_insensitive() {
+        let cfg = "0XABCDEF0123456789ABCDEF0123456789ABCDEF01 = T | V | 0x0202020202020202020202020202020202 | U | 1-0x0101010101010101010101010101010101\n"
+            .replace("0202020202020202020202020202020202", &"02".repeat(16))
+            .replace("0101010101010101010101010101010101", &"01".repeat(16));
+        let (db, _) = KeyDb::parse_counted(&cfg);
+        // uppercase-with-0x, lowercase-with-0x, and no-prefix all resolve.
+        assert!(
+            db.find_disc("0xABCDEF0123456789ABCDEF0123456789ABCDEF01")
+                .is_some()
+        );
+        assert!(
+            db.find_disc("0xabcdef0123456789abcdef0123456789abcdef01")
+                .is_some()
+        );
+        assert!(
+            db.find_disc("abcdef0123456789abcdef0123456789abcdef01")
+                .is_some()
+        );
+    }
+
+    /// A `0x…` row missing the `" = "` separator must be COUNTED as rejected,
+    /// never silently ignored — otherwise a visibly-present disc vanishes.
+    #[test]
+    fn parse_counts_a_prefixed_row_missing_the_separator() {
+        let h = "ee".repeat(20);
+        // no " = " (bare "=") — malformed for the grammar.
+        let cfg = format!(
+            "0x{h}=TITLE|V|0x{}|U|1-0x{}\n",
+            "02".repeat(16),
+            "01".repeat(16)
+        );
+        let (db, stats) = KeyDb::parse_counted(&cfg);
+        assert!(
+            db.find_disc(&format!("0x{h}")).is_none(),
+            "malformed row not loaded"
         );
         assert_eq!(
-            stats.disc_over_cap, 2,
-            "the two rows dropped by the cap must be counted"
+            stats.disc_rejected, 1,
+            "the drop MUST be counted, not silent"
         );
+        assert!(
+            stats.log() || stats.rejected() > 0,
+            "a rejection is diagnosable"
+        );
+    }
+
+    /// Duplicate hash: last row wins AND the collision is counted (a keydb with
+    /// the same hash twice means one row's keys become unreachable).
+    #[test]
+    fn parse_counts_duplicate_hash_last_wins() {
+        let h = "ff".repeat(20);
+        let cfg = format!("{}\n{}\n", disc_line(&h), disc_line(&h));
+        let (db, stats) = KeyDb::parse_counted(&cfg);
+        assert_eq!(db.disc_entries.len(), 1);
+        assert_eq!(stats.disc_duplicate, 1, "the overwrite must be counted");
+    }
+
+    /// A row carrying ONLY terminal unit keys (no V field) still loads and is
+    /// findable — VUK-less discs must resolve from their stored unit keys.
+    #[test]
+    fn parse_keeps_unit_key_only_rows() {
+        let h = "12".repeat(20);
+        let cfg = format!("0x{h} = TITLE | U | 1-0x{}\n", "01".repeat(16));
+        let (db, _) = KeyDb::parse_counted(&cfg);
+        let e = db.find_disc(&format!("0x{h}")).expect("row loads");
+        assert!(e.vuk.is_none());
+        assert_eq!(e.unit_keys.len(), 1, "the stored unit key is kept");
     }
 
     /// A disc row rejected by the FIELD parser is counted separately from one
