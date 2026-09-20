@@ -1729,4 +1729,37 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "0xGOOD = keep\n");
     }
+
+    /// Load-failure verdicts by IO kind — a keydb that can't be read must NEVER
+    /// masquerade as "this disc has no key". Permission-denied and corrupt/oversized
+    /// files surface as distinct loud errors; only a genuinely-absent file is the
+    /// documented benign case (online-only is a valid mode).
+    #[test]
+    fn load_failure_maps_io_kind_to_the_right_verdict() {
+        use std::io::{Error as IoErr, ErrorKind};
+        let src = KeydbSource::new("/nonexistent/keydb.cfg");
+
+        // Missing file → benign None (no keydb present; not an error on its own).
+        assert!(
+            src.load_failure(&IoErr::from(ErrorKind::NotFound))
+                .is_none(),
+            "a missing keydb is the benign online-only case"
+        );
+        // Permission denied → LOUD KeydbLoad, never a silent no-key.
+        assert!(
+            matches!(
+                src.load_failure(&IoErr::from(ErrorKind::PermissionDenied)),
+                Some(Error::KeydbLoad { .. })
+            ),
+            "no read permission must surface as KeydbLoad, not 'no key'"
+        );
+        // Over the size cap / non-UTF8 → LOUD KeydbInvalid (corrupt/truncated).
+        assert!(
+            matches!(
+                src.load_failure(&IoErr::from(ErrorKind::InvalidData)),
+                Some(Error::KeydbInvalid)
+            ),
+            "an unusable keydb must surface as KeydbInvalid"
+        );
+    }
 }
