@@ -20,7 +20,7 @@ concurrency:
 # The committed Cargo.toml resolves libfreemkv from a git TAG (it is off
 # crates.io). That means CI was building this branch against the LAST RELEASE
 # of libfreemkv, never against libfreemkv's dev tip — so a coordinated change
-# across the two repos could not be verified until release.sh cut the tags.
+# across the two repos could not be verified until release-orchestrate.yml cut the tags.
 # Green here meant "compiles against last month's library".
 #
 # The fix mirrors the developer's local layout via the shared composite
@@ -42,7 +42,7 @@ concurrency:
 # the `deny` job audits the resolved graph, but CI's sibling path-patch layout
 # resolves the freemkv crates as path packages, which `--locked` can't satisfy —
 # the same reason the binary crates omit it. The lock that has to hold is the one
-# release.sh regenerates in each consuming binary.
+# release-orchestrate.yml regenerates in each consuming binary.
 
 jobs:
   # Single source of truth for the MSRV — read rust-version from Cargo.toml once
@@ -170,9 +170,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
@@ -239,9 +238,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
