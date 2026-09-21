@@ -287,6 +287,10 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(TIMEOUT_SECS)))
+        // Since ureq 3.4.1 (#1194) recv_response bounds only the HEADERS; without
+        // a body deadline a stalled reply hangs the POST forever. The JSON key
+        // answer arrives in one read, so a TOTAL cap is the right shape here.
+        .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_SECS)))
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
     ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
@@ -915,6 +919,22 @@ mod tests {
             result.is_err(),
             "an empty pin must fail the connection, not silently resolve some other way"
         );
+    }
+
+    // The POST reply body has its own deadline, not just the headers: ureq
+    // 3.4.1+ recv_response covers headers only, so without recv_body a stalled
+    // reply would hang the key request forever.
+    #[test]
+    fn the_reply_body_read_is_bounded_not_only_the_headers() {
+        let agent = hardened_agent(Vec::new());
+        let t = agent.config().timeouts();
+        assert_eq!(
+            t.recv_body,
+            Some(Duration::from_secs(TIMEOUT_SECS)),
+            "ureq 3.4.1+ recv_response covers headers only; without recv_body the \
+             reply read has no deadline at all"
+        );
+        assert_eq!(t.recv_response, Some(Duration::from_secs(TIMEOUT_SECS)));
     }
 
     #[test]
