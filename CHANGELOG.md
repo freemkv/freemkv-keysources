@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.7.4] — UNRELEASED
+## [1.7.4] — 2026-09-21
 ### Fixed
 
 - keydb lookups now report match state and entry shape, so a "no entry" result tells you whether the disc was truly absent or matched-but-underivable (no usable VID) (#46).
