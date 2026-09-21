@@ -97,6 +97,39 @@ impl KeySource for MultiSource {
         first_non_empty(&self.sources, |s, c| s.get_unit_keys(c), ctx)
     }
 
+    // De-conflated counterpart: first inner source with keys wins; else the
+    // richest miss survives composition (a MATCHED inner source beats a plain
+    // miss). Same Err/Ok failure contract as `get_unit_keys`.
+    fn resolve_unit_keys(
+        &self,
+        ctx: &dyn ResolveCtx,
+    ) -> Result<libfreemkv::keysource::UnitKeyResolution, libfreemkv::Error> {
+        let mut first_failure: Option<libfreemkv::Error> = None;
+        let mut matched: Option<libfreemkv::keysource::UnitKeyResolution> = None;
+        for s in &self.sources {
+            match s.resolve_unit_keys(ctx) {
+                Ok(r) if !r.keys.is_empty() => return Ok(r),
+                Ok(r) => {
+                    if r.matched && matched.is_none() {
+                        matched = Some(r);
+                    }
+                }
+                Err(e) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(r) = matched {
+            return Ok(r);
+        }
+        match first_failure {
+            Some(e) => Err(e),
+            None => Ok(libfreemkv::keysource::UnitKeyResolution::default()),
+        }
+    }
+
     // Forensic-index counterpart to `get_unit_keys`, same failure-preserving
     // rule. A source with no forensic material (keydb, via the trait default)
     // contributes empty and is skipped; today the online source answers.

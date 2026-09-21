@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::uks_from_vuk;
 use libfreemkv::aacs::derive::{derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk};
+use libfreemkv::aacs::trace::{KeyNode, MatchedEntry};
 use libfreemkv::aacs::types::{HostCert, MediaKey, UnitKey, Vid};
-use libfreemkv::keysource::ResolveCtx;
+use libfreemkv::keysource::{ResolveCtx, UnitKeyResolution};
 use libfreemkv::{Error, KeySource};
 
 use crate::keydb_format::KeyDb;
@@ -348,15 +349,23 @@ impl KeydbSource {
         }
     }
 
-    // Derive this disc's terminal Unit Keys from a parsed keydb. Pure (no
-    // I/O). Empty Vec = no key for this disc from this keydb. CPS-unit
-    // numbering (idx = num - 1) is explained in docs/keydb.md#unit-keys-from.
+    // Terminal Unit Keys for this disc from a parsed keydb; empty Vec = none.
+    // CPS numbering (idx = num - 1): docs/keydb.md#unit-keys-from. Thin wrapper
+    // over [`resolve_from`] for callers that want only the keys (pure, no I/O).
     fn unit_keys_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
+        Self::resolve_from(db, ctx).keys
+    }
+
+    // De-conflated resolution: the keys PLUS whether the disc matched and — on a
+    // keyless match — WHY nothing derived, so a matched-but-underivable disc is
+    // never reported as a flat "no entry" (issue #46). Pure (no I/O).
+    fn resolve_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> KeydbResolution {
         // Per-disc hit (most specific); find_disc normalizes the hash form.
         // Without a match there is no per-disc anchor, so the global PK/DK
         // pools are never consulted. See docs/keydb.md#unit-keys-per-disc-hit.
+        let entries_loaded = db.disc_entries.len();
         let Some(entry) = db.find_disc(ctx.disc_hash()) else {
-            return Vec::new();
+            return KeydbResolution::miss(entries_loaded);
         };
 
         // UNION every source of terminal keys, then dedup — never first-hit,
@@ -391,6 +400,11 @@ impl KeydbSource {
                 &[]
             }
         };
+
+        // Why the keyless derivation could not finish, for the trace's miss
+        // path. `None` once any key lands (or when there was no material to try).
+        let mut miss_reason: Option<KeyNode> = None;
+
         if !enc_title_keys.is_empty() {
             // VUK path, else MK path (stored/PK/DK) → VUK. See
             // docs/keydb.md#unit-keys-vuk-or-mk for the VID rules.
@@ -425,7 +439,15 @@ impl KeydbSource {
                         uks_from_vuk(&derive_vuk(&mk.0, &vid.0), enc_title_keys)
                     }
                     // Locked VID-per-path rule: an MK with no VID cannot derive.
-                    _ => Vec::new(),
+                    // De-conflate the two reasons so the trace can say WHICH.
+                    (Some(_), None) => {
+                        miss_reason = Some(KeyNode::NoVid);
+                        Vec::new()
+                    }
+                    (None, _) => {
+                        miss_reason = Some(KeyNode::NoDerivableKey);
+                        Vec::new()
+                    }
                 }
             };
             keys.extend(derived);
@@ -434,7 +456,60 @@ impl KeydbSource {
         // Unique by key value, first occurrence wins (stored numbering kept).
         let mut seen = std::collections::HashSet::new();
         keys.retain(|u| seen.insert(u.key));
-        keys
+
+        // Booleans-and-lengths shape of the matched entry, for the app to log —
+        // answers "what did the matched entry actually carry?" (issue #46).
+        let shape = MatchedEntry {
+            has_vuk: entry.vuk.is_some(),
+            has_unit_keys: !entry.unit_keys.is_empty(),
+            unit_keys_len: entry.unit_keys.len(),
+            has_media_key: entry.media_key.is_some(),
+            has_keydb_vid: entry.vid.is_some(),
+            enc_title_keys_len: enc_title_keys.len(),
+            vid_available: ctx.vid().is_some() || entry.vid.is_some(),
+        };
+
+        // On a match with no key: carry the specific reason if we have one, else
+        // leave it empty for the library to render a bare `NoDerivableKey`.
+        let miss_path = if keys.is_empty() {
+            miss_reason.map(|n| vec![n]).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        KeydbResolution {
+            keys,
+            matched: true,
+            shape: Some(shape),
+            miss_path,
+            entries_loaded,
+        }
+    }
+}
+
+// The de-conflated result of a keydb lookup: keys plus enough context that a
+// MATCHED-but-underivable disc is reported distinctly from a true miss. See
+// [`KeydbSource::resolve_from`] and issue #46.
+struct KeydbResolution {
+    keys: Vec<UnitKey>,
+    matched: bool,
+    shape: Option<MatchedEntry>,
+    miss_path: Vec<KeyNode>,
+    // Per-disc entries loaded in the keydb — named in a true-miss verdict so a
+    // reporter can confirm a wrong-pressing (`… not in keydb (N entries loaded)`).
+    entries_loaded: usize,
+}
+
+impl KeydbResolution {
+    // A true miss: the disc hash was not in the keydb at all.
+    fn miss(entries_loaded: usize) -> Self {
+        Self {
+            keys: Vec::new(),
+            matched: false,
+            shape: None,
+            miss_path: Vec::new(),
+            entries_loaded,
+        }
     }
 }
 
@@ -541,6 +616,30 @@ impl KeySource for KeydbSource {
             Err(e) => match self.load_failure(&e) {
                 // Missing keydb: the documented benign miss.
                 None => Ok(Vec::new()),
+                // Corrupt / unreadable keydb: a SOURCE FAILURE, not a miss.
+                Some(err) => Err(err),
+            },
+        }
+    }
+
+    // De-conflated resolution (issue #46): besides the keys, report whether the
+    // disc MATCHED, why nothing derived on a keyless match, and the matched
+    // entry's shape to log — so a matched-no-key disc is not a mute "no entry".
+    fn resolve_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
+        match self.cached_db() {
+            Ok(db) => {
+                let r = Self::resolve_from(&db, ctx);
+                Ok(UnitKeyResolution {
+                    keys: r.keys,
+                    matched: r.matched,
+                    miss_path: r.miss_path,
+                    matched_entry: r.shape,
+                    store_entries: Some(r.entries_loaded),
+                })
+            }
+            Err(e) => match self.load_failure(&e) {
+                // Missing keydb: the documented benign miss (nothing matched).
+                None => Ok(UnitKeyResolution::default()),
                 // Corrupt / unreadable keydb: a SOURCE FAILURE, not a miss.
                 Some(err) => Err(err),
             },
@@ -685,6 +784,74 @@ mod tests {
         let c = ctx(HASH, Vec::new(), None);
         assert_eq!(c.title(), None);
         assert_eq!(c.samples(4).unwrap(), Vec::<Vec<u8>>::new());
+    }
+
+    // Issue #46 — de-conflated resolution: a matched entry with a Media Key but
+    // NO VID on this path (locked VID-per-path rule) is reported `matched` with a
+    // `NoVid` miss path — the exact case behind the reporter's "no entry".
+    #[test]
+    fn resolve_matched_media_key_without_vid_reports_no_vid_not_a_miss() {
+        let mut e = blank_entry(HASH);
+        e.media_key = Some([0x33u8; 16]);
+        let db = db_with(e, Vec::new());
+        // enc_title_keys present so derivation is attempted; ctx supplies no VID.
+        let r = KeydbSource::resolve_from(&db, &ctx(HASH, vec![[0x44u8; 16]], None));
+        assert!(r.keys.is_empty(), "no VID -> nothing derivable");
+        assert!(r.matched, "the disc WAS found — not a true miss");
+        assert_eq!(r.miss_path, vec![KeyNode::NoVid]);
+        let shape = r.shape.expect("a matched entry carries a shape");
+        assert!(shape.has_media_key);
+        assert!(!shape.has_vuk);
+        assert!(!shape.has_unit_keys);
+        assert_eq!(shape.enc_title_keys_len, 1);
+        assert!(!shape.vid_available);
+    }
+
+    // A hash that is NOT in the keydb is the one true miss: not matched, no
+    // shape, no miss path (the library renders this as `no entry`).
+    #[test]
+    fn resolve_unmatched_hash_is_a_true_miss() {
+        let db = db_with(blank_entry(HASH), Vec::new());
+        let r = KeydbSource::resolve_from(&db, &ctx("0xdeadbeef", Vec::new(), None));
+        assert!(!r.matched);
+        assert!(r.keys.is_empty());
+        assert!(r.shape.is_none());
+        assert!(r.miss_path.is_empty());
+        // The store size travels with the miss so the verdict can name it.
+        assert_eq!(r.entries_loaded, 1);
+    }
+
+    // Matched but no derivation material at all (no stored keys, no enc title
+    // keys): matched with an EMPTY miss path, which the library renders as the
+    // generic `no derivable key` — still distinct from a true miss.
+    #[test]
+    fn resolve_matched_with_no_material_has_empty_miss_path() {
+        let db = db_with(blank_entry(HASH), Vec::new());
+        let r = KeydbSource::resolve_from(&db, &ctx(HASH, Vec::new(), None));
+        assert!(r.matched);
+        assert!(r.keys.is_empty());
+        assert!(
+            r.miss_path.is_empty(),
+            "no specific reason -> library supplies NoDerivableKey"
+        );
+        let shape = r.shape.expect("matched -> shape present");
+        assert!(!shape.has_vuk && !shape.has_media_key && !shape.has_unit_keys);
+    }
+
+    // Matched entry that DOES resolve: keys present, matched, empty miss path,
+    // and the shape reflects the stored unit keys.
+    #[test]
+    fn resolve_matched_with_stored_unit_keys_reports_keys_and_shape() {
+        let mut e = blank_entry(HASH);
+        e.unit_keys = vec![(1, [0xA0u8; 16])];
+        let db = db_with(e, Vec::new());
+        let r = KeydbSource::resolve_from(&db, &ctx(HASH, Vec::new(), None));
+        assert!(!r.keys.is_empty());
+        assert!(r.matched);
+        assert!(r.miss_path.is_empty());
+        let shape = r.shape.expect("matched -> shape");
+        assert!(shape.has_unit_keys);
+        assert_eq!(shape.unit_keys_len, 1);
     }
 
     // KAT (a): disc with terminal Unit Keys, no enc_title_keys. Stored
