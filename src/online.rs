@@ -1192,10 +1192,9 @@ mod tests {
         );
     }
 
-    // The decode POST records its reachability so the caller can classify a
-    // no-key from the REAL answer instead of firing a second empty probe: an
-    // HTTP answer (200/404/422) → `Status(code)`, a transport failure →
-    // `Transport`. This is the signal that removes autorip's redundant probe.
+    // The decode POST records its reachability so the caller classifies a
+    // no-key from the REAL answer, not a second empty probe: an HTTP answer
+    // (200/404/422) → `Status(code)`, a transport failure → `Transport`.
     #[test]
     fn interpret_reply_records_the_decode_reachability() {
         // A 200 with no entry — the service answered; record its status.
