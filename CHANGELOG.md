@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.7.4]
+
+### Fixed
+
+- keydb lookups now report match state and entry shape, so a "no entry" result tells you whether the disc was truly absent or matched-but-underivable (no usable VID) (#46).
+- ureq 3.4.2 with a bounded, rolling-idle reply body, so a slow-but-progressing download is no longer killed by an absolute deadline.
+
+### Maintenance
+
+- CI moved to the central reusable workflows.
+
 ## [1.7.3] — 2026-09-19
 
 ### Changed
