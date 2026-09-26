@@ -35,9 +35,7 @@ pub use libfreemkv::keysource::MIN_SAMPLE_UNITS;
 /// the client to OOM with an unbounded body.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-// ── SSRF guard — see docs/online-ssrf-guard.md ───────────────────────────────
-// is_blocked_ip: true when `ip` must never be an outbound key-service POST
-// target (loopback, link-local incl. cloud metadata, RFC1918, IPv4-mapped).
+// ── SSRF guard.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -154,9 +152,8 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     } else if let Some((h, p)) = authority.rsplit_once(':') {
         match p.parse::<u16>() {
             Ok(p) => (h.to_string(), p),
-            // A malformed port (e.g. `:notaport`) is an operator config typo,
-            // not a service outage — reject as `Config`, same as the
-            // bracketed-IPv6 branch above. See docs/online-guardfail.md.
+            // A malformed port (e.g. `:notaport`) is an operator config typo, not a service
+            // outage — reject as `Config`, same as the bracketed-IPv6 branch above.
             Err(_) => return Err((GuardFail::Config, "invalid port".into())),
         }
     } else {
@@ -254,9 +251,8 @@ pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
 // first 16 — each already validated by `resolve_and_guard`.
 const MAX_PINNED_ADDRS: usize = 16;
 
-// The pinned-address resolver behind `hardened_agent`. Must be wired via
-// `Agent::with_parts` — `new_with_config` silently keeps live DNS and
-// reopens the rebind window. See docs/online-ssrf-guard.md.
+// The pinned-address resolver behind `hardened_agent`. Must be wired via `Agent::with_parts` —
+// `new_with_config` silently keeps live DNS and reopens the rebind window.
 #[derive(Debug)]
 struct PinnedResolver(Vec<SocketAddr>);
 
@@ -299,13 +295,10 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
 pub struct OnlineSource {
     base_url: String,
     secret: String,
-    /// The last agent built, with the address set (sorted, deduped — an
-    /// order-insensitive SET KEY) it was pinned to. Reused only when a fresh
-    /// resolve + SSRF-guard of the host yields the identical address set, so
-    /// the anti-rebinding guarantee is untouched: only the pooled TLS
-    /// connection is reused, never a stale, un-reguarded address. See
-    /// docs/online-agent-cache.md for why this exists and why the key is a
-    /// set rather than an ordered sequence.
+    /// The last agent built, with the address set (sorted, deduped — an order-insensitive SET
+    /// KEY) it was pinned to. Reused only when a fresh resolve + SSRF-guard of the host yields
+    /// the identical address set, so the anti-rebinding guarantee is untouched: only the pooled
+    /// TLS connection is reused, never a stale, un-reguarded address.
     agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
 }
 
@@ -340,9 +333,8 @@ impl OnlineSource {
         agent
     }
 
-    // The server-resolved Unit Keys for this disc: one round-trip, returning
-    // a terminal `UK` or a `VUK` derived locally. `Ok`/`Err` draw the
-    // miss-vs-outage distinction — see docs/online-query-contract.md.
+    // The server-resolved Unit Keys for this disc: one round-trip, returning a terminal `UK` or
+    // a `VUK` derived locally. `Ok`/`Err` draw the miss-vs-outage distinction.
     fn query(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         // Reset the per-thread decode-reachability slot so it reflects ONLY this
         // query afterwards: `Some(..)` once a POST answers/transport-fails, `None`
@@ -352,9 +344,8 @@ impl OnlineSource {
         if self.base_url.is_empty() {
             return Ok(Vec::new());
         }
-        // Refuse to transmit over plaintext: the body carries base64 key
-        // material and, when configured, a replayable bearer token. `Err`,
-        // not `Ok(empty)` — see docs/online-query-guards.md.
+        // Refuse to transmit over plaintext: the body carries base64 key material and, when
+        // configured, a replayable bearer token. `Err`, not `Ok(empty)`
         if !self.base_url.starts_with("https://") {
             tracing::error!(
                 target: "freemkv::keysource",
@@ -365,9 +356,7 @@ impl OnlineSource {
             return Err(Error::KeyServiceUnavailable);
         }
         let mkb = ctx.mkb().unwrap_or(&[]);
-        // No-URL / bad-URL / over-cap-or-under-sampled draw three different
-        // verdicts — see docs/online-query-guards.md. Logged: a silent empty
-        // here reads as "no key", so the real cause (64 MiB cap) is surfaced.
+        // No-URL / bad-URL / over-cap-or-under-sampled draw three different verdicts.
         if mkb.len() > MAX_MKB_BYTES {
             tracing::warn!(
                 target: "freemkv::keysource",
@@ -422,8 +411,7 @@ impl OnlineSource {
         // time can't redirect the request to an internal/metadata host.
         let pinned = match resolve_and_guard(&self.base_url) {
             Ok(addrs) => addrs,
-            // Did-not-RESOLVE is the service unreachable, not a bad URL — see
-            // docs/online-guardfail.md.
+            // Did-not-RESOLVE is the service unreachable, not a bad URL.
             Err((GuardFail::Unreachable, _)) => {
                 // The host did not resolve — the service never answered, so this
                 // is a transport-class outcome for the decode-reachability slot
@@ -438,9 +426,8 @@ impl OnlineSource {
                 return Err(Error::KeyServiceUnavailable);
             }
             Err((GuardFail::Config, _)) => {
-                // Log THAT the URL was rejected, never WHY (the message names
-                // the address). `error!` + `Err`, not `Ok(empty)` — see
-                // docs/online-guardfail.md for the full rationale.
+                // Log THAT the URL was rejected, never WHY (the message names the address).
+                // `error!` + `Err`, not `Ok(empty)`
                 tracing::error!(
                     target: "freemkv::keysource",
                     phase = "keyserver_post",
@@ -683,9 +670,8 @@ fn interpret_reply(
 }
 
 impl KeySource for OnlineSource {
-    // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service
-    // answered with no key, `Err` means it could not answer — see
-    // docs/online-query-contract.md.
+    // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
+    // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         self.query(ctx)
     }
@@ -950,9 +936,8 @@ mod tests {
         assert_eq!(addrs[0].port(), 8080);
     }
 
-    // The pin is actually consulted (a mis-wired resolver fails OPEN to
-    // live DNS with no symptom — see docs/online-ssrf-guard.md): pin to a
-    // loopback listener, then ask for a `.test` host that CANNOT resolve.
+    // The pin is actually consulted: pin to a loopback listener, then ask for a `.test` host
+    // that CANNOT resolve.
     #[test]
     fn hardened_agent_connects_to_the_pinned_address_not_dns() {
         use std::io::Write as _;
@@ -1438,9 +1423,7 @@ mod tests {
         }
     }
 
-    // ── The pre-flight guards in `query` (nothing leaves the process) ──────
-    // See docs/online-preflight-guard-tests.md — why each guard's verdict
-    // differs and why `.test` is the discriminator host used below.
+    // ── The pre-flight guards in `query` (nothing leaves the process) ──────.
 
     /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
     struct GuardCtx {
@@ -1468,9 +1451,8 @@ mod tests {
         }
     }
 
-    // An `http://` key-service URL must never be POSTed to; the source
-    // refuses with `Err`, not an empty that reads as "no key" — see
-    // docs/online-query-guards.md.
+    // An `http://` key-service URL must never be POSTed to; the source refuses with `Err`, not
+    // an empty that reads as "no key".
     #[test]
     fn cleartext_http_url_is_refused_before_anything_is_sent() {
         let src = OnlineSource::new("http://keyserver.test/keys", "s3cr3t");
@@ -1562,8 +1544,7 @@ mod tests {
 
     // ── A bad port is CONFIG, not an outage ────────────────────────────────
 
-    // A typo'd port must be `Config`, not `Unreachable` — see
-    // docs/online-guardfail.md for why collapsing the two is the bug.
+    // A typo'd port must be `Config`, not `Unreachable`
     #[test]
     fn unparseable_port_is_a_config_fault_not_an_outage() {
         for url in [
@@ -1582,9 +1563,8 @@ mod tests {
         assert_eq!(addrs[0].port(), 8443);
     }
 
-    // The caller-visible half: a mistyped port must get `Err`, exactly like
-    // an outage (only the log text differs) — catches the `Ok(Vec::new())`
-    // regression from `GuardFail::Config` (docs/online-guardfail.md).
+    // The caller-visible half: a mistyped port must get `Err`, exactly like an outage (only the
+    // log text differs) — catches the `Ok(Vec::new())` regression from `GuardFail::Config`.
     #[test]
     fn query_with_a_mistyped_port_reports_a_failure_not_a_miss() {
         let src = OnlineSource::new("https://example.com:notaport/keys", "s3cr3t");
@@ -1721,9 +1701,8 @@ mod tests {
         assert!(src.get_unit_keys(&WhitespaceTitleCtx).is_err());
     }
 
-    // ── One agent per address set, not one per query ──────────────────────
-    // A round-robin keyserver reorders the SAME addresses; still the same
-    // set, so it must reuse the agent — see docs/online-agent-cache.md.
+    // ── One agent per address set, not one per query ────────────────────── A round-robin
+    // keyserver reorders the SAME addresses; still the same set, so it must reuse the agent.
     #[test]
     fn a_reordered_but_identical_address_set_reuses_the_agent() {
         let src = OnlineSource::new("https://keyserver.test/keys", "");
@@ -1753,9 +1732,8 @@ mod tests {
         );
     }
 
-    // An FMTS disc calls `query` twice per rip; the agent is reused only
-    // while the freshly guarded address set is IDENTICAL — see
-    // docs/online-agent-cache.md.
+    // An FMTS disc calls `query` twice per rip; the agent is reused only while the freshly
+    // guarded address set is IDENTICAL.
     #[test]
     fn the_agent_is_reused_per_address_set_only() {
         let src = OnlineSource::new("https://keyserver.test/keys", "");

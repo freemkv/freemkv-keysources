@@ -368,9 +368,7 @@ fn multi_source_real_keydb_resolves_through_chain() {
     );
 }
 
-// ── MultiSource: a source that could not ANSWER is not a source that said no ─
-// See docs/multi-source-failure-collapse.md — the Ok/Err collapse incident
-// this section's tests exist to catch.
+// ── MultiSource: a source that could not ANSWER is not a source that said no ─.
 
 /// A source that always fails, with a chosen error — the key-service outage.
 struct FailingSource {
@@ -398,8 +396,6 @@ fn unauthorized() -> libfreemkv::Error {
     libfreemkv::Error::KeyServiceUnauthorized
 }
 
-// See docs/multi-source-failure-collapse.md — must report FAILURE, not a
-// clean "no key", when no source holds a key and one could not answer.
 #[test]
 fn multi_source_reports_a_source_failure_instead_of_a_clean_no_key() {
     let multi = MultiSource::new(vec![

@@ -1,12 +1,10 @@
 //! `keydb.cfg` key source (source #1).
 //!
-//! Parses a local `keydb.cfg`, looks the disc up by hash, and derives the
-//! disc's terminal **Unit Keys** by composing libfreemkv's raw
-//! `aacs::derive` primitives — never re-implementing AES. The path mirrors
-//! the OLD candidate order EXACTLY, cheapest-first: per-disc Unit Keys, then
-//! VUK, then a Media Key (stored / PK pool / DK pool) via `derive_vuk`. See
-//! docs/keydb.md#candidate-order for the full path and VID rules. The
-//! library owns the crypto; this source owns only which primitive to call.
+//! Parses a local `keydb.cfg`, looks the disc up by hash, and derives the disc's terminal
+//! **Unit Keys** by composing libfreemkv's raw `aacs::derive` primitives — never
+//! re-implementing AES. The path mirrors the OLD candidate order EXACTLY, cheapest-first:
+//! per-disc Unit Keys, then VUK, then a Media Key (stored / PK pool / DK pool) via
+//! `derive_vuk`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -34,14 +32,12 @@ pub struct UpdateResult {
     pub bytes: usize,
 }
 
-// Widest observed granularity of a filesystem's stored mtime (HFS+, many
-// container/network filesystems record whole seconds); 2 s leaves rounding
-// room. See docs/keydb.md#settle-proof for CacheEntry::is_settled's argument.
+// Widest observed granularity of a filesystem's stored mtime (HFS+, many container/network
+// filesystems record whole seconds); 2 s leaves rounding room.
 const MTIME_GRANULARITY: std::time::Duration = std::time::Duration::from_secs(2);
 
-// The identity of the keydb file a cache entry was parsed from. `(len,
-// modified)` alone is not an identity (see docs/keydb.md#file-identity for
-// why); `dev`+`ino` plus CacheEntry::is_settled close the gap.
+// The identity of the keydb file a cache entry was parsed from. `(len, modified)` alone is not
+// an identity; `dev`+`ino` plus CacheEntry::is_settled close the gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     /// Filesystem device id. `0` where unavailable.
@@ -92,9 +88,9 @@ struct CacheEntry {
 }
 
 impl CacheEntry {
-    // Whether this entry's stamp can be TRUSTED to change if the file changes.
-    // Proof, cost, and the clock caveat are in docs/keydb.md#settle-proof;
-    // don't weaken this without re-reading them.
+    // Require a settled identity before reusing a cached parse: coarse mtimes can hide
+    // in-place edits within one timestamp tick. Missing/future mtimes use the age of
+    // the observation; inode identity detects atomic replacement.
     fn is_settled(&self, granularity: std::time::Duration) -> bool {
         match self
             .stamp
@@ -117,13 +113,10 @@ impl CacheEntry {
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 ///
-/// The parsed database is CACHED behind the file's identity stamp: a single
-/// AACS-cert rip calls `host_certs()`, the trait `host_certs(mkb)`, and
-/// `get_unit_keys`, and each used to re-read + re-parse the whole
-/// ~62 MiB file. A replaced keydb is picked up on the next call, with one
-/// narrow exception; see docs/keydb.md#keydbsource-cache for that exception
-/// and the memory-residency tradeoff — do not weaken [`FileStamp`] or
-/// [`CacheEntry::is_settled`] without re-reading it.
+/// The parsed database is CACHED behind the file's identity stamp: a single AACS-cert rip calls
+/// `host_certs()`, the trait `host_certs(mkb)`, and `get_unit_keys`, and each used to re-read +
+/// re-parse the whole ~62 MiB file. A replaced keydb is picked up on the next call, with one
+/// narrow exception.
 pub struct KeydbSource {
     path: PathBuf,
     // Mutex, not RwLock: the guarded section is a stamp compare + Arc clone,
@@ -134,9 +127,8 @@ pub struct KeydbSource {
     // cache from a test, since timing is flaky and the parsed value is
     // identical either way.
     parses: AtomicUsize,
-    // The `G` of CacheEntry::is_settled, as a field so tests can isolate the
-    // two staleness discriminators one at a time (0 vs. a huge duration). See
-    // docs/keydb.md#test-two-discriminators.
+    // The `G` of CacheEntry::is_settled, as a field so tests can isolate the two staleness
+    // discriminators one at a time (0 vs. a huge duration).
     mtime_granularity: std::time::Duration,
     // Corruption summaries emitted (see emit_parse_stats). Same rationale as
     // `parses`: avoids pulling a `tracing` subscriber into dev-dependencies.
@@ -179,9 +171,8 @@ impl KeydbSource {
         self
     }
 
-    // The parsed keydb, from cache when unchanged (errors mirror KeyDb::load).
-    // ONE OPEN, ONE IDENTITY: stamp (fstat) and bytes share one handle. See
-    // docs/keydb.md#cached-db-one-open for why a separate metadata()+load() pair was unsound.
+    // The parsed keydb, from cache when unchanged (errors mirror KeyDb::load). ONE OPEN, ONE
+    // IDENTITY: stamp (fstat) and bytes share one handle.
     fn cached_db(&self) -> std::io::Result<Arc<KeyDb>> {
         let file = std::fs::File::open(&self.path)?;
         let stamp = FileStamp::of(&file.metadata()?);
@@ -239,9 +230,9 @@ impl KeydbSource {
         self.parses.load(Ordering::Relaxed)
     }
 
-    // Turn a KeyDb::load failure into this source's verdict: MISSING is the
-    // documented benign case (Ok/None); everything else is logged and
-    // surfaced as an error, not silently reported as "no key". See docs/keydb.md#load-failure.
+    // Turn a KeyDb::load failure into this source's verdict: MISSING is the documented benign
+    // case (Ok/None); everything else is logged and surfaced as an error, not silently reported
+    // as "no key".
     fn load_failure(&self, e: &std::io::Error) -> Option<Error> {
         match e.kind() {
             std::io::ErrorKind::NotFound => None,
@@ -291,8 +282,8 @@ impl KeydbSource {
         let entries = text
             .lines()
             // Mirror KeyDb::parse by running the same parsers, not a prefix check: a
-            // right-prefix row with bad hex / short cert parses to nothing, so a prefix
-            // count let junk past `entries > 0`. See docs/keydb.md#save-mirror-parse.
+            // right-prefix row with bad hex / short cert parses to nothing, so a prefix count
+            // let junk past `entries > 0`.
             .filter(|l| crate::keydb_format::is_parseable_entry_line(l))
             .count();
 
@@ -349,9 +340,8 @@ impl KeydbSource {
         }
     }
 
-    // Terminal Unit Keys for this disc from a parsed keydb; empty Vec = none.
-    // CPS numbering (idx = num - 1): docs/keydb.md#unit-keys-from. Thin wrapper
-    // over [`resolve_from`] for callers that want only the keys (pure, no I/O).
+    // Return terminal Unit Keys from a parsed keydb without I/O.
+    // CPS unit numbers are one-based; the returned vector uses zero-based indexes.
     fn unit_keys_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
         Self::resolve_from(db, ctx).keys
     }
@@ -360,17 +350,15 @@ impl KeydbSource {
     // keyless match — WHY nothing derived, so a matched-but-underivable disc is
     // never reported as a flat "no entry" (issue #46). Pure (no I/O).
     fn resolve_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> KeydbResolution {
-        // Per-disc hit (most specific); find_disc normalizes the hash form.
-        // Without a match there is no per-disc anchor, so the global PK/DK
-        // pools are never consulted. See docs/keydb.md#unit-keys-per-disc-hit.
+        // Per-disc hit (most specific); find_disc normalizes the hash form. Without a match
+        // there is no per-disc anchor, so the global PK/DK pools are never consulted.
         let entries_loaded = db.disc_entries.len();
         let Some(entry) = db.find_disc(ctx.disc_hash()) else {
             return KeydbResolution::miss(entries_loaded);
         };
 
-        // UNION every source of terminal keys, then dedup — never first-hit,
-        // since a stored `unit_keys` list can be PARTIAL while the VUK boils
-        // every declared unit. See docs/keydb.md#unit-keys-union.
+        // UNION every source of terminal keys, then dedup — never first-hit, since a stored
+        // `unit_keys` list can be PARTIAL while the VUK boils every declared unit.
         let mut keys: Vec<UnitKey> = Vec::new();
 
         // 1. Terminal Unit Keys stored in the entry — directly usable, no
@@ -406,8 +394,7 @@ impl KeydbSource {
         let mut miss_reason: Option<KeyNode> = None;
 
         if !enc_title_keys.is_empty() {
-            // VUK path, else MK path (stored/PK/DK) → VUK. See
-            // docs/keydb.md#unit-keys-vuk-or-mk for the VID rules.
+            // VUK path, else MK path (stored/PK/DK) → VUK.
             let derived = if let Some(vuk) = entry.vuk {
                 uks_from_vuk(&vuk, enc_title_keys)
             } else {
@@ -545,9 +532,8 @@ fn extract_zip(data: &[u8]) -> Result<String, Error> {
     Err(Error::KeydbInvalid)
 }
 
-// Write `text` to `path` crash-safely (temp file, fsync, atomic rename) so an
-// interrupted update never leaves a half-written keydb. See
-// docs/keydb.md#write-atomic for the fsync-before-rename argument.
+// Write `text` to `path` crash-safely (temp file, fsync, atomic rename) so an interrupted
+// update never leaves a half-written keydb.
 fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
     let werr = || Error::KeydbWrite {
         path: path.display().to_string(),
@@ -607,9 +593,8 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
 }
 
 impl KeySource for KeydbSource {
-    // Resolve this disc's base per-CPS-unit Unit Keys from the keydb. A
-    // MISSING keydb yields no keys (Ok(empty)); an UNUSABLE one is a source
-    // failure (Err) — never conflated. See docs/keydb.md#get-unit-keys-trait.
+    // Resolve this disc's base per-CPS-unit Unit Keys from the keydb. A MISSING keydb yields no
+    // keys (Ok(empty)); an UNUSABLE one is a source failure (Err) — never conflated.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
         match self.cached_db() {
             Ok(db) => Ok(Self::unit_keys_from(&db, ctx)),
@@ -646,9 +631,8 @@ impl KeySource for KeydbSource {
         }
     }
 
-    // Expose the keydb's host certs through the trait, wiring the disc's MKB
-    // generation through for revocation filtering. See
-    // docs/keydb.md#host-certs-trait.
+    // Expose the keydb's host certs through the trait, wiring the disc's MKB generation through
+    // for revocation filtering.
     fn host_certs(&self, mkb: Option<u32>) -> Vec<HostCert> {
         match self.cached_db() {
             Ok(db) => db.host_certs(mkb),
@@ -674,9 +658,8 @@ mod tests {
     #[cfg(unix)]
     const PINNED_MTIME: &str = "202601011200.00";
 
-    // Force a file's mtime to PINNED_MTIME so two different files can be
-    // made bit-identical to a (len, mtime) stamp on purpose, rather than
-    // hoping the filesystem produces that case. See docs/keydb.md#test-pinned-mtime.
+    // Force a file's mtime to PINNED_MTIME so two different files can be made bit-identical to
+    // a (len, mtime) stamp on purpose, rather than hoping the filesystem produces that case.
     #[cfg(unix)]
     fn pin_mtime(p: &std::path::Path) {
         let ok = std::process::Command::new("touch")
@@ -765,9 +748,8 @@ mod tests {
         }
     }
 
-    // The committed (cps, key) pairs resolve_and_apply derives from a
-    // source's Unit Keys (idx -> idx + 1). KATs compare against THIS. See
-    // docs/keydb.md#test-committed.
+    // The committed (cps, key) pairs resolve_and_apply derives from a source's Unit Keys (idx
+    // -> idx + 1). KATs compare against THIS.
     fn committed(uks: &[UnitKey]) -> Vec<(u32, [u8; 16])> {
         uks.iter()
             .map(|u| (u.idx.saturating_add(1), u.key))
@@ -854,9 +836,8 @@ mod tests {
         assert_eq!(shape.unit_keys_len, 1);
     }
 
-    // KAT (a): disc with terminal Unit Keys, no enc_title_keys. Stored
-    // terminal unit keys are returned with CPS numbering preserved. See
-    // docs/keydb.md#test-kat-a.
+    // KAT (a): disc with terminal Unit Keys, no enc_title_keys. Stored terminal unit keys are
+    // returned with CPS numbering preserved.
     #[test]
     fn kat_a_disc_with_unit_keys_is_terminal_and_preserves_cps_numbering() {
         let mut e = blank_entry(HASH);
@@ -889,9 +870,8 @@ mod tests {
         assert_eq!(committed(&got), vec![(1u32, [0xA0u8; 16])]);
     }
 
-    // Orphan-unit completeness (the real keydb bug): a PARTIAL stored list
-    // plus a VUK that boils BOTH declared units must return BOTH, not shadow
-    // the VUK with the partial list. See docs/keydb.md#test-orphan-union.
+    // Orphan-unit completeness (the real keydb bug): a PARTIAL stored list plus a VUK that
+    // boils BOTH declared units must return BOTH, not shadow the VUK with the partial list.
     #[test]
     fn union_partial_stored_plus_vuk_yields_all_declared_units() {
         let vuk = [0x5Au8; 16];
@@ -945,9 +925,8 @@ mod tests {
         );
     }
 
-    // KAT (c): MK + physical (unlock) VID derives MK -> VUK -> UK. The
-    // PHYSICAL VID must win over the keydb's stored VID. See
-    // docs/keydb.md#test-kat-c.
+    // KAT (c): MK + physical (unlock) VID derives MK -> VUK -> UK. The PHYSICAL VID must win
+    // over the keydb's stored VID.
     #[test]
     fn kat_c_disc_with_mk_uses_physical_vid_over_keydb_vid() {
         let mk = [0x77u8; 16];
@@ -1031,9 +1010,8 @@ mod tests {
         rec
     }
 
-    // KAT (f): disc with NO per-disc MK, resolved via the keydb PK pool
-    // (PK -> MK -> VUK -> UK) with a known-answer MKB/PK construction. See
-    // docs/keydb.md#test-kat-f.
+    // KAT (f): disc with NO per-disc MK, resolved via the keydb PK pool (PK -> MK -> VUK -> UK)
+    // with a known-answer MKB/PK construction.
     #[test]
     fn kat_f_disc_with_pk_pool_yields_uks() {
         // Planted PK and the MK it resolves to (see libfreemkv boil.rs KAT).
@@ -1246,9 +1224,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Caching: the 62 MiB / 181k-entry keydb is parsed ONCE. A single
-    // AACS-cert rip drives this source at least three times; the mtime is
-    // pinned into the PAST first, since an entry is only trusted once settled. See docs/keydb.md#test-repeated-lookups.
+    // Caching: the 62 MiB / 181k-entry keydb is parsed ONCE. A single AACS-cert rip drives this
+    // source at least three times; the mtime is pinned into the PAST first, since an entry is
+    // only trusted once settled.
     #[cfg(unix)]
     #[test]
     fn repeated_lookups_parse_the_keydb_once() {
@@ -1277,9 +1255,8 @@ mod tests {
         );
     }
 
-    // The cache must not go stale: a keydb replaced UNDERNEATH the source has
-    // a different size/mtime stamp and must be re-read. See
-    // docs/keydb.md#test-changed-keydb.
+    // The cache must not go stale: a keydb replaced UNDERNEATH the source has a different
+    // size/mtime stamp and must be re-read.
     #[test]
     fn a_changed_keydb_file_is_reparsed() {
         let dir = scratch("cache-stamp");
@@ -1306,9 +1283,9 @@ mod tests {
         assert_eq!(src.parse_count(), 2, "one parse per distinct file");
     }
 
-    // Two stale-cache discriminators, tested ONE AT A TIME (each test
-    // disables the other via `mtime_granularity`). Discriminator 1, the
-    // inode: an ATOMIC RENAME must be re-read even with identical length and mtime. See docs/keydb.md#test-inode-rename.
+    // Two stale-cache discriminators, tested ONE AT A TIME (each test disables the other via
+    // `mtime_granularity`). Discriminator 1, the inode: an ATOMIC RENAME must be re-read even
+    // with identical length and mtime.
     #[cfg(unix)]
     #[test]
     fn a_same_length_same_mtime_rename_is_still_re_read() {
@@ -1343,9 +1320,8 @@ mod tests {
         assert_eq!(src.parse_count(), 2, "the replacement must be re-parsed");
     }
 
-    // Discriminator 2, the settle window: a keydb rewritten IN PLACE (same
-    // inode/length, mtime forced back) must still be re-read while too young
-    // to trust. See docs/keydb.md#test-inplace-rewrite.
+    // Discriminator 2, the settle window: a keydb rewritten IN PLACE (same inode/length, mtime
+    // forced back) must still be re-read while too young to trust.
     #[cfg(unix)]
     #[test]
     fn an_in_place_rewrite_under_an_unsettled_stamp_is_still_re_read() {
@@ -1389,9 +1365,8 @@ mod tests {
         );
     }
 
-    // A corrupt-but-parseable keydb must keep saying so on EVERY hit, not
-    // just the parse that produced the summary (a cache hit skips `parse`).
-    // See docs/keydb.md#test-corrupt-warns.
+    // A corrupt-but-parseable keydb must keep saying so on EVERY hit, not just the parse that
+    // produced the summary (a cache hit skips `parse`).
     #[cfg(unix)]
     #[test]
     fn a_corrupt_keydb_warns_on_every_lookup_not_only_on_the_parse() {
@@ -1429,9 +1404,8 @@ mod tests {
         );
     }
 
-    // A HEALTHY keydb must stay silent — the re-emission above must not turn
-    // into a per-lookup log line for every operator with an intact file. See
-    // docs/keydb.md#test-healthy-silent.
+    // A HEALTHY keydb must stay silent — the re-emission above must not turn into a per-lookup
+    // log line for every operator with an intact file.
     #[cfg(unix)]
     #[test]
     fn a_healthy_keydb_warns_on_no_lookup() {
@@ -1455,9 +1429,8 @@ mod tests {
         );
     }
 
-    // The cost side of the settle rule, asserted as a decision: a keydb
-    // written just now is re-read on every lookup until quiet for the
-    // granularity. See docs/keydb.md#test-fresh-not-trusted.
+    // The cost side of the settle rule, asserted as a decision: a keydb written just now is
+    // re-read on every lookup until quiet for the granularity.
     #[test]
     fn a_freshly_written_keydb_is_not_trusted_from_cache() {
         let dir = scratch("cache-fresh");
@@ -1486,9 +1459,8 @@ mod tests {
         );
     }
 
-    // `save()` replaces the very file this source reads, so it drops the
-    // cached parse ITSELF rather than trusting the (size, mtime) stamp — the
-    // one change the stamp cannot see. See docs/keydb.md#test-save-invalidates.
+    // `save()` replaces the very file this source reads, so it drops the cached parse ITSELF
+    // rather than trusting the (size, mtime) stamp — the one change the stamp cannot see.
     #[cfg(unix)]
     #[test]
     fn save_invalidates_the_cache_even_when_the_file_stamp_is_unchanged() {
@@ -1522,9 +1494,8 @@ mod tests {
         );
     }
 
-    // A corrupt keydb is a source FAILURE, not "this disc has no key": both
-    // used to collapse into Ok(Vec::new()) with ZERO tracing. Only a MISSING
-    // file is genuinely benign. See docs/keydb.md#test-corrupt-is-error.
+    // A corrupt keydb is a source FAILURE, not "this disc has no key": both used to collapse
+    // into Ok(Vec::new()) with ZERO tracing. Only a MISSING file is genuinely benign.
     #[test]
     fn a_corrupt_keydb_is_an_error_not_an_empty_answer() {
         let dir = scratch("corrupt");

@@ -5,8 +5,6 @@
 //! logic is identical; the only deviation is [`KeyDb::load`], which returns a
 //! standalone [`std::io::Result`] here instead of `libfreemkv::error::Result`
 //! (so the format crate carries no dependency on libfreemkv's error type).
-//
-// See docs/keydb-format.md — why the full parser API (incl. dead_code items) is retained.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -49,9 +47,7 @@ pub struct KeyDb {
     pub disc_entries: HashMap<Arc<str>, DiscEntry>,
 }
 
-// Key material must never leak via `{:?}`; both types below carry raw AACS
-// key bytes. See docs/keydb-format.md for why these hand-write a redacting
-// `Debug` instead of deriving it. Pinned by `keydb_debug_is_redacted` / `disc_entry_debug_is_redacted`.
+// Key material must never leak via `{:?}`; both types below carry raw AACS key bytes.
 
 impl std::fmt::Debug for KeyDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,9 +169,7 @@ pub(crate) fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     libfreemkv::hex::parse_hex_fixed::<20>(s)
 }
 
-// What `KeyDb::parse` threw away, by reason. See docs/keydb-format.md — why
-// this counter exists (silent corruption on a third-party keydb) and why
-// it's logged once per parse rather than per-line.
+// What `KeyDb::parse` threw away, by reason.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParseStats {
     /// `| DK` rows that parsed as neither a positioned nor an orphan device key.
@@ -233,13 +227,12 @@ pub(crate) fn is_disc_entry_line(line: &str) -> bool {
     (line.starts_with("0x") || line.starts_with("0X")) && line.contains(" = ")
 }
 
-/// True when `line` is a row `KeyDb::parse` would actually ACCEPT into the db —
-/// a disc row OR a DK/PK/HC/HC2 row that its real parser accepts, not merely one
-/// carrying the right `| XX` prefix. `KeydbSource::save`'s "won't persist
-/// unparseable content" guard counts entries with THIS, so a syntactically
-/// prefixed but malformed DK/PK/HC row (right prefix, bad hex/short cert) can no
-/// longer inflate the entry count past the `entries > 0` check. Mirrors the
-/// dispatch in [`KeyDb::parse_counted`] exactly. See docs/keydb.md#save-mirror-parse.
+/// True when `line` is a row `KeyDb::parse` would actually ACCEPT into the db — a disc row OR a
+/// DK/PK/HC/HC2 row that its real parser accepts, not merely one carrying the right `| XX`
+/// prefix. `KeydbSource::save`'s "won't persist unparseable content" guard counts entries with
+/// THIS, so a syntactically prefixed but malformed DK/PK/HC row (right prefix, bad hex/short
+/// cert) can no longer inflate the entry count past the `entries > 0` check. Mirrors the
+/// dispatch in [`KeyDb::parse_counted`] exactly.
 pub(crate) fn is_parseable_entry_line(line: &str) -> bool {
     let line = line.trim();
     if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
@@ -412,9 +405,7 @@ impl KeyDb {
         Ok(db)
     }
 
-    // `Self::load` from an ALREADY-OPEN file, without the log. See
-    // docs/keydb-format.md — why the same descriptor must supply both the
-    // identity stamp and the bytes, and why rejection counts are retained here.
+    // `Self::load` from an ALREADY-OPEN file, without the log.
     pub(crate) fn load_counted(
         f: std::fs::File,
         path: &std::path::Path,
@@ -529,9 +520,6 @@ impl KeyDb {
     /// line per disc entry (sorted by hash). `parse(to_keydb_cfg(kd))` reproduces
     /// every field (see `round_trips_through_parse`). Used by the key-import tool
     /// to export a complete keydb.cfg (keys + host certs + VIDs).
-    ///
-    /// See docs/keydb-format.md for why the trailing `; <comment>` is only
-    /// emitted after a `U` (unit-keys) field.
     pub fn to_keydb_cfg(&self) -> String {
         fn hx(b: &[u8]) -> String {
             use std::fmt::Write;
@@ -784,7 +772,6 @@ impl KeyDb {
         let is_uhd = comment.contains("(UHD)");
 
         // Title kept VERBATIM (trimmed), a faithful copy for exact round-trip.
-        // See docs/keydb-format.md — why display prettification does NOT belong here.
         let before_fields = rest.split(" | ").next().unwrap_or("");
         // A title-only entry (no key fields) carries its `;` comment on the same
         // chunk — strip it so the comment doesn't leak into the title.
@@ -968,9 +955,8 @@ mod tests {
         assert_eq!(b.host_certs[0].revoked_at_mkb, Some(72));
     }
 
-    // REAL-DATA IDEMPOTENCE: parse → serialize (S1) → parse → serialize (S2);
-    // S1 must equal S2 byte-for-byte. REQUIRES a real keydb (KEYDB_PATH env);
-    // `#[ignore]` by default. See docs/keydb-format.md.
+    // REAL-DATA IDEMPOTENCE: parse → serialize (S1) → parse → serialize (S2); S1 must equal S2
+    // byte-for-byte. REQUIRES a real keydb (KEYDB_PATH env); `#[ignore]` by default.
     #[test]
     #[ignore = "needs a real keydb.cfg: KEYDB_PATH=<path> cargo test -- --ignored"]
     fn to_keydb_cfg_is_idempotent_on_real_keydb() {
@@ -1028,8 +1014,6 @@ mod tests {
     }
 
     // The real keydb for the `#[ignore]`d real-scale tests, or a LOUD failure.
-    // See docs/keydb-format.md — why silent `return` on a missing fixture is
-    // wrong here.
     fn real_keydb_path() -> std::path::PathBuf {
         keydb_path().expect(
             "KEYDB_PATH must point at a real keydb.cfg; run: \
@@ -1234,9 +1218,8 @@ mod tests {
         );
     }
 
-    // `load_counted` must read the HANDLE it was given, never re-resolve the
-    // path (identity stamp + bytes must match). See docs/keydb-format.md.
-    // With the path already replaced, the handle's contents must still win.
+    // `load_counted` must read the HANDLE it was given, never re-resolve the path (identity
+    // stamp + bytes must match).
     #[cfg(unix)]
     #[test]
     fn load_counted_reads_the_handle_not_the_path() {
@@ -1367,9 +1350,9 @@ mod tests {
         );
     }
 
-    // The SIBLING type: `KeyDb`'s hand-written `Debug` protects the whole-db
-    // rendering only; `{:?}` on one `KeydbHostCert` element walks a different
-    // path carrying the AACS host PRIVATE key. See docs/keydb-format.md.
+    // The SIBLING type: `KeyDb`'s hand-written `Debug` protects the whole-db rendering only;
+    // `{:?}` on one `KeydbHostCert` element walks a different path carrying the AACS host
+    // PRIVATE key.
     #[test]
     fn host_cert_debug_is_redacted_including_the_sibling_wrapper() {
         let hc = KeydbHostCert {
@@ -2336,8 +2319,8 @@ mod tests {
         );
     }
 
-    // KEYDB-parser integration tests relocated from libfreemkv; exercise the
-    // parser end-to-end against a real keydb.cfg. See docs/keydb-format.md.
+    // KEYDB-parser integration tests relocated from libfreemkv; exercise the parser end-to-end
+    // against a real keydb.cfg.
 
     /// REQUIRES a real keydb; `#[ignore]` by default. Run with:
     /// `KEYDB_PATH=/path/to/keydb.cfg cargo test --release -- --ignored`.
@@ -2437,8 +2420,6 @@ mod tests {
         }
 
         // Reaching here is the EXPECTED outcome for this AACS 2.0 (BEE) sample.
-        // See docs/keydb-format.md for why "no key worked" alone would be an
-        // unusable assertion, and what is asserted instead.
         assert!(attempts > 0, "no unit key was tried at all");
         assert!(
             any_key_changed_the_unit,

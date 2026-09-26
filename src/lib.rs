@@ -1,11 +1,10 @@
 //! Pluggable AACS key sources for libfreemkv.
 //!
-//! libfreemkv owns the AACS crypto; this crate provides [`KeySource`] impls
-//! that look a disc up and drive the boil-down primitives to terminal Unit
-//! Keys: [`KeydbSource`] (local `keydb.cfg`) and [`OnlineSource`] (remote key
-//! service). Applications choose and order sources, then resolve and hand
-//! the key to `Disc::decrypt_with`; compose several with [`MultiSource`].
-//! See docs/lib-scope.md for the mechanism-vs-policy split with libfreemkv.
+//! libfreemkv owns the AACS crypto; this crate provides [`KeySource`] impls that look a disc up
+//! and drive the boil-down primitives to terminal Unit Keys: [`KeydbSource`] (local
+//! `keydb.cfg`) and [`OnlineSource`] (remote key service). Applications choose and order
+//! sources, then resolve and hand the key to `Disc::decrypt_with`; compose several with
+//! [`MultiSource`].
 
 mod keydb;
 /// The `keydb.cfg` parser (`KeyDb`, `DiscEntry`, …). Public: parsing the keydb
@@ -42,13 +41,11 @@ pub(crate) fn uks_from_vuk(vuk: &[u8; 16], enc_title_keys: &[[u8; 16]]) -> Vec<U
 
 /// An ordered composition of key sources, driven as one.
 ///
-/// [`MultiSource::get_unit_keys`] tries each inner source in order and
-/// returns the first non-empty Unit Key set (and
-/// [`MultiSource::get_fmts_indexes`] does the same for the forensic set). The
-/// caller supplies the list AND the order — local-first `[Keydb, Online]`,
-/// online-first `[Online, Keydb]`, etc. `MultiSource` is itself a
-/// [`KeySource`], so it nests and composes. See docs/lib-scope.md for the
-/// `Err`-vs-`Ok(empty)` failure contract.
+/// [`MultiSource::get_unit_keys`] tries each inner source in order and returns the first
+/// non-empty Unit Key set (and [`MultiSource::get_fmts_indexes`] does the same for the forensic
+/// set). The caller supplies the list AND the order — local-first `[Keydb, Online]`,
+/// online-first `[Online, Keydb]`, etc. `MultiSource` is itself a [`KeySource`], so it nests
+/// and composes.
 pub struct MultiSource {
     sources: Vec<Box<dyn KeySource>>,
 }
@@ -60,9 +57,9 @@ impl MultiSource {
     }
 }
 
-// Drive `sources` in order, returning the first non-empty result and
-// preserving Ok/Err when nothing resolves. `get` selects the trait method so
-// the base and forensic paths share one implementation. See docs/lib-scope.md.
+// Drive `sources` in order, returning the first non-empty result and preserving Ok/Err when
+// nothing resolves. `get` selects the trait method so the base and forensic paths share one
+// implementation.
 fn first_non_empty(
     sources: &[Box<dyn KeySource>],
     get: impl Fn(&dyn KeySource, &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error>,

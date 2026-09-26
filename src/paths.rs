@@ -4,9 +4,8 @@
 //! just reads a handed-in path. This module gives the *search* list (first
 //! existing wins) and the single *default* write location.
 //!
-//! freemkv is portable: `keydb.cfg` lives next to the exe —
-//! `<dir of current exe>/keydb.cfg` — with no OS config-dir fallback.
-//! `--keydb PATH` bypasses this module. See docs/paths.md for rationale.
+//! freemkv is portable: `keydb.cfg` lives next to the exe — `<dir of current exe>/keydb.cfg` —
+//! with no OS config-dir fallback. `--keydb PATH` bypasses this module.
 
 use std::path::PathBuf;
 
