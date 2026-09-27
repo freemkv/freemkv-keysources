@@ -16,10 +16,11 @@ mod paths;
 
 pub use keydb::{KeydbSource, UpdateResult};
 pub use keydb_format::{DiscEntry, KeyDb};
+#[cfg(feature = "test-hooks")]
+pub use online::set_last_decode_reachability;
 pub use online::{
     DecodeReachability, KeyserverUrlFault, KeyserverUrlRejection, MIN_SAMPLE_UNITS, OnlineSource,
-    check_keyserver_url, set_last_decode_reachability, take_last_decode_reachability,
-    validate_keyserver_url,
+    check_keyserver_url, take_last_decode_reachability, validate_keyserver_url,
 };
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 

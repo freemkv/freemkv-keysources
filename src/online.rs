@@ -248,6 +248,7 @@ pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
 
 /// Whether a rejected key-service URL can start working without a config change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyserverUrlFault {
     /// Bad scheme, host or port, or a non-public address: retrying changes nothing.
     Permanent,
@@ -257,6 +258,7 @@ pub enum KeyserverUrlFault {
 
 /// Why [`check_keyserver_url`] rejected a URL; `message` is [`validate_keyserver_url`]'s text.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyserverUrlRejection {
     pub fault: KeyserverUrlFault,
     pub message: String,
@@ -333,7 +335,8 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
         // a body deadline a stalled reply hangs the POST forever. The JSON key
         // answer arrives in one read, so a TOTAL cap is the right shape here.
         .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_SECS)))
-        // Never the env proxy: a proxy re-resolves the host, bypassing the guarded pin.
+        // Never the env proxy: PinnedResolver would also answer the proxy's lookup with the key
+        // service's address, so with HTTP(S)_PROXY/ALL_PROXY set every key lookup failed to connect.
         .proxy(None)
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
@@ -543,8 +546,9 @@ pub fn take_last_decode_reachability() -> Option<DecodeReachability> {
     LAST_DECODE_REACHABILITY.with(std::cell::Cell::take)
 }
 
-/// Set this thread's decode-reachability slot, as a real decode POST would. A test hook: lets a
-/// caller exercise its [`take_last_decode_reachability`] handling without a network or DNS.
+/// Set this thread's decode-reachability slot, as a real decode POST would. Test hook (feature
+/// `test-hooks`): lets a caller test its [`take_last_decode_reachability`] handling offline.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn set_last_decode_reachability(outcome: Option<DecodeReachability>) {
     LAST_DECODE_REACHABILITY.with(|c| c.set(outcome));
 }
@@ -1048,8 +1052,8 @@ mod tests {
         );
     }
 
-    // ureq 3 defaults to `Proxy::try_from_env()`; a proxy re-resolves the host itself, so the
-    // pinned, SSRF-guarded addresses would be bypassed. Checked in a child so no test mutates env.
+    // ureq 3 defaults to `Proxy::try_from_env()`; PinnedResolver would send the proxy connection to
+    // the key service's address, failing every lookup. Checked in a child so no test mutates env.
     #[test]
     fn the_key_service_agent_never_uses_an_environment_proxy() {
         const CHILD: &str = "FMKV_KS_PROXY_CHILD";
@@ -1110,6 +1114,13 @@ mod tests {
         assert_eq!(r.message, "DNS resolution timed out");
         let c = KeyserverUrlRejection::from((GuardFail::Config, "URL has no host".into()));
         assert_eq!(c.fault, KeyserverUrlFault::Permanent);
+    }
+
+    // RFC 6761: `.invalid` never resolves, so the lookup fails (or times out) either way.
+    #[test]
+    fn an_unresolvable_host_is_a_temporary_rejection() {
+        let r = check_keyserver_url("https://nonexistent.invalid/").unwrap_err();
+        assert_eq!(r.fault, KeyserverUrlFault::Temporary, "{r}");
     }
 
     // Callers test their verdict mapping with the hook instead of a real DNS lookup.

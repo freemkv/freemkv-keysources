@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- The online key service ignores `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`: with one set, every key lookup failed to connect (the pinned resolver also answered the proxy's address).
+
+### Added
+
+- `check_keyserver_url` with `KeyserverUrlRejection`/`KeyserverUrlFault`: a typed Permanent vs Temporary verdict, so callers need not match `validate_keyserver_url`'s text.
+- `test-hooks` feature exposing `set_last_decode_reachability`, to test decode-verdict handling without a network.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance
