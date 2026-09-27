@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- The online key service ignores `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`: with one set, every key lookup failed to connect (the pinned resolver also answered the proxy's address).
+- The online key service ignores `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`: with one set, every key lookup failed (the pinned resolver also answered the proxy's address, so the proxy request went to the key service).
 
 ### Added
 

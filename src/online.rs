@@ -336,7 +336,7 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
         // answer arrives in one read, so a TOTAL cap is the right shape here.
         .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_SECS)))
         // Never the env proxy: PinnedResolver would also answer the proxy's lookup with the key
-        // service's address, so with HTTP(S)_PROXY/ALL_PROXY set every key lookup failed to connect.
+        // service's address, so with HTTP(S)_PROXY/ALL_PROXY set every key lookup failed.
         .proxy(None)
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
@@ -1105,22 +1105,20 @@ mod tests {
 
     #[test]
     fn a_failed_lookup_is_a_temporary_rejection() {
-        let r = KeyserverUrlRejection::from((
-            GuardFail::Unreachable,
-            "DNS resolution timed out".into(),
-        ));
-        assert_eq!(r.fault, KeyserverUrlFault::Temporary);
-        assert!(r.is_temporary());
-        assert_eq!(r.message, "DNS resolution timed out");
+        // Offline: every GuardFail::Unreachable reason resolve_and_guard produces.
+        for msg in [
+            "DNS resolution timed out",
+            "could not resolve host: failed to lookup address information",
+            "host did not resolve to any address",
+            "too many concurrent DNS resolutions in flight for this host",
+        ] {
+            let r = KeyserverUrlRejection::from((GuardFail::Unreachable, msg.to_string()));
+            assert_eq!(r.fault, KeyserverUrlFault::Temporary, "{msg}");
+            assert!(r.is_temporary());
+            assert_eq!(r.message, msg);
+        }
         let c = KeyserverUrlRejection::from((GuardFail::Config, "URL has no host".into()));
         assert_eq!(c.fault, KeyserverUrlFault::Permanent);
-    }
-
-    // RFC 6761: `.invalid` never resolves, so the lookup fails (or times out) either way.
-    #[test]
-    fn an_unresolvable_host_is_a_temporary_rejection() {
-        let r = check_keyserver_url("https://nonexistent.invalid/").unwrap_err();
-        assert_eq!(r.fault, KeyserverUrlFault::Temporary, "{r}");
     }
 
     // Callers test their verdict mapping with the hook instead of a real DNS lookup.
