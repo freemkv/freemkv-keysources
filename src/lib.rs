@@ -20,7 +20,8 @@ pub use keydb_format::{DiscEntry, KeyDb};
 pub use online::set_last_decode_reachability;
 pub use online::{
     DecodeReachability, KeyserverUrlFault, KeyserverUrlRejection, MIN_SAMPLE_UNITS, OnlineSource,
-    check_keyserver_url, take_last_decode_reachability, validate_keyserver_url,
+    check_keyserver_url, check_keyserver_url_static, take_last_decode_reachability,
+    validate_keyserver_url,
 };
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 
@@ -149,6 +150,23 @@ impl KeySource for MultiSource {
     fn label(&self) -> &'static str {
         "multi"
     }
+
+    // KU3-6: depends on samples if ANY inner source does, so a nested
+    // sample-dependent source keeps getting the per-piece ask.
+    fn answer_depends_on_samples(&self) -> bool {
+        self.sources.iter().any(|s| s.answer_depends_on_samples())
+    }
+
+    // Same `any(inner)` rule (KU-K1 review): `resolve` retries the composition
+    // whenever any inner source's last failure was transport-class.
+    fn last_failure_was_transport(&self) -> bool {
+        self.sources.iter().any(|s| s.last_failure_was_transport())
+    }
+
+    // KU J23: any inner source that consumes the VID makes the composition one.
+    fn uses_vid(&self) -> bool {
+        self.sources.iter().any(|s| s.uses_vid())
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +230,92 @@ mod tests {
     fn multi_source_host_certs_empty_when_no_source_has_one() {
         let multi = MultiSource::new(vec![boxed(vec![]), boxed(vec![])]);
         assert!(multi.host_certs(None).is_empty());
+    }
+
+    // A source whose `answer_depends_on_samples` is fixed to the given value —
+    // the only behaviour KSK2 exercises.
+    struct FixedDependency(bool);
+    impl KeySource for FixedDependency {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn answer_depends_on_samples(&self) -> bool {
+            self.0
+        }
+    }
+
+    // KSK2: `MultiSource::answer_depends_on_samples` is `any(inner)`, so nesting
+    // a sample-dependent online source under a sample-independent keydb still
+    // gets the per-piece ask (`resolve` must not treat the pair as keydb-only).
+    #[test]
+    fn multi_source_answer_depends_on_samples_is_any_inner() {
+        let all_independent = MultiSource::new(vec![
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!all_independent.answer_depends_on_samples());
+
+        let keydb_then_online = MultiSource::new(vec![
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+            Box::new(FixedDependency(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(keydb_then_online.answer_depends_on_samples());
+    }
+
+    // A source whose `uses_vid` is fixed to the given value.
+    struct FixedVid(bool);
+    impl KeySource for FixedVid {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn uses_vid(&self) -> bool {
+            self.0
+        }
+    }
+
+    // KU J23: like `answer_depends_on_samples`, a composed source uses the VID if any
+    // inner one does, so a nested online source still makes a Missing piece VID-derivable.
+    #[test]
+    fn multi_source_uses_vid_is_any_inner() {
+        let neither = MultiSource::new(vec![
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!neither.uses_vid());
+        let keydb_then_online = MultiSource::new(vec![
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+            Box::new(FixedVid(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(keydb_then_online.uses_vid());
+    }
+
+    // A source whose `last_failure_was_transport` is fixed to the given value.
+    struct FixedTransport(bool);
+    impl KeySource for FixedTransport {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn last_failure_was_transport(&self) -> bool {
+            self.0
+        }
+    }
+
+    // For consistency with `answer_depends_on_samples` (KU3-6): a composed
+    // source's last-failure verdict is `any(inner)` too, so `resolve` retries
+    // the composition whenever ANY inner source's last failure was transport.
+    #[test]
+    fn multi_source_last_failure_was_transport_is_any_inner() {
+        let none_transport = MultiSource::new(vec![
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!none_transport.last_failure_was_transport());
+
+        let one_transport = MultiSource::new(vec![
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+            Box::new(FixedTransport(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(one_transport.last_failure_was_transport());
     }
 
     /// The `mkb` generation must reach each inner source so its OWN revocation

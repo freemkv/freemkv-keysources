@@ -34,6 +34,11 @@ tracing = "0.1"
 # `set_last_decode_reachability`, for consumers' tests only (enable in dev-dependencies).
 test-hooks = []
 
+[dev-dependencies]
+# `test_util` fixtures (`decrypt_unit`, …) for this crate's tests (keys-upfront
+# KU-P1). CI resolves it through the sibling path patch.
+libfreemkv = { version = "1.7", features = ["test-util"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

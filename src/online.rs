@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -176,6 +177,10 @@ fn split_authority(url: &str) -> Result<(String, u16), (GuardFail, String)> {
     Ok((host, port))
 }
 
+// Host lookups started, for the tests that prove a check made none.
+#[cfg(test)]
+static DNS_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // Resolve `url`'s host, validating every address against the SSRF guard;
 // returns pinned socket addrs or a rejection reason + message. SECURITY: the
 // message names the address — log only at config time, never in `query`.
@@ -206,6 +211,8 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
         }
         let host = host.clone();
         let (tx, rx) = mpsc::channel();
+        #[cfg(test)]
+        DNS_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
             let res = (host.as_str(), port)
                 .to_socket_addrs()
@@ -304,6 +311,23 @@ impl From<(GuardFail, String)> for KeyserverUrlRejection {
             GuardFail::Unreachable => KeyserverUrlFault::Temporary,
         };
         Self { fault, message }
+    }
+}
+
+/// The key-service URL checks that need no DNS lookup: `https`, a host, a valid port, and
+/// no literal non-public address (SSRF guard). Every rejection is
+/// [`KeyserverUrlFault::Permanent`]. For a factory build, which no Stop can reach: the host
+/// lookup (and its guard) runs at the first query, on the source's worker. That query is
+/// not yet Stop-aware: it runs under its own `Halt` until ST-K1b wires `ctx.halt()` (J10).
+pub fn check_keyserver_url_static(url: &str) -> Result<(), KeyserverUrlRejection> {
+    let (host, _) = split_authority(url).map_err(KeyserverUrlRejection::from)?;
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    match literal.parse::<IpAddr>() {
+        Ok(ip) if is_blocked_ip(&ip) => Err(KeyserverUrlRejection::from((
+            GuardFail::Config,
+            format!("refusing to connect to non-public address {ip} (SSRF guard)"),
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -608,6 +632,9 @@ pub struct OnlineSource {
     /// the identical address set, so the anti-rebinding guarantee is untouched: only the pooled
     /// TLS connection is reused, never a stale, un-reguarded address.
     agent: AgentCache,
+    /// KU-K1 (J15): whether the most recent `query` failure was transport-class
+    /// (`DecodeReachability::Transport`). Reset on every success.
+    last_failure_transport: AtomicBool,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -641,6 +668,7 @@ impl OnlineSource {
             base_url: base_url.into(),
             secret: secret.into(),
             agent: Arc::new(Mutex::new(None)),
+            last_failure_transport: AtomicBool::new(false),
             #[cfg(test)]
             test_net: None,
         }
@@ -746,6 +774,16 @@ impl OnlineSource {
             .map(|(host, _)| host)
             .unwrap_or_else(|_| self.base_url.clone());
         run_on_worker(&host, halt, move || job.run())
+    }
+
+    // KU-K1 (J15): classify the query just finished, from a PEEK (never a
+    // `take`) at the slot — a caller downstream of `resolve` (freemkv-library's
+    // server) still needs to read the same verdict once (`query_with` clears it).
+    fn record_last_failure_transport(&self, result: &Result<Vec<UnitKey>, Error>) {
+        let transport = result.is_err()
+            && LAST_DECODE_REACHABILITY.with(|c| c.get()) == Some(DecodeReachability::Transport);
+        self.last_failure_transport
+            .store(transport, Ordering::Relaxed);
     }
 }
 
@@ -1065,14 +1103,18 @@ impl KeySource for OnlineSource {
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query_with(ctx, &Halt::new())
+        let result = self.query_with(ctx, &Halt::new());
+        self.record_last_failure_transport(&result);
+        result
     }
 
     // AACS 2.1 forensic index set: same `query` round-trip as
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query_with(ctx, &Halt::new())
+        let result = self.query_with(ctx, &Halt::new());
+        self.record_last_failure_transport(&result);
+        result
     }
 
     fn label(&self) -> &'static str {
@@ -1081,6 +1123,17 @@ impl KeySource for OnlineSource {
 
     // host_certs: no-op default. No online cert fetch/endpoint today, so
     // OEM certs fall back to another source (e.g. keydb); no network touched.
+
+    // KU-K1 (J15): only a transport-class failure (no answer at all) is retried by `resolve`.
+    fn last_failure_was_transport(&self) -> bool {
+        self.last_failure_transport.load(Ordering::Relaxed)
+    }
+
+    // KU J23: the service derives keys from the VID it is sent (`vid_b64`), so a Missing
+    // piece might open with the disc's VID in hand.
+    fn uses_vid(&self) -> bool {
+        true
+    }
 }
 
 // The `Authorization` header value, or `None` when no secret is configured
@@ -1418,6 +1471,39 @@ mod tests {
             out.status.success() && stdout.contains("1 passed"),
             "child run failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
+    // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
+    // leaves the host lookup to the first query (not Stop-aware until ST-K1b, J10).
+    #[test]
+    fn the_static_check_rejects_config_faults_without_a_lookup() {
+        for url in [
+            "http://8.8.8.8/keys",
+            "ftp://example.com/keys",
+            "https:///keys",
+            "https://8.8.8.8:notaport/keys",
+            "https://[::1/keys",
+            "https://127.0.0.1/keys",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]:8443/keys",
+        ] {
+            let r = check_keyserver_url_static(url).expect_err(url);
+            assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
+        }
+        // A host name is not looked up: `.test` (RFC 2606) never resolves, yet it passes here.
+        assert_eq!(
+            check_keyserver_url_static("https://keys.ku-e1.test/keys"),
+            Ok(())
+        );
+        assert_eq!(check_keyserver_url_static("https://8.8.8.8/keys"), Ok(()));
+        let dns_before = DNS_LOOKUPS.load(Ordering::SeqCst);
+        let _ = check_keyserver_url_static("https://keys.example.com/keys");
+        assert_eq!(
+            DNS_LOOKUPS.load(Ordering::SeqCst),
+            dns_before,
+            "no DNS lookup"
         );
     }
 
@@ -2837,5 +2923,161 @@ mod tests {
             "no disc material read after a Stop"
         );
         assert_eq!(take_last_decode_reachability(), None);
+    }
+
+    // ── KU-K1: `last_failure_was_transport` (J13, J15) ──────────────────────
+
+    // KU J23: the service derives keys from the VID it is sent (`vid_b64`; KS-16 "Kvu =
+    // AES-G(Km, IDv)"), so a Missing piece might open with the disc's VID in hand (E7034).
+    #[test]
+    fn online_source_uses_the_vid() {
+        assert!(OnlineSource::new("https://keyserver.test/keys", "s3cr3t").uses_vid());
+    }
+
+    #[test]
+    fn last_failure_was_transport_is_false_before_any_query() {
+        let src = OnlineSource::new("https://keyserver.test/keys", "s3cr3t");
+        assert!(!src.last_failure_was_transport());
+    }
+
+    // Per J15/J13: a DNS failure never answers, so it is transport-class and gets retried.
+    #[test]
+    fn last_failure_was_transport_true_after_dns_failure() {
+        let src = source_via("kuk1a.test", T_IDLE, || {
+            Err((GuardFail::Unreachable, "did not resolve".into()))
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a DNS failure is transport-class"
+        );
+    }
+
+    // A refused connection never answers either — transport-class (J13's "connect").
+    #[test]
+    fn last_failure_was_transport_true_after_connect_refused() {
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let src = source_via("kuk1b.test", T_IDLE, move || Ok(vec![refused]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a refused connection is transport-class"
+        );
+    }
+
+    // Stop-design-v5 T16: "no bytes moved" for the idle bound is a transport-class timeout.
+    #[test]
+    fn last_failure_was_transport_true_after_idle_timeout() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("kuk1c.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "an idle stall is transport-class"
+        );
+    }
+
+    // J15: a 5xx (or any decode reply) IS an answer, so it must never look transport-class —
+    // that would re-ask a source the service already answered ("never call it twice").
+    #[test]
+    fn last_failure_was_transport_false_after_5xx() {
+        let addr = stub_server(Stub::Answer(503));
+        let src = source_via("kuk1d.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            !src.last_failure_was_transport(),
+            "the service answered (5xx) — never re-asked"
+        );
+    }
+
+    // J15: "reset it on success" — a later answer must clear a prior transport verdict.
+    #[test]
+    fn last_failure_was_transport_resets_on_success() {
+        let ok_addr = stub_server(Stub::Answer(200));
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let target = Arc::new(Mutex::new(refused));
+        let for_resolve = target.clone();
+        let src = source_via("kuk1e.test", T_IDLE, move || {
+            Ok(vec![*for_resolve.lock().unwrap()])
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.last_failure_was_transport());
+        *target.lock().unwrap() = ok_addr;
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_ok());
+        assert!(
+            !src.last_failure_was_transport(),
+            "a success must reset the flag"
+        );
+    }
+
+    // Regression: freemkv-library's server takes the reachability slot itself
+    // after `resolve`, to classify a no-key without a second probe.
+    // `last_failure_was_transport` must PEEK it, not TAKE it (never ask twice).
+    #[test]
+    fn recording_last_failure_does_not_erase_the_reachability_slot() {
+        let addr = stub_server(Stub::Answer(422));
+        let src = source_via("kuk1f.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(422)),
+            "get_unit_keys must leave the slot for a later caller (e.g. the server) to read"
+        );
+
+        let addr = stub_server(Stub::Answer(422));
+        let src = source_via("kuk1g.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(422)),
+            "get_fmts_indexes must leave the slot too"
+        );
+    }
+
+    // The base and forensic paths share `query_with`, so the flag must update
+    // through `get_fmts_indexes` exactly as it does through `get_unit_keys`.
+    #[test]
+    fn last_failure_was_transport_true_through_get_fmts_indexes() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("kuk1h.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "get_fmts_indexes must classify the failure too"
+        );
+    }
+
+    // Stop-design-v5 T16: a reply that stalls mid-BODY (not just before the
+    // first byte) is still "no bytes moved" past idle — transport-class.
+    #[test]
+    fn last_failure_was_transport_true_after_mid_body_stall() {
+        let addr = stub_server(Stub::StallBody);
+        let src = source_via("kuk1i.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a mid-body stall is transport-class"
+        );
+    }
+
+    // J15: a definite answer after a transport failure must clear the flag — the
+    // NEXT verdict always wins, so a stale `true` never survives past one query.
+    #[test]
+    fn last_failure_was_transport_resets_from_true_on_5xx() {
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let answering = stub_server(Stub::Answer(503));
+        let target = Arc::new(Mutex::new(refused));
+        let for_resolve = target.clone();
+        let src = source_via("kuk1j.test", T_IDLE, move || {
+            Ok(vec![*for_resolve.lock().unwrap()])
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.last_failure_was_transport());
+        *target.lock().unwrap() = answering;
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            !src.last_failure_was_transport(),
+            "a 5xx answer must clear a prior transport verdict"
+        );
     }
 }

@@ -456,10 +456,10 @@ impl KeydbSource {
 
         // On a match with no key: carry the specific reason if we have one, else
         // leave it empty for the library to render a bare `NoDerivableKey`.
-        let miss_path = if keys.is_empty() {
-            miss_reason.map(|n| vec![n]).unwrap_or_default()
-        } else {
-            Vec::new()
+        // KU J23: `NoVid` stays beside partial keys (the VID would derive the rest).
+        let miss_path = match miss_reason {
+            Some(n) if keys.is_empty() || n == KeyNode::NoVid => vec![n],
+            _ => Vec::new(),
         };
 
         KeydbResolution {
@@ -641,6 +641,12 @@ impl KeySource for KeydbSource {
         }
     }
 
+    // Keyed by disc hash, not by samples: asked once per resolve, not per
+    // piece (KU §2.3 step 8, N-KU10; KSK1).
+    fn answer_depends_on_samples(&self) -> bool {
+        false
+    }
+
     fn label(&self) -> &'static str {
         "keydb"
     }
@@ -784,6 +790,19 @@ mod tests {
         assert!(!shape.has_unit_keys);
         assert_eq!(shape.enc_title_keys_len, 1);
         assert!(!shape.vid_available);
+    }
+
+    // KU J23: stored unit keys for SOME CPS units plus a Media Key with no VID. The stored
+    // keys come back, and the miss path still says `NoVid`: the VID would derive the rest.
+    #[test]
+    fn partial_stored_keys_with_a_media_key_and_no_vid_report_no_vid() {
+        let mut e = blank_entry(HASH);
+        e.media_key = Some([0x33u8; 16]);
+        e.unit_keys = vec![(1, [0x55u8; 16])];
+        let db = db_with(e, Vec::new());
+        let r = KeydbSource::resolve_from(&db, &ctx(HASH, vec![[0x44u8; 16]; 2], None));
+        assert_eq!(r.keys.len(), 1, "the stored key");
+        assert_eq!(r.miss_path, vec![KeyNode::NoVid]);
     }
 
     // A hash that is NOT in the keydb is the one true miss: not matched, no
@@ -1140,6 +1159,15 @@ mod tests {
     #[test]
     fn label_is_keydb() {
         assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
+    }
+
+    // KSK1: keyed by disc hash, so `resolve` asks it once per rip, not once per
+    // piece (KU §2.3 step 8, N-KU10).
+    #[test]
+    fn keydb_source_answer_does_not_depend_on_samples() {
+        assert!(!KeydbSource::new("/nonexistent/keydb.cfg").answer_depends_on_samples());
+        // KU J23: a keydb's VID need is per disc (its `NoVid` miss path), not blanket.
+        assert!(!KeydbSource::new("/nonexistent/keydb.cfg").uses_vid());
     }
 
     // A stamp with no mtime (mtime-less FS) or a future mtime (clock skew) must

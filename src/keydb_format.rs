@@ -2423,7 +2423,7 @@ mod tests {
         for entry in &candidate_entries {
             for (_, key) in &entry.unit_keys {
                 let mut unit = original.clone();
-                libfreemkv::aacs::content::decrypt_unit(&mut unit, key);
+                libfreemkv::test_util::decrypt_unit(&mut unit, key);
                 attempts += 1;
                 any_key_changed_the_unit |= unit != original;
                 if libfreemkv::aacs::content::is_clean(&unit, libfreemkv::disc::ContentFormat::BdTs)
