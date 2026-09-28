@@ -673,6 +673,10 @@ impl OnlineSource {
             );
             return Err(Error::KeyServiceUnavailable);
         }
+        // A pending Stop returns before any disc material is read or encoded (up to 64 MiB).
+        if halt.is_cancelled() {
+            return Err(Error::Halted);
+        }
         let mkb = ctx.mkb().unwrap_or(&[]);
         // No-URL / bad-URL / over-cap-or-under-sampled draw three different verdicts.
         if mkb.len() > MAX_MKB_BYTES {
@@ -732,6 +736,7 @@ impl OnlineSource {
             body,
             title_keys: TitleKeysCtx(ctx.enc_title_keys().ok().map(<[_]>::to_vec)),
             agents: self.agent.clone(),
+            halt: halt.clone(),
             #[cfg(test)]
             test_net: self.test_net.clone(),
         };
@@ -751,6 +756,8 @@ struct PostJob {
     body: serde_json::Value,
     title_keys: TitleKeysCtx,
     agents: AgentCache,
+    /// The caller's Stop, re-checked after the lookup, before anything is sent.
+    halt: Halt,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -813,6 +820,11 @@ impl PostJob {
         let mut req = agent.post(&url);
         if let Some(value) = bearer_header(&self.secret) {
             req = req.header("Authorization", &value);
+        }
+        // A caller stopped during the lookup has gone: never connect or send the key material
+        // and token, so a reopen's query is the only one the service ever sees.
+        if self.halt.is_cancelled() {
+            return Err(Error::Halted);
         }
         // Begin/end around the round-trip, bounded only by the stall bounds of
         // `hardened_agent`. SECURITY: never log `body` — it carries base64 key material.
