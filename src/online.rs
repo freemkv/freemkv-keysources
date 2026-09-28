@@ -1156,6 +1156,7 @@ fn parse_uk(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libfreemkv::halt::Progress;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     // ── is_blocked_ip ──────────────────────────────────────────────────────
@@ -1993,9 +1994,12 @@ mod tests {
     // ── The pre-flight guards in `query` (nothing leaves the process) ──────.
 
     /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
+    #[derive(Default)]
     struct GuardCtx {
         mkb: Vec<u8>,
         samples: usize,
+        halt: Option<Halt>,
+        progress: Option<Progress>,
     }
     impl ResolveCtx for GuardCtx {
         fn disc_hash(&self) -> &str {
@@ -2016,6 +2020,12 @@ mod tests {
         fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
             Ok(vec![vec![0u8; 16]; self.samples])
         }
+        fn halt(&self) -> Option<&Halt> {
+            self.halt.as_ref()
+        }
+        fn progress(&self) -> Option<&Progress> {
+            self.progress.as_ref()
+        }
     }
 
     // An `http://` key-service URL must never be POSTed to; the source refuses with `Err`, not
@@ -2027,6 +2037,8 @@ mod tests {
             mkb: Vec::new(),
             // Enough samples that ONLY the scheme guard can stop the request.
             samples: MIN_SAMPLE_UNITS,
+
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2045,6 +2057,8 @@ mod tests {
         let ctx = GuardCtx {
             mkb: vec![0u8; MAX_MKB_BYTES + 1],
             samples: MIN_SAMPLE_UNITS,
+
+            ..Default::default()
         };
         assert!(
             src.get_unit_keys(&ctx)
@@ -2063,6 +2077,8 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS - 1,
+
+            ..Default::default()
         };
         assert!(
             src.get_unit_keys(&ctx)
@@ -2138,6 +2154,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2157,6 +2174,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2174,6 +2192,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_fmts_indexes(&ctx)
@@ -2191,6 +2210,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2368,6 +2388,7 @@ mod tests {
         GuardCtx {
             mkb: vec![0x5a; len],
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         }
     }
 
@@ -3078,6 +3099,106 @@ mod tests {
         assert!(
             !src.last_failure_was_transport(),
             "a 5xx answer must clear a prior transport verdict"
+        );
+    }
+    // ── ST-K1b: `ctx.halt()` / `ctx.progress()` wired to KU's ctx (stop-design-v5 §2.7) ──
+
+    // `get_unit_keys` must wait on `ctx.halt()`, not a fresh `Halt::new()` — a Stop
+    // reaching only the KU ctx must still land within one slice.
+    #[test]
+    fn stop_during_stalled_post_returns_halted_via_ctx_halt() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("stk1b1.test", T_IDLE, move || Ok(vec![addr]));
+        let halt = Halt::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: Some(halt.clone()),
+            progress: None,
+        };
+        let canceller = {
+            let halt = halt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                halt.cancel();
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let out = src.get_unit_keys(&ctx);
+        let elapsed = t0.elapsed();
+        canceller.join().expect("canceller");
+        assert_eq!(
+            out.expect_err("a ctx.halt() Stop is never an answer")
+                .code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert!(
+            elapsed <= Duration::from_millis(150),
+            "ctx.halt() took {elapsed:?} to land"
+        );
+    }
+
+    // T29: `ctx.progress()` must bump on body bytes moved, WHILE the call is
+    // still running — not only once, after it ends.
+    #[test]
+    fn progress_bumps_during_a_slow_body() {
+        let n = 6;
+        let gap = T_IDLE / 2;
+        let addr = stub_server(Stub::TrickleBody { n, gap });
+        let src = Arc::new(source_via("stk1b2.test", T_IDLE, move || Ok(vec![addr])));
+        let progress = Progress::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: None,
+            progress: Some(progress.clone()),
+        };
+        let handle = {
+            let src = src.clone();
+            std::thread::spawn(move || src.get_unit_keys(&ctx))
+        };
+        let seen_mid_flight = eventually(gap * n as u32 + T_IDLE, || progress.get() > 0);
+        let out = handle.join().expect("query thread");
+        assert!(
+            seen_mid_flight,
+            "progress must bump before the trickle finishes"
+        );
+        assert_eq!(
+            out.expect("a trickled {} body is a genuine miss"),
+            Vec::new()
+        );
+        assert!(
+            progress.get() > 1,
+            "a multi-byte trickle must bump more than once, got {}",
+            progress.get()
+        );
+    }
+
+    // §2.1 bullet 3: "The K1 worker holds `busy()` while a key-service call is in
+    // flight." An `idle_only` `StallTimer` on the same `Progress` must never see
+    // `Expired` while the call runs, even though a `NeverAnswer` stub sends nothing.
+    #[test]
+    fn busy_is_held_during_the_call() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = Arc::new(source_via("stk1b3.test", T_IDLE, move || Ok(vec![addr])));
+        let progress = Progress::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: None,
+            progress: Some(progress.clone()),
+        };
+        let mut timer = libfreemkv::halt::StallTimer::idle_only(T_IDLE / 4, &progress);
+        let handle = {
+            let src = src.clone();
+            std::thread::spawn(move || src.get_unit_keys(&ctx))
+        };
+        std::thread::sleep(T_IDLE / 2);
+        let stall = timer.poll(&progress);
+        let _ = handle.join();
+        assert!(
+            !matches!(stall, libfreemkv::halt::Stall::Expired),
+            "busy() must hold off the idle timer while the call is in flight: got {stall:?}"
         );
     }
 }
