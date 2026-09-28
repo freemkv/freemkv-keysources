@@ -1,8 +1,9 @@
 //! Online key-service source.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::uks_from_vuk;
@@ -13,22 +14,25 @@ use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use ureq::unversioned::transport::time::Duration as UreqDuration;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 
 // Upper bound on the MKB forwarded to the key service — kept in lockstep with
 // libfreemkv's `read_mkb_content` MAX_BYTES (64 MiB), so a capturable MKB is
 // never silently un-forwardable here (headroom, not an expected size).
 const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
-const TIMEOUT_SECS: u64 = 180;
+/// Connect bound, TLS handshake included (stop-design-v5 T15: "10 s with no answer").
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Stall bound for the key-service send and receive phases (stop-design-v5 T16, D3).
-#[cfg_attr(not(test), allow(dead_code))]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Server-side upload processing allowance in the first-byte budget, bytes per second (T17, D3).
-#[cfg_attr(not(test), allow(dead_code))]
 const FIRST_BYTE_RATE: u64 = 256 * 1024;
 /// Queries in flight per key-service host (stop-design-v5 §2.7).
-#[cfg_attr(not(test), allow(dead_code))]
 const MAX_QUERY_WORKERS_PER_HOST: usize = 4;
+/// How often a waiting caller re-checks its halt (the Stop design's `WAIT_SLICE`).
+const WORKER_POLL_SLICE: Duration = Duration::from_millis(20);
 /// Minimum encrypted-content samples the online source will send in one key
 /// request — re-exported from the base crate
 /// ([`libfreemkv::keysource::MIN_SAMPLE_UNITS`]) so this crate and
@@ -120,10 +124,8 @@ enum GuardFail {
     Unreachable,
 }
 
-// Resolve `url`'s host, validating every address against the SSRF guard;
-// returns pinned socket addrs or a rejection reason + message. SECURITY: the
-// message names the address — log only at config time, never in `query`.
-fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> {
+// The `(host, port)` a key-service URL names; `Config` when it is not an https URL with a host.
+fn split_authority(url: &str) -> Result<(String, u16), (GuardFail, String)> {
     // ONLY https: the POST body carries base64 key material and a replayable
     // bearer token, so cleartext `http://` is refused here in the shared guard —
     // a standing operator fault (`Config`) caught once at config time, not per rip.
@@ -171,6 +173,14 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
     if host.is_empty() {
         return Err((GuardFail::Config, "URL has no host".into()));
     }
+    Ok((host, port))
+}
+
+// Resolve `url`'s host, validating every address against the SSRF guard;
+// returns pinned socket addrs or a rejection reason + message. SECURITY: the
+// message names the address — log only at config time, never in `query`.
+fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> {
+    let (host, port) = split_authority(url)?;
     // `to_socket_addrs` is a BLOCKING DNS lookup that can hang for the OS
     // resolver timeout and freeze the calling rip thread, so run it on a
     // spawned thread with a bounded deadline (mirrors autorip/libfreemkv).
@@ -332,43 +342,126 @@ impl Resolver for PinnedResolver {
     }
 }
 
-// The wait for the first response byte after the request was written.
-#[cfg_attr(not(test), allow(dead_code))]
-fn first_byte_budget(idle: Duration, _request_bytes: u64) -> Duration {
-    idle
+// Per spec, stop-design-v5 T17: "**60 s + body / 256 KiB/s (D3)**". `request_bytes` is all
+// that was written for the request: the body plus a few hundred header bytes.
+fn first_byte_budget(idle: Duration, request_bytes: u64) -> Duration {
+    let micros = u128::from(request_bytes) * 1_000_000 / u128::from(FIRST_BYTE_RATE);
+    idle.saturating_add(Duration::from_micros(
+        u64::try_from(micros).unwrap_or(u64::MAX),
+    ))
+}
+
+// Per spec, stop-design-v5 §2.7: "a ureq connector chained after `DefaultConnector` that
+// re-arms a rolling per-read and per-write idle bound". It owns every bound after connect.
+#[derive(Debug)]
+struct IdleConnector {
+    idle: Duration,
+}
+
+impl<In: Transport> Connector<In> for IdleConnector {
+    type Out = IdleTransport<In>;
+
+    fn connect(
+        &self,
+        _details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| IdleTransport {
+            inner,
+            idle: self.idle,
+            request_bytes: 0,
+            awaiting_reply: false,
+        }))
+    }
+}
+
+/// A transport whose every write and read gets a fresh stall bound (T16), except the wait
+/// for a reply's first byte, which gets the upload-scaled budget (T17).
+#[derive(Debug)]
+struct IdleTransport<In> {
+    inner: In,
+    idle: Duration,
+    /// Bytes written for the request now awaiting its reply.
+    request_bytes: u64,
+    /// A request was written and no reply byte has arrived yet.
+    awaiting_reply: bool,
+}
+
+// ureq hands an unconfigured phase `NotHappening`; the tighter of that and `bound` wins.
+fn within(timeout: NextTimeout, bound: Duration) -> NextTimeout {
+    let bound = UreqDuration::Exact(bound);
+    NextTimeout {
+        after: if timeout.after < bound {
+            timeout.after
+        } else {
+            bound
+        },
+        reason: timeout.reason,
+    }
+}
+
+impl<In: Transport> Transport for IdleTransport<In> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        // T16: "60 s with no bytes written"; the first write after a reply starts a request.
+        if !self.awaiting_reply {
+            self.awaiting_reply = true;
+            self.request_bytes = 0;
+        }
+        self.request_bytes = self.request_bytes.saturating_add(amount as u64);
+        self.inner
+            .transmit_output(amount, within(timeout, self.idle))
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        // T17 until the reply's first byte, then T16: "60 s with no bytes read".
+        let bound = if self.awaiting_reply {
+            first_byte_budget(self.idle, self.request_bytes)
+        } else {
+            self.idle
+        };
+        let progressed = self.inner.await_input(within(timeout, bound))?;
+        if progressed {
+            self.awaiting_reply = false;
+        }
+        Ok(progressed)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
 }
 
 /// Build a ureq agent that follows zero redirects (so a public URL can't
 /// 30x-redirect to an internal host) and pins DNS resolution to `pinned`
 /// (the addresses already validated by [`resolve_and_guard`]).
 fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
+    hardened_agent_with(pinned, IDLE_TIMEOUT)
+}
+
+// `hardened_agent` with a caller-chosen idle bound, so the stall rules are testable at scale.
+// Per spec, stop-design-v5 §2.7: "There is **no total cap.**" — no phase total is configured.
+fn hardened_agent_with(pinned: Vec<SocketAddr>, idle: Duration) -> ureq::Agent {
     let config = Config::builder()
         .max_redirects(0)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(TIMEOUT_SECS)))
-        // Since ureq 3.4.1 (#1194) recv_response bounds only the HEADERS; without
-        // a body deadline a stalled reply hangs the POST forever. The JSON key
-        // answer arrives in one read, so a TOTAL cap is the right shape here.
-        .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_SECS)))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         // Never the env proxy: PinnedResolver would also answer the proxy's lookup with the key
         // service's address, so with HTTP(S)_PROXY/ALL_PROXY set every key lookup failed.
         .proxy(None)
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
-    ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
-}
-
-// `hardened_agent` with a caller-chosen idle bound, so the stall rules are testable at scale.
-#[cfg_attr(not(test), allow(dead_code))]
-fn hardened_agent_with(pinned: Vec<SocketAddr>, idle: Duration) -> ureq::Agent {
-    let config = Config::builder()
-        .max_redirects(0)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(idle))
-        .timeout_recv_body(Some(idle))
-        .proxy(None)
-        .build();
-    ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
+    ureq::Agent::with_parts(
+        config,
+        DefaultConnector::new().chain(IdleConnector { idle }),
+        PinnedResolver(pinned),
+    )
 }
 
 #[cfg(test)]
@@ -383,11 +476,129 @@ struct TestNet {
     idle: Duration,
 }
 
+// Per spec, stop-design-v5 §2.7: "a worker capped at 4 per host … When the cap is full, the
+// caller waits halt-aware for a slot (D4)." A slot is freed only when its worker ends.
+static QUERY_INFLIGHT: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// One of a host's [`MAX_QUERY_WORKERS_PER_HOST`] worker slots, released on drop.
+struct QuerySlot(String);
+
+impl Drop for QuerySlot {
+    fn drop(&mut self) {
+        let mut inflight = QUERY_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = inflight.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                inflight.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn acquire_query_slot(host: &str, halt: &Halt) -> Result<QuerySlot, Error> {
+    loop {
+        if halt.is_cancelled() {
+            return Err(Error::Halted);
+        }
+        {
+            let mut inflight = QUERY_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let n = inflight.entry(host.to_owned()).or_insert(0);
+            if *n < MAX_QUERY_WORKERS_PER_HOST {
+                *n += 1;
+                return Ok(QuerySlot(host.to_owned()));
+            }
+        }
+        std::thread::sleep(WORKER_POLL_SLICE);
+    }
+}
+
 // Queries holding a worker slot for `host` right now.
 #[cfg(test)]
-fn query_slots_in_flight(_host: &str) -> usize {
-    0
+fn query_slots_in_flight(host: &str) -> usize {
+    let inflight = QUERY_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    inflight.get(host).copied().unwrap_or(0)
 }
+
+/// What a worker hands back: the source's answer and the reachability of its POST, if any.
+type WorkerOutcome = (Result<Vec<UnitKey>, Error>, Option<DecodeReachability>);
+
+// Runs `work` (DNS + POST) on a worker in one of `host`'s slots. Per spec, stop-design-v5
+// §2.7: "The caller never blocks inside ureq"; on Stop it returns `Halted` within a slice.
+fn run_on_worker(
+    host: &str,
+    halt: &Halt,
+    work: impl FnOnce() -> WorkerOutcome + Send + 'static,
+) -> Result<Vec<UnitKey>, Error> {
+    let slot = acquire_query_slot(host, halt)?;
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("keysource-online".into())
+        .spawn(move || {
+            // Held until the worker ends on its own, even after the caller has gone.
+            let _slot = slot;
+            let _ = tx.send(work());
+        });
+    if spawned.is_err() {
+        tracing::warn!(
+            target: "freemkv::keysource",
+            phase = "keyserver_post",
+            "could not start the key-service worker; the service was not asked"
+        );
+        return Err(Error::KeyServiceUnavailable);
+    }
+    loop {
+        if halt.is_cancelled() {
+            // Per spec, stop-design-v5 §2.7: "On Stop, the call returns `Halted` and records
+            // nothing." The worker is abandoned; its answer is dropped with the channel.
+            return Err(Error::Halted);
+        }
+        match rx.recv_timeout(WORKER_POLL_SLICE) {
+            Ok((answer, reachability)) => {
+                // "Reachability is recorded on the caller's thread, and only when the
+                // worker's result arrives" (stop-design-v5 §2.7).
+                if let Some(outcome) = reachability {
+                    record_decode_reachability(outcome);
+                }
+                return answer;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!(
+                    target: "freemkv::keysource",
+                    phase = "keyserver_post",
+                    "the key-service worker ended without an answer"
+                );
+                return Err(Error::KeyServiceUnavailable);
+            }
+        }
+    }
+}
+
+/// The disc's encrypted title keys, read on the caller's thread for the worker's VUK path.
+struct TitleKeysCtx(Option<Vec<[u8; 16]>>);
+
+impl ResolveCtx for TitleKeysCtx {
+    fn disc_hash(&self) -> &str {
+        ""
+    }
+    fn title(&self) -> Option<&str> {
+        None
+    }
+    fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+        None
+    }
+    fn mkb(&self) -> Result<&[u8], Error> {
+        Ok(&[])
+    }
+    fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+        self.0.as_deref().ok_or(Error::AacsKeyRead)
+    }
+    fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(Vec::new())
+    }
+}
+
+type AgentCache = Arc<Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>>;
 
 pub struct OnlineSource {
     base_url: String,
@@ -396,9 +607,32 @@ pub struct OnlineSource {
     /// KEY) it was pinned to. Reused only when a fresh resolve + SSRF-guard of the host yields
     /// the identical address set, so the anti-rebinding guarantee is untouched: only the pooled
     /// TLS connection is reused, never a stale, un-reguarded address.
-    agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
+    agent: AgentCache,
     #[cfg(test)]
     test_net: Option<TestNet>,
+}
+
+// The agent pinned to `pinned`: the cached one when the address SET is unchanged, else a fresh
+// one. Poisoning is recovered from, so one panic cannot fail every later key request.
+fn pinned_agent(
+    cache: &Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
+    pinned: Vec<SocketAddr>,
+) -> Arc<ureq::Agent> {
+    let key = {
+        let mut k = pinned.clone();
+        k.sort();
+        k.dedup();
+        k
+    };
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_key, agent)) = guard.as_ref()
+        && *cached_key == key
+    {
+        return agent.clone();
+    }
+    let agent = Arc::new(hardened_agent(pinned));
+    *guard = Some((key, agent.clone()));
+    agent
 }
 
 impl OnlineSource {
@@ -406,37 +640,20 @@ impl OnlineSource {
         Self {
             base_url: base_url.into(),
             secret: secret.into(),
-            agent: Mutex::new(None),
+            agent: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_net: None,
         }
     }
 
-    // The agent pinned to `pinned` — the cached one when the address set is
-    // unchanged, a fresh one otherwise. Poisoning is recovered from: a panic
-    // elsewhere must not make every later key request panic.
+    #[cfg(test)]
     fn agent_for(&self, pinned: Vec<SocketAddr>) -> Arc<ureq::Agent> {
-        // Compare SETS, not sequences — see the `agent` field's doc.
-        let key = {
-            let mut k = pinned.clone();
-            k.sort();
-            k.dedup();
-            k
-        };
-        let mut guard = self.agent.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_key, agent)) = guard.as_ref()
-            && *cached_key == key
-        {
-            return agent.clone();
-        }
-        let agent = Arc::new(hardened_agent(pinned));
-        *guard = Some((key, agent.clone()));
-        agent
+        pinned_agent(&self.agent, pinned)
     }
 
     // The server-resolved Unit Keys for this disc: one round-trip, returning a terminal `UK` or
-    // a `VUK` derived locally. `Ok`/`Err` draw the miss-vs-outage distinction.
-    fn query_with(&self, ctx: &dyn ResolveCtx, _halt: &Halt) -> Result<Vec<UnitKey>, Error> {
+    // a `VUK` derived locally. `Ok`/`Err` draw the miss-vs-outage distinction; `halt` stops it.
+    fn query_with(&self, ctx: &dyn ResolveCtx, halt: &Halt) -> Result<Vec<UnitKey>, Error> {
         // Reset the per-thread decode-reachability slot so it reflects ONLY this
         // query afterwards: `Some(..)` once a POST answers/transport-fails, `None`
         // if we short-circuit before the network. See `take_last_decode_reachability`.
@@ -507,23 +724,60 @@ impl OnlineSource {
         {
             body["title"] = serde_json::Value::String(label.to_string());
         }
-        // Resolve + SSRF-guard the host just before the POST; pin the
-        // validated addresses so a DNS rebind between config time and fetch
-        // time can't redirect the request to an internal/metadata host.
+        // Everything below touches the network, so it runs on a worker; the body and the
+        // title keys (for a VUK reply) are read here, on the caller's thread.
+        let job = PostJob {
+            url: self.base_url.clone(),
+            secret: self.secret.clone(),
+            body,
+            title_keys: TitleKeysCtx(ctx.enc_title_keys().ok().map(<[_]>::to_vec)),
+            agents: self.agent.clone(),
+            #[cfg(test)]
+            test_net: self.test_net.clone(),
+        };
+        // A URL with no parsable host still takes a slot (keyed by the URL); its worker then
+        // fails the address guard at once.
+        let host = split_authority(&self.base_url)
+            .map(|(host, _)| host)
+            .unwrap_or_else(|_| self.base_url.clone());
+        run_on_worker(&host, halt, move || job.run())
+    }
+}
+
+/// One key-service round-trip, owned so it can run on a worker thread.
+struct PostJob {
+    url: String,
+    secret: String,
+    body: serde_json::Value,
+    title_keys: TitleKeysCtx,
+    agents: AgentCache,
+    #[cfg(test)]
+    test_net: Option<TestNet>,
+}
+
+impl PostJob {
+    // DNS + address guard + POST + reply, on the worker. The reachability it records lands in
+    // this thread's slot and is handed back for the caller to record on its own.
+    fn run(self) -> WorkerOutcome {
+        let answer = self.post();
+        (answer, take_last_decode_reachability())
+    }
+
+    fn post(self) -> Result<Vec<UnitKey>, Error> {
         #[cfg(test)]
         let guarded = match &self.test_net {
             Some(t) => (t.resolve)(),
-            None => resolve_and_guard(&self.base_url),
+            None => resolve_and_guard(&self.url),
         };
         #[cfg(not(test))]
-        let guarded = resolve_and_guard(&self.base_url);
+        let guarded = resolve_and_guard(&self.url);
+        // Resolve + SSRF-guard the host just before the POST and pin the validated addresses,
+        // so a DNS rebind after config time can't redirect the request to an internal host.
         let pinned = match guarded {
             Ok(addrs) => addrs,
             // Did-not-RESOLVE is the service unreachable, not a bad URL.
             Err((GuardFail::Unreachable, _)) => {
-                // The host did not resolve — the service never answered, so this
-                // is a transport-class outcome for the decode-reachability slot
-                // (transient/down), the same verdict a refused connection gets.
+                // Never answered, so a transport-class outcome, like a refused connection.
                 record_decode_reachability(DecodeReachability::Transport);
                 tracing::warn!(
                     target: "freemkv::keysource",
@@ -552,21 +806,20 @@ impl OnlineSource {
                 Arc::new(hardened_agent_with(pinned, t.idle)),
                 t.post_url.clone(),
             ),
-            None => (self.agent_for(pinned), self.base_url.clone()),
+            None => (pinned_agent(&self.agents, pinned), self.url.clone()),
         };
         #[cfg(not(test))]
-        let (agent, url) = (self.agent_for(pinned), self.base_url.clone());
+        let (agent, url) = (pinned_agent(&self.agents, pinned), self.url.clone());
         let mut req = agent.post(&url);
         if let Some(value) = bearer_header(&self.secret) {
             req = req.header("Authorization", &value);
         }
-        // Begin/end around the keyserver round-trip: bounded by
-        // `hardened_agent`'s connect/read timeouts, so this can never block
-        // forever. SECURITY: never log `body` — it carries base64 key material.
+        // Begin/end around the round-trip, bounded only by the stall bounds of
+        // `hardened_agent`. SECURITY: never log `body` — it carries base64 key material.
         tracing::info!(target: "freemkv::keysource", phase = "keyserver_post", "begin");
         let post_t0 = std::time::Instant::now();
-        let sent = req.send_json(body);
-        interpret_reply(sent, ctx, post_t0.elapsed().as_millis() as u64)
+        let sent = req.send_json(self.body);
+        interpret_reply(sent, &self.title_keys, post_t0.elapsed().as_millis() as u64)
     }
 }
 
@@ -694,14 +947,17 @@ fn interpret_reply(
     // Bounded read: cap the body so a hostile server can't OOM the client.
     // Reading MAX_RESPONSE_BYTES+1 lets us detect (and reject) an over-cap body.
     let mut buf = Vec::new();
-    if resp
+    let read = resp
         .body_mut()
         .as_reader()
         .take(MAX_RESPONSE_BYTES as u64 + 1)
-        .read_to_end(&mut buf)
-        .is_err()
-        || buf.len() > MAX_RESPONSE_BYTES
-    {
+        .read_to_end(&mut buf);
+    if read.is_err() {
+        // Per spec, stop-design-v5 T16: "no bytes moved" for 60 s → "`Transport` reachability".
+        // A reply that stops mid-body never finished answering.
+        record_decode_reachability(DecodeReachability::Transport);
+    }
+    if read.is_err() || buf.len() > MAX_RESPONSE_BYTES {
         // Length only — never the body, which carries base64 key material.
         // A truncated / over-cap body is the service failing mid-answer: the
         // question went unanswered, so this is a source failure, not a miss.
