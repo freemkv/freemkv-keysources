@@ -20,7 +20,8 @@ pub use keydb_format::{DiscEntry, KeyDb};
 pub use online::set_last_decode_reachability;
 pub use online::{
     DecodeReachability, KeyserverUrlFault, KeyserverUrlRejection, MIN_SAMPLE_UNITS, OnlineSource,
-    check_keyserver_url, take_last_decode_reachability, validate_keyserver_url,
+    check_keyserver_url, check_keyserver_url_static, take_last_decode_reachability,
+    validate_keyserver_url,
 };
 pub use paths::{default_keydb_path, existing_keydb_path, keydb_search_paths};
 

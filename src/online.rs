@@ -177,6 +177,10 @@ fn split_authority(url: &str) -> Result<(String, u16), (GuardFail, String)> {
     Ok((host, port))
 }
 
+// Host lookups started, for the tests that prove a check made none.
+#[cfg(test)]
+static DNS_LOOKUPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 // Resolve `url`'s host, validating every address against the SSRF guard;
 // returns pinned socket addrs or a rejection reason + message. SECURITY: the
 // message names the address — log only at config time, never in `query`.
@@ -207,6 +211,8 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
         }
         let host = host.clone();
         let (tx, rx) = mpsc::channel();
+        #[cfg(test)]
+        DNS_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::spawn(move || {
             let res = (host.as_str(), port)
                 .to_socket_addrs()
@@ -305,6 +311,23 @@ impl From<(GuardFail, String)> for KeyserverUrlRejection {
             GuardFail::Unreachable => KeyserverUrlFault::Temporary,
         };
         Self { fault, message }
+    }
+}
+
+/// The key-service URL checks that need no DNS lookup: `https`, a host, a valid port, and
+/// no literal non-public address (SSRF guard). Every rejection is
+/// [`KeyserverUrlFault::Permanent`]. For a factory build, which no Stop can reach: the host
+/// lookup (and its guard) runs at the first query, halt-aware (Stop rule: every wait is
+/// interruptible).
+pub fn check_keyserver_url_static(url: &str) -> Result<(), KeyserverUrlRejection> {
+    let (host, _) = split_authority(url).map_err(KeyserverUrlRejection::from)?;
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    match literal.parse::<IpAddr>() {
+        Ok(ip) if is_blocked_ip(&ip) => Err(KeyserverUrlRejection::from((
+            GuardFail::Config,
+            format!("refusing to connect to non-public address {ip} (SSRF guard)"),
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -1451,8 +1474,6 @@ mod tests {
         );
     }
 
-    // The typed verdict autorip needs instead of matching message text: a standing fault
-    // (scheme, host, port, blocked address) is Permanent; only a failed lookup is Temporary.
     // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
     // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
     // leaves the host lookup to the first query, which runs halt-aware on its worker.
@@ -1472,13 +1493,22 @@ mod tests {
             assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
         }
         // A host name is not looked up: `.invalid` never resolves, yet it passes here.
-        assert_eq!(check_keyserver_url_static("https://keys.ku-e1.invalid/keys"), Ok(()));
+        assert_eq!(
+            check_keyserver_url_static("https://keys.ku-e1.invalid/keys"),
+            Ok(())
+        );
         assert_eq!(check_keyserver_url_static("https://8.8.8.8/keys"), Ok(()));
         let dns_before = DNS_LOOKUPS.load(Ordering::SeqCst);
         let _ = check_keyserver_url_static("https://keys.example.com/keys");
-        assert_eq!(DNS_LOOKUPS.load(Ordering::SeqCst), dns_before, "no DNS lookup");
+        assert_eq!(
+            DNS_LOOKUPS.load(Ordering::SeqCst),
+            dns_before,
+            "no DNS lookup"
+        );
     }
 
+    // The typed verdict autorip needs instead of matching message text: a standing fault
+    // (scheme, host, port, blocked address) is Permanent; only a failed lookup is Temporary.
     #[test]
     fn check_keyserver_url_types_permanent_rejections() {
         for url in [
