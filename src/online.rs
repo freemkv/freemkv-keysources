@@ -2604,10 +2604,9 @@ mod tests {
             first_byte_budget(idle, 64 * 1024 * 1024),
             Duration::from_secs(316)
         );
-        assert_eq!(
-            first_byte_budget(idle, u64::MAX),
-            first_byte_budget(idle, u64::MAX)
-        );
+        // The largest request saturates instead of overflowing, and never undercuts idle.
+        let huge = first_byte_budget(idle, u64::MAX);
+        assert!(huge >= idle && huge > first_byte_budget(idle, 64 * 1024 * 1024));
     }
 
     // KT7b. Per spec, stop-design-v5 T17: a server that never answers after the body fails
@@ -2737,5 +2736,94 @@ mod tests {
     #[test]
     fn the_reply_byte_cap_is_unchanged() {
         assert_eq!(MAX_RESPONSE_BYTES, 1024 * 1024);
+    }
+
+    // Per keys-upfront-design §2.1 invariant 4 ("No lookups after K exists") and the user
+    // rule "never call the key service twice": a Stop during the host lookup must send
+    // nothing, so a reopen's query is the only one the service ever sees.
+    #[test]
+    fn a_stop_during_the_lookup_never_reaches_the_service() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let host = "kt1b.test";
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub address");
+        listener.set_nonblocking(true).expect("nonblocking stub");
+        let connections = Arc::new(AtomicUsize::new(0));
+        {
+            let connections = connections.clone();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                while t0.elapsed() < Duration::from_secs(5) {
+                    if listener.accept().is_ok() {
+                        connections.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
+        let src = source_via(host, T_IDLE, move || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(vec![addr])
+        });
+        let (out, _) = query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
+        assert_eq!(
+            out.expect_err("stopped").code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert!(eventually(
+            Duration::from_secs(3),
+            || query_slots_in_flight(host) == 0
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "a stopped query must send nothing"
+        );
+    }
+
+    // A Stop that is already pending costs nothing: no samples gathered, no MKB encoded.
+    #[test]
+    fn a_pending_stop_returns_before_the_body_is_built() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingCtx(AtomicUsize);
+        impl ResolveCtx for CountingCtx {
+            fn disc_hash(&self) -> &str {
+                "0x422EB"
+            }
+            fn title(&self) -> Option<&str> {
+                None
+            }
+            fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+                None
+            }
+            fn mkb(&self) -> Result<&[u8], Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(&[])
+            }
+            fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+                Ok(&[])
+            }
+            fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
+            }
+        }
+        let src = source_via("kt1c.test", T_IDLE, || Ok(Vec::new()));
+        let halt = Halt::new();
+        halt.cancel();
+        let ctx = CountingCtx(AtomicUsize::new(0));
+        let out = src.query_with(&ctx, &halt);
+        assert_eq!(
+            out.expect_err("stopped").code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert_eq!(
+            ctx.0.load(Ordering::SeqCst),
+            0,
+            "no disc material read after a Stop"
+        );
+        assert_eq!(take_last_decode_reachability(), None);
     }
 }
