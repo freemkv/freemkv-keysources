@@ -477,6 +477,7 @@ impl KeyDb {
     /// is `None` the disc's generation is unknown and cannot be filtered, so
     /// every cert is returned; certs with no revocation annotation are always
     /// returned.
+    #[deprecated(note = "use host_certs_ranked; host cert selection takes no disc input")]
     pub fn host_certs(&self, mkb: Option<u32>) -> Vec<HostCert> {
         self.host_certs
             .iter()
@@ -487,6 +488,19 @@ impl KeyDb {
             })
             .map(|hc| hc.cert.clone())
             .collect()
+    }
+
+    /// Every host cert, best first, with no disc input: certs with no `Revoked in
+    /// MKBv<N>` note in file order, then revoked ones by latest revocation (a later
+    /// revocation is the better bet without knowing the disc's generation).
+    pub fn host_certs_ranked(&self) -> Vec<HostCert> {
+        let mut ranked: Vec<&KeydbHostCert> = self.host_certs.iter().collect();
+        // Stable sort: ties (every unannotated cert, equal revocations) keep file order.
+        ranked.sort_by_key(|hc| {
+            let r = hc.revoked_at_mkb;
+            (r.is_some(), std::cmp::Reverse(r.unwrap_or(0)))
+        });
+        ranked.into_iter().map(|hc| hc.cert.clone()).collect()
     }
 
     /// Standalone keydb accessor: the disc's Volume ID (the keydb `I` token),
@@ -1913,6 +1927,7 @@ mod tests {
     // ── Host-cert revocation: parse + host_certs(mkb) filter ────────────────
 
     #[test]
+    #[allow(deprecated)]
     fn host_cert_revoked_parses_and_filters_by_mkb() {
         let revoked_line = format!(
             "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{} ; Revoked in MKBv72",
@@ -1942,6 +1957,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn host_cert_without_revocation_included_for_all_mkb() {
         let line = format!(
             "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}",
@@ -1958,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn hc2_revocation_propagates_when_hc_has_none() {
         // The HC line carries no annotation; the revocation lives on the HC2
         // line. The combined cert must still be filtered by that generation
@@ -2178,6 +2195,7 @@ mod tests {
     /// so the returned SET is identified exactly, not merely counted. A cert
     /// revoked at generation R is usable iff the disc's generation is `< R`.
     #[test]
+    #[allow(deprecated)]
     fn host_certs_filters_several_certs_across_mkb_generations() {
         let hc = |marker: u8, note: &str| {
             format!(

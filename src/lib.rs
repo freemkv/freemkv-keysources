@@ -136,9 +136,9 @@ impl KeySource for MultiSource {
         first_non_empty(&self.sources, |s, c| s.get_fmts_indexes(c), ctx)
     }
 
-    /// UNION every inner source's host certs (filtered at the given MKB
-    /// generation). Without this a composed source would hide an inner source's
-    /// cert from the OEM cert-auth route — the gap this fixes.
+    /// UNION every inner source's host certs, in source order (`mkb` is passed
+    /// through unchanged). Without this a composed source would hide an inner
+    /// source's cert from the OEM cert-auth route — the gap this fixes.
     fn host_certs(&self, mkb: Option<u32>) -> Vec<libfreemkv::aacs::types::HostCert> {
         self.sources
             .iter()

@@ -324,13 +324,11 @@ impl KeydbSource {
     /// live-drive scan as `DriveCredentials` for the AACS handshake. Empty if
     /// the keydb is missing/unreadable or carries no host cert.
     ///
-    /// Inherent, no-MKB form: this is used by the **scan-options** builder,
-    /// which runs before the disc's MKB generation is known, so no revocation
-    /// filtering is applied (passes `None`). The [`KeySource::host_certs`] TRAIT
-    /// method wires the real MKB generation through for revocation filtering.
+    /// Best first ([`KeyDb::host_certs_ranked`]): this is what the scan-options
+    /// builder hands the live-drive handshake as `DriveCredentials`.
     pub fn host_certs(&self) -> Vec<HostCert> {
         match self.cached_db() {
-            Ok(db) => db.host_certs(None),
+            Ok(db) => db.host_certs_ranked(),
             // No error channel here (the scan-options builder wants a list), so
             // the failure can only be LOGGED — but it must not be invisible.
             Err(e) => {
@@ -631,11 +629,10 @@ impl KeySource for KeydbSource {
         }
     }
 
-    // Expose the keydb's host certs through the trait, wiring the disc's MKB generation through
-    // for revocation filtering.
-    fn host_certs(&self, mkb: Option<u32>) -> Vec<HostCert> {
+    // The keydb's host certs, best first. `mkb` is ignored: cert selection takes no disc input.
+    fn host_certs(&self, _mkb: Option<u32>) -> Vec<HostCert> {
         match self.cached_db() {
-            Ok(db) => db.host_certs(mkb),
+            Ok(db) => db.host_certs_ranked(),
             // Vec-returning trait method: log the failure, return nothing.
             Err(e) => {
                 let _ = self.load_failure(&e);
@@ -1192,6 +1189,46 @@ mod tests {
         );
     }
 
+    /// Best-first with no disc input: unannotated certs in file order, then revoked
+    /// ones by latest revocation. The trait ignores its MKB argument.
+    #[test]
+    fn host_certs_ranked_orders_unannotated_then_latest_revocation_first() {
+        let dir = scratch("ranked");
+        let path = dir.join("keydb.cfg");
+        let hc = |marker: u8, note: &str| {
+            format!(
+                "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}{}\n",
+                "00".repeat(20),
+                format!("{marker:02x}").repeat(92),
+                note
+            )
+        };
+        let cfg = [
+            hc(0x68, " ; Revoked in MKBv68"),
+            hc(0xA1, ""),
+            hc(0x72, " ; Revoked in MKBv72"),
+            hc(0xB2, ""),
+        ]
+        .concat();
+        std::fs::write(&path, cfg).unwrap();
+        let src = KeydbSource::new(&path);
+        let markers =
+            |certs: Vec<HostCert>| -> Vec<u8> { certs.iter().map(|c| c.certificate[0]).collect() };
+        let want = vec![0xA1, 0xB2, 0x72, 0x68];
+        assert_eq!(
+            markers(src.host_certs()),
+            want,
+            "inherent (production credentials)"
+        );
+        assert_eq!(
+            markers(KeySource::host_certs(&src, Some(99))),
+            want,
+            "trait ignores mkb"
+        );
+        assert_eq!(markers(KeySource::host_certs(&src, None)), want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// No keydb → no host credentials, not an error (inherent and trait forms).
     #[test]
     fn host_certs_empty_when_keydb_missing() {
@@ -1201,8 +1238,8 @@ mod tests {
         assert!(KeySource::host_certs(&src, Some(68)).is_empty());
     }
 
-    /// The TRAIT `host_certs` surfaces a `| HC |` row and now wires the MKB
-    /// generation through. Placeholder all-zero material (never a real key).
+    /// The TRAIT `host_certs` surfaces a `| HC |` row for any `mkb` argument.
+    /// Placeholder all-zero material (never a real key).
     #[test]
     fn trait_host_certs_returns_keydb_hc_row() {
         let dir = std::env::temp_dir().join(format!("fmk_hc_{}", std::process::id()));

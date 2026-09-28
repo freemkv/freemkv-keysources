@@ -138,7 +138,7 @@ fn keydb_source_label_is_keydb() {
     assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
 }
 
-// ── KeydbSource: MKB-aware host-cert serving from a file ────────────────────
+// ── KeydbSource: host-cert serving from a file ──────────────────────────────
 
 #[test]
 fn keydb_source_serves_host_cert_from_hc_row() {
@@ -152,14 +152,13 @@ fn keydb_source_serves_host_cert_from_hc_row() {
     let path = s.write("keydb.cfg", &line);
 
     let src = KeydbSource::new(&path);
-    // Inherent (no-MKB, scan-options) form.
+    // Inherent (scan-options) form.
     assert_eq!(
         src.host_certs().len(),
         1,
         "inherent host_certs sees the HC row"
     );
-    // Trait form now wires the MKB generation through (no revocation annotation
-    // → always returned).
+    // Trait form: `mkb` is ignored; the ranked list is returned.
     let via_trait = KeySource::host_certs(&src, Some(70));
     assert_eq!(via_trait.len(), 1, "trait host_certs sees the HC row");
     assert_eq!(via_trait[0].certificate.len(), 92);
