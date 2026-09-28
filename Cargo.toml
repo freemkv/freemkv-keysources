@@ -30,6 +30,10 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # key material).
 tracing = "0.1"
 
+[features]
+# `set_last_decode_reachability`, for consumers' tests only (enable in dev-dependencies).
+test-hooks = []
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

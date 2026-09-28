@@ -243,7 +243,55 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
 ///
 /// The *config-time* check; [`OnlineSource`] re-guards before each POST, closing the DNS-rebind window.
 pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
-    resolve_and_guard(url).map(|_| ()).map_err(|(_, msg)| msg)
+    check_keyserver_url(url).map_err(|r| r.message)
+}
+
+/// Whether a rejected key-service URL can start working without a config change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyserverUrlFault {
+    /// Bad scheme, host or port, or a non-public address: retrying changes nothing.
+    Permanent,
+    /// The host did not resolve (DNS failure, timeout, lookup cap): may succeed later.
+    Temporary,
+}
+
+/// Why [`check_keyserver_url`] rejected a URL; `message` is [`validate_keyserver_url`]'s text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyserverUrlRejection {
+    pub fault: KeyserverUrlFault,
+    pub message: String,
+}
+
+impl KeyserverUrlRejection {
+    pub fn is_temporary(&self) -> bool {
+        self.fault == KeyserverUrlFault::Temporary
+    }
+}
+
+impl std::fmt::Display for KeyserverUrlRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for KeyserverUrlRejection {}
+
+impl From<(GuardFail, String)> for KeyserverUrlRejection {
+    fn from((fail, message): (GuardFail, String)) -> Self {
+        let fault = match fail {
+            GuardFail::Config => KeyserverUrlFault::Permanent,
+            GuardFail::Unreachable => KeyserverUrlFault::Temporary,
+        };
+        Self { fault, message }
+    }
+}
+
+/// [`validate_keyserver_url`] with a typed verdict: [`KeyserverUrlFault::Temporary`] only when
+/// the host lookup failed, so a caller can keep the source and retry at request time.
+pub fn check_keyserver_url(url: &str) -> Result<(), KeyserverUrlRejection> {
+    resolve_and_guard(url).map(|_| ()).map_err(Into::into)
 }
 
 // ureq's `ResolvedSocketAddrs` is a fixed 16-slot array; `push`ing a 17th
@@ -287,6 +335,9 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
         // a body deadline a stalled reply hangs the POST forever. The JSON key
         // answer arrives in one read, so a TOTAL cap is the right shape here.
         .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_SECS)))
+        // Never the env proxy: PinnedResolver would also answer the proxy's lookup with the key
+        // service's address, so with HTTP(S)_PROXY/ALL_PROXY set every key lookup failed.
+        .proxy(None)
         .build();
     // `with_parts`, never `new_with_config` — see [`PinnedResolver`].
     ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
@@ -493,6 +544,13 @@ fn record_decode_reachability(outcome: DecodeReachability) {
 /// from the REAL decode's HTTP outcome instead of a second, redundant probe.
 pub fn take_last_decode_reachability() -> Option<DecodeReachability> {
     LAST_DECODE_REACHABILITY.with(std::cell::Cell::take)
+}
+
+/// Set this thread's decode-reachability slot, as a real decode POST would. Test hook (feature
+/// `test-hooks`): lets a caller test its [`take_last_decode_reachability`] handling offline.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_last_decode_reachability(outcome: Option<DecodeReachability>) {
+    LAST_DECODE_REACHABILITY.with(|c| c.set(outcome));
 }
 
 // Map a key-service HTTP status into the operator action it implies: 401/403
@@ -992,6 +1050,89 @@ mod tests {
             head.contains("keyserver.test"),
             "the pinned agent must still address the original host; got: {head}"
         );
+    }
+
+    // ureq 3 defaults to `Proxy::try_from_env()`; PinnedResolver would send the proxy connection to
+    // the key service's address, failing every lookup. Checked in a child so no test mutates env.
+    #[test]
+    fn the_key_service_agent_never_uses_an_environment_proxy() {
+        const CHILD: &str = "FMKV_KS_PROXY_CHILD";
+        const NAME: &str = "online::tests::the_key_service_agent_never_uses_an_environment_proxy";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(
+                hardened_agent(Vec::new()).config().proxy().is_none(),
+                "the pinned agent picked up a proxy from the environment"
+            );
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("ALL_PROXY", "http://proxy.example:3128")
+            .env("HTTPS_PROXY", "http://proxy.example:3128")
+            .env("HTTP_PROXY", "http://proxy.example:3128")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child run failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The typed verdict autorip needs instead of matching message text: a standing fault
+    // (scheme, host, port, blocked address) is Permanent; only a failed lookup is Temporary.
+    #[test]
+    fn check_keyserver_url_types_permanent_rejections() {
+        for url in [
+            "http://8.8.8.8/keys",
+            "ftp://example.com/keys",
+            "https:///keys",
+            "https://8.8.8.8:notaport/keys",
+            "https://[::1/keys",
+            "https://127.0.0.1/keys",
+            "https://169.254.169.254/latest/meta-data",
+        ] {
+            let r = check_keyserver_url(url).expect_err(url);
+            assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
+            assert!(!r.is_temporary(), "{url}");
+            assert_eq!(Err(r.message.clone()), validate_keyserver_url(url), "{url}");
+            assert_eq!(r.to_string(), r.message);
+        }
+        assert_eq!(check_keyserver_url("https://8.8.8.8/keys"), Ok(()));
+    }
+
+    #[test]
+    fn a_failed_lookup_is_a_temporary_rejection() {
+        // Offline: every GuardFail::Unreachable reason resolve_and_guard produces.
+        for msg in [
+            "DNS resolution timed out",
+            "could not resolve host: failed to lookup address information",
+            "host did not resolve to any address",
+            "too many concurrent DNS resolutions in flight for this host",
+        ] {
+            let r = KeyserverUrlRejection::from((GuardFail::Unreachable, msg.to_string()));
+            assert_eq!(r.fault, KeyserverUrlFault::Temporary, "{msg}");
+            assert!(r.is_temporary());
+            assert_eq!(r.message, msg);
+        }
+        let c = KeyserverUrlRejection::from((GuardFail::Config, "URL has no host".into()));
+        assert_eq!(c.fault, KeyserverUrlFault::Permanent);
+    }
+
+    // Callers test their verdict mapping with the hook instead of a real DNS lookup.
+    #[test]
+    fn the_decode_reachability_hook_plants_what_take_reads() {
+        set_last_decode_reachability(Some(DecodeReachability::Status(422)));
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(422))
+        );
+        assert_eq!(take_last_decode_reachability(), None);
+        set_last_decode_reachability(Some(DecodeReachability::Transport));
+        set_last_decode_reachability(None);
+        assert_eq!(take_last_decode_reachability(), None);
     }
 
     // ── bearer_header ──────────────────────────────────────────────────────

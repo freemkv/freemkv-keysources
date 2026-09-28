@@ -1,5 +1,25 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- The online key service ignores `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`: with one set, every key lookup failed (the pinned resolver also answered the proxy's address, so the proxy request went to the key service).
+
+### Changed
+
+- `KeydbSource` hands out host certs best first, with no disc input: certs with no `Revoked in MKBv<N>` note in keydb order, then revoked ones by latest revocation. The inherent `host_certs()` and the `KeySource::host_certs` trait method both return this order; the trait ignores its `mkb` argument.
+
+### Deprecated
+
+- `KeyDb::host_certs(mkb)`: use `KeyDb::host_certs_ranked`.
+
+### Added
+
+- `KeyDb::host_certs_ranked`.
+- `check_keyserver_url` with `KeyserverUrlRejection`/`KeyserverUrlFault`: a typed Permanent vs Temporary verdict, so callers need not match `validate_keyserver_url`'s text.
+- `test-hooks` feature exposing `set_last_decode_reachability`, to test decode-verdict handling without a network.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance
