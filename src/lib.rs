@@ -256,6 +256,33 @@ mod tests {
         assert!(keydb_then_online.answer_depends_on_samples());
     }
 
+    // A source whose `uses_vid` is fixed to the given value.
+    struct FixedVid(bool);
+    impl KeySource for FixedVid {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn uses_vid(&self) -> bool {
+            self.0
+        }
+    }
+
+    // KU J23: like `answer_depends_on_samples`, a composed source uses the VID if any
+    // inner one does, so a nested online source still makes a Missing piece VID-derivable.
+    #[test]
+    fn multi_source_uses_vid_is_any_inner() {
+        let neither = MultiSource::new(vec![
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!neither.uses_vid());
+        let keydb_then_online = MultiSource::new(vec![
+            Box::new(FixedVid(false)) as Box<dyn KeySource>,
+            Box::new(FixedVid(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(keydb_then_online.uses_vid());
+    }
+
     // A source whose `last_failure_was_transport` is fixed to the given value.
     struct FixedTransport(bool);
     impl KeySource for FixedTransport {

@@ -2865,6 +2865,13 @@ mod tests {
 
     // ── KU-K1: `last_failure_was_transport` (J13, J15) ──────────────────────
 
+    // KU J23: the service derives keys from the VID it is sent (`vid_b64`; KS-16 "Kvu =
+    // AES-G(Km, IDv)"), so a Missing piece might open with the disc's VID in hand (E7034).
+    #[test]
+    fn online_source_uses_the_vid() {
+        assert!(OnlineSource::new("https://keyserver.test/keys", "s3cr3t").uses_vid());
+    }
+
     #[test]
     fn last_failure_was_transport_is_false_before_any_query() {
         let src = OnlineSource::new("https://keyserver.test/keys", "s3cr3t");

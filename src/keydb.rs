@@ -1153,6 +1153,8 @@ mod tests {
     #[test]
     fn keydb_source_answer_does_not_depend_on_samples() {
         assert!(!KeydbSource::new("/nonexistent/keydb.cfg").answer_depends_on_samples());
+        // KU J23: a keydb's VID need is per disc (its `NoVid` miss path), not blanket.
+        assert!(!KeydbSource::new("/nonexistent/keydb.cfg").uses_vid());
     }
 
     // A stamp with no mtime (mtime-less FS) or a future mtime (clock skew) must
