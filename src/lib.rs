@@ -161,6 +161,11 @@ impl KeySource for MultiSource {
     fn last_failure_was_transport(&self) -> bool {
         self.sources.iter().any(|s| s.last_failure_was_transport())
     }
+
+    // KU J23: any inner source that consumes the VID makes the composition one.
+    fn uses_vid(&self) -> bool {
+        self.sources.iter().any(|s| s.uses_vid())
+    }
 }
 
 #[cfg(test)]

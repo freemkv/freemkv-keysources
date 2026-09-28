@@ -1105,6 +1105,12 @@ impl KeySource for OnlineSource {
     fn last_failure_was_transport(&self) -> bool {
         self.last_failure_transport.load(Ordering::Relaxed)
     }
+
+    // KU J23: the service derives keys from the VID it is sent (`vid_b64`), so a Missing
+    // piece might open with the disc's VID in hand.
+    fn uses_vid(&self) -> bool {
+        true
+    }
 }
 
 // The `Authorization` header value, or `None` when no secret is configured
