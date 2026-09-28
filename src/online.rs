@@ -1453,6 +1453,32 @@ mod tests {
 
     // The typed verdict autorip needs instead of matching message text: a standing fault
     // (scheme, host, port, blocked address) is Permanent; only a failed lookup is Temporary.
+    // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
+    // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
+    // leaves the host lookup to the first query, which runs halt-aware on its worker.
+    #[test]
+    fn the_static_check_rejects_config_faults_without_a_lookup() {
+        for url in [
+            "http://8.8.8.8/keys",
+            "ftp://example.com/keys",
+            "https:///keys",
+            "https://8.8.8.8:notaport/keys",
+            "https://[::1/keys",
+            "https://127.0.0.1/keys",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]:8443/keys",
+        ] {
+            let r = check_keyserver_url_static(url).expect_err(url);
+            assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
+        }
+        // A host name is not looked up: `.invalid` never resolves, yet it passes here.
+        assert_eq!(check_keyserver_url_static("https://keys.ku-e1.invalid/keys"), Ok(()));
+        assert_eq!(check_keyserver_url_static("https://8.8.8.8/keys"), Ok(()));
+        let dns_before = DNS_LOOKUPS.load(Ordering::SeqCst);
+        let _ = check_keyserver_url_static("https://keys.example.com/keys");
+        assert_eq!(DNS_LOOKUPS.load(Ordering::SeqCst), dns_before, "no DNS lookup");
+    }
+
     #[test]
     fn check_keyserver_url_types_permanent_rejections() {
         for url in [
