@@ -250,6 +250,35 @@ mod tests {
         assert!(keydb_then_online.answer_depends_on_samples());
     }
 
+    // A source whose `last_failure_was_transport` is fixed to the given value.
+    struct FixedTransport(bool);
+    impl KeySource for FixedTransport {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn last_failure_was_transport(&self) -> bool {
+            self.0
+        }
+    }
+
+    // For consistency with `answer_depends_on_samples` (KU3-6): a composed
+    // source's last-failure verdict is `any(inner)` too, so `resolve` retries
+    // the composition whenever ANY inner source's last failure was transport.
+    #[test]
+    fn multi_source_last_failure_was_transport_is_any_inner() {
+        let none_transport = MultiSource::new(vec![
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!none_transport.last_failure_was_transport());
+
+        let one_transport = MultiSource::new(vec![
+            Box::new(FixedTransport(false)) as Box<dyn KeySource>,
+            Box::new(FixedTransport(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(one_transport.last_failure_was_transport());
+    }
+
     /// The `mkb` generation must reach each inner source so its OWN revocation
     /// filter can act; a source that drops everything at a given generation is
     /// honoured by the union.

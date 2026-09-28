@@ -2943,4 +2943,76 @@ mod tests {
             "a success must reset the flag"
         );
     }
+
+    // Regression: freemkv-library's server takes the reachability slot itself
+    // (`take_online_decode_reachability`) after `resolve`, to classify a no-key
+    // without a second probe. `last_failure_was_transport` must PEEK, not TAKE,
+    // or the server sees `None` and re-asks the service — never call it twice.
+    #[test]
+    fn recording_last_failure_does_not_erase_the_reachability_slot() {
+        let addr = stub_server(Stub::Answer(422));
+        let src = source_via("kuk1f.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(422)),
+            "get_unit_keys must leave the slot for a later caller (e.g. the server) to read"
+        );
+
+        let addr = stub_server(Stub::Answer(422));
+        let src = source_via("kuk1g.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Status(422)),
+            "get_fmts_indexes must leave the slot too"
+        );
+    }
+
+    // The base and forensic paths share `query_with`, so the flag must update
+    // through `get_fmts_indexes` exactly as it does through `get_unit_keys`.
+    #[test]
+    fn last_failure_was_transport_true_through_get_fmts_indexes() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("kuk1h.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "get_fmts_indexes must classify the failure too"
+        );
+    }
+
+    // Stop-design-v5 T16: a reply that stalls mid-BODY (not just before the
+    // first byte) is still "no bytes moved" past idle — transport-class.
+    #[test]
+    fn last_failure_was_transport_true_after_mid_body_stall() {
+        let addr = stub_server(Stub::StallBody);
+        let src = source_via("kuk1i.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a mid-body stall is transport-class"
+        );
+    }
+
+    // J15: a definite answer after a transport failure must clear the flag — the
+    // NEXT verdict always wins, so a stale `true` never survives past one query.
+    #[test]
+    fn last_failure_was_transport_resets_from_true_on_5xx() {
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let answering = stub_server(Stub::Answer(503));
+        let target = Arc::new(Mutex::new(refused));
+        let for_resolve = target.clone();
+        let src = source_via("kuk1j.test", T_IDLE, move || {
+            Ok(vec![*for_resolve.lock().unwrap()])
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.last_failure_was_transport());
+        *target.lock().unwrap() = answering;
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            !src.last_failure_was_transport(),
+            "a 5xx answer must clear a prior transport verdict"
+        );
+    }
 }
