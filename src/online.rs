@@ -753,15 +753,12 @@ impl OnlineSource {
         run_on_worker(&host, halt, move || job.run())
     }
 
-    // KU-K1 (J15): classify the query just finished. A success resets it; a
-    // failure is transport-class only when its `DecodeReachability` says so —
-    // an HTTP answer (a 5xx included) is never transport-class.
+    // KU-K1 (J15): classify the query just finished, from a PEEK (never a
+    // `take`) at the slot — a caller downstream of `resolve` (freemkv-library's
+    // server) still needs to read the same verdict once (`query_with` clears it).
     fn record_last_failure_transport(&self, result: &Result<Vec<UnitKey>, Error>) {
         let transport = result.is_err()
-            && matches!(
-                take_last_decode_reachability(),
-                Some(DecodeReachability::Transport)
-            );
+            && LAST_DECODE_REACHABILITY.with(|c| c.get()) == Some(DecodeReachability::Transport);
         self.last_failure_transport
             .store(transport, Ordering::Relaxed);
     }
@@ -2945,9 +2942,8 @@ mod tests {
     }
 
     // Regression: freemkv-library's server takes the reachability slot itself
-    // (`take_online_decode_reachability`) after `resolve`, to classify a no-key
-    // without a second probe. `last_failure_was_transport` must PEEK, not TAKE,
-    // or the server sees `None` and re-asks the service — never call it twice.
+    // after `resolve`, to classify a no-key without a second probe.
+    // `last_failure_was_transport` must PEEK it, not TAKE it (never ask twice).
     #[test]
     fn recording_last_failure_does_not_erase_the_reachability_slot() {
         let addr = stub_server(Stub::Answer(422));

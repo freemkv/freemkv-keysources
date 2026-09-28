@@ -155,6 +155,12 @@ impl KeySource for MultiSource {
     fn answer_depends_on_samples(&self) -> bool {
         self.sources.iter().any(|s| s.answer_depends_on_samples())
     }
+
+    // Same `any(inner)` rule (KU-K1 review): `resolve` retries the composition
+    // whenever any inner source's last failure was transport-class.
+    fn last_failure_was_transport(&self) -> bool {
+        self.sources.iter().any(|s| s.last_failure_was_transport())
+    }
 }
 
 #[cfg(test)]
