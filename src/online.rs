@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
+use libfreemkv::halt::Progress;
 use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
 use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
@@ -318,7 +319,7 @@ impl From<(GuardFail, String)> for KeyserverUrlRejection {
 /// no literal non-public address (SSRF guard). Every rejection is
 /// [`KeyserverUrlFault::Permanent`]. For a factory build, which no Stop can reach: the host
 /// lookup (and its guard) runs at the first query, on the source's worker. That query is
-/// not yet Stop-aware: it runs under its own `Halt` until ST-K1b wires `ctx.halt()` (J10).
+/// Stop-aware (`ctx.halt()`, ST-K1b, J10); this static check itself opens no socket.
 pub fn check_keyserver_url_static(url: &str) -> Result<(), KeyserverUrlRejection> {
     let (host, _) = split_authority(url).map_err(KeyserverUrlRejection::from)?;
     let literal = host.trim_start_matches('[').trim_end_matches(']');
@@ -411,6 +412,24 @@ struct IdleTransport<In> {
     awaiting_reply: bool,
 }
 
+thread_local! {
+    // Progress for the query in flight on THIS thread (§2.7, T29), bumped by
+    // IdleTransport on every byte moved. Thread-local: ureq's cached Agent
+    // reuses one connector across queries whose ctx.progress() differs.
+    static ACTIVE_QUERY_PROGRESS: std::cell::RefCell<Option<Progress>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Bump this thread's active query Progress, if `PostJob::post` set one; a no-op
+// off a worker thread (or with no ctx.progress()).
+fn bump_active_progress() {
+    ACTIVE_QUERY_PROGRESS.with(|p| {
+        if let Some(progress) = p.borrow().as_ref() {
+            progress.bump();
+        }
+    });
+}
+
 // ureq hands an unconfigured phase `NotHappening`; the tighter of that and `bound` wins.
 fn within(timeout: NextTimeout, bound: Duration) -> NextTimeout {
     let bound = UreqDuration::Exact(bound);
@@ -436,8 +455,14 @@ impl<In: Transport> Transport for IdleTransport<In> {
             self.request_bytes = 0;
         }
         self.request_bytes = self.request_bytes.saturating_add(amount as u64);
-        self.inner
-            .transmit_output(amount, within(timeout, self.idle))
+        let result = self
+            .inner
+            .transmit_output(amount, within(timeout, self.idle));
+        // §2.7, T29: "bumps it on every byte moved."
+        if result.is_ok() && amount > 0 {
+            bump_active_progress();
+        }
+        result
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
@@ -450,6 +475,8 @@ impl<In: Transport> Transport for IdleTransport<In> {
         let progressed = self.inner.await_input(within(timeout, bound))?;
         if progressed {
             self.awaiting_reply = false;
+            // §2.7, T29: "bumps it on every byte moved."
+            bump_active_progress();
         }
         Ok(progressed)
     }
@@ -765,6 +792,7 @@ impl OnlineSource {
             title_keys: TitleKeysCtx(ctx.enc_title_keys().ok().map(<[_]>::to_vec)),
             agents: self.agent.clone(),
             halt: halt.clone(),
+            progress: ctx.progress().cloned(),
             #[cfg(test)]
             test_net: self.test_net.clone(),
         };
@@ -796,6 +824,9 @@ struct PostJob {
     agents: AgentCache,
     /// The caller's Stop, re-checked after the lookup, before anything is sent.
     halt: Halt,
+    /// §2.7, T29: bumped on every body byte moved and at answer; held `busy()`
+    /// for the call's duration. `None` when the ctx carries no `Progress`.
+    progress: Option<Progress>,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -804,6 +835,11 @@ impl PostJob {
     // DNS + address guard + POST + reply, on the worker. The reachability it records lands in
     // this thread's slot and is handed back for the caller to record on its own.
     fn run(self) -> WorkerOutcome {
+        // §2.1 bullet 3: "The K1 worker holds busy() while a key-service call is
+        // in flight" — held for the worker's whole run, including past a Stop
+        // the caller already gave up on (the worker still runs to its own bound).
+        let _busy = self.progress.as_ref().map(Progress::busy);
+        ACTIVE_QUERY_PROGRESS.with(|p| *p.borrow_mut() = self.progress.clone());
         let answer = self.post();
         (answer, take_last_decode_reachability())
     }
@@ -947,16 +983,24 @@ fn interpret_reply(
             // (a 200/404/422 is "up"; a 5xx is "down"), read by the caller so a
             // no-key needs no second probe.
             record_decode_reachability(DecodeReachability::Status(r.status().as_u16()));
+            // §2.7, T29: "bumps it ... at answer" — this IS the answer.
+            bump_active_progress();
             r
         }
         Err(e) => {
             // A 4xx/5xx is still an ANSWER (record its status); a transport
             // error is not (record `Transport`). Kept separate from the
             // error-mapping below, which is unchanged.
-            record_decode_reachability(match &e {
+            let outcome = match &e {
                 ureq::Error::StatusCode(code) => DecodeReachability::Status(*code),
                 _ => DecodeReachability::Transport,
-            });
+            };
+            // An HTTP error status is still an answer (§2.7, T29); a transport
+            // failure never got one, so it never bumps.
+            if matches!(outcome, DecodeReachability::Status(_)) {
+                bump_active_progress();
+            }
+            record_decode_reachability(outcome);
             // 401/403/429/5xx demand different operator actions; collapsing
             // them is why a 502 was read as "no key". Each arm RETURNS the
             // classified error, never an empty vec, so it survives past here.
@@ -1099,11 +1143,17 @@ fn interpret_reply(
     Ok(Vec::new())
 }
 
+// ST-K1b (stop-design-v5 §2.7): the KU ctx's own token, or an uncancellable
+// stand-in for a caller (autorip, a test) that built its ctx with none.
+fn ctx_halt(ctx: &dyn ResolveCtx) -> Halt {
+    ctx.halt().cloned().unwrap_or_default()
+}
+
 impl KeySource for OnlineSource {
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &Halt::new());
+        let result = self.query_with(ctx, &ctx_halt(ctx));
         self.record_last_failure_transport(&result);
         result
     }
@@ -1112,7 +1162,7 @@ impl KeySource for OnlineSource {
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &Halt::new());
+        let result = self.query_with(ctx, &ctx_halt(ctx));
         self.record_last_failure_transport(&result);
         result
     }
@@ -1156,7 +1206,6 @@ fn parse_uk(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libfreemkv::halt::Progress;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     // ── is_blocked_ip ──────────────────────────────────────────────────────
@@ -1477,7 +1526,7 @@ mod tests {
 
     // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
     // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
-    // leaves the host lookup to the first query (not Stop-aware until ST-K1b, J10).
+    // leaves the host lookup to the first query, which is Stop-aware (ST-K1b, J10).
     #[test]
     fn the_static_check_rejects_config_faults_without_a_lookup() {
         for url in [
