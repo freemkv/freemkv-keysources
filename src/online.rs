@@ -2838,4 +2838,82 @@ mod tests {
         );
         assert_eq!(take_last_decode_reachability(), None);
     }
+
+    // ── KU-K1: `last_failure_was_transport` (J13, J15) ──────────────────────
+
+    #[test]
+    fn last_failure_was_transport_is_false_before_any_query() {
+        let src = OnlineSource::new("https://keyserver.test/keys", "s3cr3t");
+        assert!(!src.last_failure_was_transport());
+    }
+
+    // Per J15/J13: a DNS failure never answers, so it is transport-class and gets retried.
+    #[test]
+    fn last_failure_was_transport_true_after_dns_failure() {
+        let src = source_via("kuk1a.test", T_IDLE, || {
+            Err((GuardFail::Unreachable, "did not resolve".into()))
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a DNS failure is transport-class"
+        );
+    }
+
+    // A refused connection never answers either — transport-class (J13's "connect").
+    #[test]
+    fn last_failure_was_transport_true_after_connect_refused() {
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let src = source_via("kuk1b.test", T_IDLE, move || Ok(vec![refused]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "a refused connection is transport-class"
+        );
+    }
+
+    // Stop-design-v5 T16: "no bytes moved" for the idle bound is a transport-class timeout.
+    #[test]
+    fn last_failure_was_transport_true_after_idle_timeout() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("kuk1c.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            src.last_failure_was_transport(),
+            "an idle stall is transport-class"
+        );
+    }
+
+    // J15: a 5xx (or any decode reply) IS an answer, so it must never look transport-class —
+    // that would re-ask a source the service already answered ("never call it twice").
+    #[test]
+    fn last_failure_was_transport_false_after_5xx() {
+        let addr = stub_server(Stub::Answer(503));
+        let src = source_via("kuk1d.test", T_IDLE, move || Ok(vec![addr]));
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(
+            !src.last_failure_was_transport(),
+            "the service answered (5xx) — never re-asked"
+        );
+    }
+
+    // J15: "reset it on success" — a later answer must clear a prior transport verdict.
+    #[test]
+    fn last_failure_was_transport_resets_on_success() {
+        let ok_addr = stub_server(Stub::Answer(200));
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        let target = Arc::new(Mutex::new(refused));
+        let for_resolve = target.clone();
+        let src = source_via("kuk1e.test", T_IDLE, move || {
+            Ok(vec![*for_resolve.lock().unwrap()])
+        });
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.last_failure_was_transport());
+        *target.lock().unwrap() = ok_addr;
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_ok());
+        assert!(
+            !src.last_failure_was_transport(),
+            "a success must reset the flag"
+        );
+    }
 }

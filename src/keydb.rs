@@ -1142,6 +1142,13 @@ mod tests {
         assert_eq!(KeydbSource::new("/nonexistent/keydb.cfg").label(), "keydb");
     }
 
+    // KSK1: keyed by disc hash, so `resolve` asks it once per rip, not once per
+    // piece (KU §2.3 step 8, N-KU10).
+    #[test]
+    fn keydb_source_answer_does_not_depend_on_samples() {
+        assert!(!KeydbSource::new("/nonexistent/keydb.cfg").answer_depends_on_samples());
+    }
+
     // A stamp with no mtime (mtime-less FS) or a future mtime (clock skew) must
     // not be stuck un-settled forever — it now settles via the inode-identity
     // fallback once the observation has aged past the granularity.

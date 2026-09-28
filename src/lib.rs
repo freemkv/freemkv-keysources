@@ -214,6 +214,36 @@ mod tests {
         assert!(multi.host_certs(None).is_empty());
     }
 
+    // A source whose `answer_depends_on_samples` is fixed to the given value —
+    // the only behaviour KSK2 exercises.
+    struct FixedDependency(bool);
+    impl KeySource for FixedDependency {
+        fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+            Ok(Vec::new())
+        }
+        fn answer_depends_on_samples(&self) -> bool {
+            self.0
+        }
+    }
+
+    // KSK2: `MultiSource::answer_depends_on_samples` is `any(inner)`, so nesting
+    // a sample-dependent online source under a sample-independent keydb still
+    // gets the per-piece ask (`resolve` must not treat the pair as keydb-only).
+    #[test]
+    fn multi_source_answer_depends_on_samples_is_any_inner() {
+        let all_independent = MultiSource::new(vec![
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+        ]);
+        assert!(!all_independent.answer_depends_on_samples());
+
+        let keydb_then_online = MultiSource::new(vec![
+            Box::new(FixedDependency(false)) as Box<dyn KeySource>,
+            Box::new(FixedDependency(true)) as Box<dyn KeySource>,
+        ]);
+        assert!(keydb_then_online.answer_depends_on_samples());
+    }
+
     /// The `mkb` generation must reach each inner source so its OWN revocation
     /// filter can act; a source that drops everything at a given generation is
     /// honoured by the union.
