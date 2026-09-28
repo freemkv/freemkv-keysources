@@ -317,8 +317,8 @@ impl From<(GuardFail, String)> for KeyserverUrlRejection {
 /// The key-service URL checks that need no DNS lookup: `https`, a host, a valid port, and
 /// no literal non-public address (SSRF guard). Every rejection is
 /// [`KeyserverUrlFault::Permanent`]. For a factory build, which no Stop can reach: the host
-/// lookup (and its guard) runs at the first query, halt-aware (Stop rule: every wait is
-/// interruptible).
+/// lookup (and its guard) runs at the first query, on the source's worker. That query is
+/// not yet Stop-aware: it runs under its own `Halt` until ST-K1b wires `ctx.halt()` (J10).
 pub fn check_keyserver_url_static(url: &str) -> Result<(), KeyserverUrlRejection> {
     let (host, _) = split_authority(url).map_err(KeyserverUrlRejection::from)?;
     let literal = host.trim_start_matches('[').trim_end_matches(']');
@@ -1476,7 +1476,7 @@ mod tests {
 
     // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
     // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
-    // leaves the host lookup to the first query, which runs halt-aware on its worker.
+    // leaves the host lookup to the first query (not Stop-aware until ST-K1b, J10).
     #[test]
     fn the_static_check_rejects_config_faults_without_a_lookup() {
         for url in [
