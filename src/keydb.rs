@@ -641,6 +641,12 @@ impl KeySource for KeydbSource {
         }
     }
 
+    // Keyed by disc hash, not by samples: asked once per resolve, not per
+    // piece (KU §2.3 step 8, N-KU10; KSK1).
+    fn answer_depends_on_samples(&self) -> bool {
+        false
+    }
+
     fn label(&self) -> &'static str {
         "keydb"
     }

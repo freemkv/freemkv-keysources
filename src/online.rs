@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -608,6 +609,9 @@ pub struct OnlineSource {
     /// the identical address set, so the anti-rebinding guarantee is untouched: only the pooled
     /// TLS connection is reused, never a stale, un-reguarded address.
     agent: AgentCache,
+    /// KU-K1 (J15): whether the most recent `query` failure was transport-class
+    /// (`DecodeReachability::Transport`). Reset on every success.
+    last_failure_transport: AtomicBool,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -641,6 +645,7 @@ impl OnlineSource {
             base_url: base_url.into(),
             secret: secret.into(),
             agent: Arc::new(Mutex::new(None)),
+            last_failure_transport: AtomicBool::new(false),
             #[cfg(test)]
             test_net: None,
         }
@@ -746,6 +751,19 @@ impl OnlineSource {
             .map(|(host, _)| host)
             .unwrap_or_else(|_| self.base_url.clone());
         run_on_worker(&host, halt, move || job.run())
+    }
+
+    // KU-K1 (J15): classify the query just finished. A success resets it; a
+    // failure is transport-class only when its `DecodeReachability` says so —
+    // an HTTP answer (a 5xx included) is never transport-class.
+    fn record_last_failure_transport(&self, result: &Result<Vec<UnitKey>, Error>) {
+        let transport = result.is_err()
+            && matches!(
+                take_last_decode_reachability(),
+                Some(DecodeReachability::Transport)
+            );
+        self.last_failure_transport
+            .store(transport, Ordering::Relaxed);
     }
 }
 
@@ -1065,14 +1083,18 @@ impl KeySource for OnlineSource {
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query_with(ctx, &Halt::new())
+        let result = self.query_with(ctx, &Halt::new());
+        self.record_last_failure_transport(&result);
+        result
     }
 
     // AACS 2.1 forensic index set: same `query` round-trip as
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query_with(ctx, &Halt::new())
+        let result = self.query_with(ctx, &Halt::new());
+        self.record_last_failure_transport(&result);
+        result
     }
 
     fn label(&self) -> &'static str {
@@ -1081,6 +1103,11 @@ impl KeySource for OnlineSource {
 
     // host_certs: no-op default. No online cert fetch/endpoint today, so
     // OEM certs fall back to another source (e.g. keydb); no network touched.
+
+    // KU-K1 (J15): only a transport-class failure (no answer at all) is retried by `resolve`.
+    fn last_failure_was_transport(&self) -> bool {
+        self.last_failure_transport.load(Ordering::Relaxed)
+    }
 }
 
 // The `Authorization` header value, or `None` when no secret is configured

@@ -149,6 +149,12 @@ impl KeySource for MultiSource {
     fn label(&self) -> &'static str {
         "multi"
     }
+
+    // KU3-6: depends on samples if ANY inner source does, so a nested
+    // sample-dependent source keeps getting the per-piece ask.
+    fn answer_depends_on_samples(&self) -> bool {
+        self.sources.iter().any(|s| s.answer_depends_on_samples())
+    }
 }
 
 #[cfg(test)]
