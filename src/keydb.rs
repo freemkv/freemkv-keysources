@@ -456,10 +456,10 @@ impl KeydbSource {
 
         // On a match with no key: carry the specific reason if we have one, else
         // leave it empty for the library to render a bare `NoDerivableKey`.
-        let miss_path = if keys.is_empty() {
-            miss_reason.map(|n| vec![n]).unwrap_or_default()
-        } else {
-            Vec::new()
+        // KU J23: `NoVid` stays beside partial keys (the VID would derive the rest).
+        let miss_path = match miss_reason {
+            Some(n) if keys.is_empty() || n == KeyNode::NoVid => vec![n],
+            _ => Vec::new(),
         };
 
         KeydbResolution {
