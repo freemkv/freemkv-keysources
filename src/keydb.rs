@@ -792,6 +792,19 @@ mod tests {
         assert!(!shape.vid_available);
     }
 
+    // KU J23: stored unit keys for SOME CPS units plus a Media Key with no VID. The stored
+    // keys come back, and the miss path still says `NoVid`: the VID would derive the rest.
+    #[test]
+    fn partial_stored_keys_with_a_media_key_and_no_vid_report_no_vid() {
+        let mut e = blank_entry(HASH);
+        e.media_key = Some([0x33u8; 16]);
+        e.unit_keys = vec![(1, [0x55u8; 16])];
+        let db = db_with(e, Vec::new());
+        let r = KeydbSource::resolve_from(&db, &ctx(HASH, vec![[0x44u8; 16]; 2], None));
+        assert_eq!(r.keys.len(), 1, "the stored key");
+        assert_eq!(r.miss_path, vec![KeyNode::NoVid]);
+    }
+
     // A hash that is NOT in the keydb is the one true miss: not matched, no
     // shape, no miss path (the library renders this as `no entry`).
     #[test]
