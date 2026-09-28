@@ -1492,9 +1492,9 @@ mod tests {
             let r = check_keyserver_url_static(url).expect_err(url);
             assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
         }
-        // A host name is not looked up: `.invalid` never resolves, yet it passes here.
+        // A host name is not looked up: `.test` (RFC 2606) never resolves, yet it passes here.
         assert_eq!(
-            check_keyserver_url_static("https://keys.ku-e1.invalid/keys"),
+            check_keyserver_url_static("https://keys.ku-e1.test/keys"),
             Ok(())
         );
         assert_eq!(check_keyserver_url_static("https://8.8.8.8/keys"), Ok(()));
