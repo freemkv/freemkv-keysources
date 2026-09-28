@@ -9,7 +9,7 @@ use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
-use libfreemkv::{Error, KeySource};
+use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
@@ -20,6 +20,15 @@ use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 // never silently un-forwardable here (headroom, not an expected size).
 const MAX_MKB_BYTES: usize = 64 * 1024 * 1024;
 const TIMEOUT_SECS: u64 = 180;
+/// Stall bound for the key-service send and receive phases (stop-design-v5 T16, D3).
+#[cfg_attr(not(test), allow(dead_code))]
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Server-side upload processing allowance in the first-byte budget, bytes per second (T17, D3).
+#[cfg_attr(not(test), allow(dead_code))]
+const FIRST_BYTE_RATE: u64 = 256 * 1024;
+/// Queries in flight per key-service host (stop-design-v5 §2.7).
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_QUERY_WORKERS_PER_HOST: usize = 4;
 /// Minimum encrypted-content samples the online source will send in one key
 /// request — re-exported from the base crate
 /// ([`libfreemkv::keysource::MIN_SAMPLE_UNITS`]) so this crate and
@@ -323,6 +332,12 @@ impl Resolver for PinnedResolver {
     }
 }
 
+// The wait for the first response byte after the request was written.
+#[cfg_attr(not(test), allow(dead_code))]
+fn first_byte_budget(idle: Duration, _request_bytes: u64) -> Duration {
+    idle
+}
+
 /// Build a ureq agent that follows zero redirects (so a public URL can't
 /// 30x-redirect to an internal host) and pins DNS resolution to `pinned`
 /// (the addresses already validated by [`resolve_and_guard`]).
@@ -343,6 +358,37 @@ fn hardened_agent(pinned: Vec<SocketAddr>) -> ureq::Agent {
     ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
 }
 
+// `hardened_agent` with a caller-chosen idle bound, so the stall rules are testable at scale.
+#[cfg_attr(not(test), allow(dead_code))]
+fn hardened_agent_with(pinned: Vec<SocketAddr>, idle: Duration) -> ureq::Agent {
+    let config = Config::builder()
+        .max_redirects(0)
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(idle))
+        .timeout_recv_body(Some(idle))
+        .proxy(None)
+        .build();
+    ureq::Agent::with_parts(config, DefaultConnector::new(), PinnedResolver(pinned))
+}
+
+#[cfg(test)]
+type TestResolve = Arc<dyn Fn() -> Result<Vec<SocketAddr>, (GuardFail, String)> + Send + Sync>;
+
+// Test seam: replaces the host lookup and the POST target, so a loopback stub can play the service.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestNet {
+    resolve: TestResolve,
+    post_url: String,
+    idle: Duration,
+}
+
+// Queries holding a worker slot for `host` right now.
+#[cfg(test)]
+fn query_slots_in_flight(_host: &str) -> usize {
+    0
+}
+
 pub struct OnlineSource {
     base_url: String,
     secret: String,
@@ -351,6 +397,8 @@ pub struct OnlineSource {
     /// the identical address set, so the anti-rebinding guarantee is untouched: only the pooled
     /// TLS connection is reused, never a stale, un-reguarded address.
     agent: Mutex<Option<(Vec<SocketAddr>, Arc<ureq::Agent>)>>,
+    #[cfg(test)]
+    test_net: Option<TestNet>,
 }
 
 impl OnlineSource {
@@ -359,6 +407,8 @@ impl OnlineSource {
             base_url: base_url.into(),
             secret: secret.into(),
             agent: Mutex::new(None),
+            #[cfg(test)]
+            test_net: None,
         }
     }
 
@@ -386,7 +436,7 @@ impl OnlineSource {
 
     // The server-resolved Unit Keys for this disc: one round-trip, returning a terminal `UK` or
     // a `VUK` derived locally. `Ok`/`Err` draw the miss-vs-outage distinction.
-    fn query(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
+    fn query_with(&self, ctx: &dyn ResolveCtx, _halt: &Halt) -> Result<Vec<UnitKey>, Error> {
         // Reset the per-thread decode-reachability slot so it reflects ONLY this
         // query afterwards: `Some(..)` once a POST answers/transport-fails, `None`
         // if we short-circuit before the network. See `take_last_decode_reachability`.
@@ -460,7 +510,14 @@ impl OnlineSource {
         // Resolve + SSRF-guard the host just before the POST; pin the
         // validated addresses so a DNS rebind between config time and fetch
         // time can't redirect the request to an internal/metadata host.
-        let pinned = match resolve_and_guard(&self.base_url) {
+        #[cfg(test)]
+        let guarded = match &self.test_net {
+            Some(t) => (t.resolve)(),
+            None => resolve_and_guard(&self.base_url),
+        };
+        #[cfg(not(test))]
+        let guarded = resolve_and_guard(&self.base_url);
+        let pinned = match guarded {
             Ok(addrs) => addrs,
             // Did-not-RESOLVE is the service unreachable, not a bad URL.
             Err((GuardFail::Unreachable, _)) => {
@@ -489,8 +546,17 @@ impl OnlineSource {
                 return Err(Error::KeyServiceUnavailable);
             }
         };
-        let agent = self.agent_for(pinned);
-        let mut req = agent.post(&self.base_url);
+        #[cfg(test)]
+        let (agent, url) = match &self.test_net {
+            Some(t) => (
+                Arc::new(hardened_agent_with(pinned, t.idle)),
+                t.post_url.clone(),
+            ),
+            None => (self.agent_for(pinned), self.base_url.clone()),
+        };
+        #[cfg(not(test))]
+        let (agent, url) = (self.agent_for(pinned), self.base_url.clone());
+        let mut req = agent.post(&url);
         if let Some(value) = bearer_header(&self.secret) {
             req = req.header("Authorization", &value);
         }
@@ -731,14 +797,14 @@ impl KeySource for OnlineSource {
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query(ctx)
+        self.query_with(ctx, &Halt::new())
     }
 
     // AACS 2.1 forensic index set: same `query` round-trip as
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        self.query(ctx)
+        self.query_with(ctx, &Halt::new())
     }
 
     fn label(&self) -> &'static str {
@@ -965,20 +1031,26 @@ mod tests {
         );
     }
 
-    // The POST reply body has its own deadline, not just the headers: ureq
-    // 3.4.1+ recv_response covers headers only, so without recv_body a stalled
-    // reply would hang the key request forever.
+    // KT9 (replaces the 180 s totals test). Per spec, stop-design-v5 §2.7: "There is
+    // **no total cap.**" Every phase bound is a stall bound owned by the idle connector.
+    // Guard: do not change without a spec citation proving otherwise.
     #[test]
-    fn the_reply_body_read_is_bounded_not_only_the_headers() {
+    fn agent_timeouts_are_idle_not_totals() {
         let agent = hardened_agent(Vec::new());
         let t = agent.config().timeouts();
+        assert_eq!(t.global, None, "no whole-request total");
+        assert_eq!(t.per_call, None, "no per-call total");
+        assert_eq!(t.send_request, None, "request headers: idle only");
+        assert_eq!(t.send_body, None, "request body: idle only");
         assert_eq!(
-            t.recv_body,
-            Some(Duration::from_secs(TIMEOUT_SECS)),
-            "ureq 3.4.1+ recv_response covers headers only; without recv_body the \
-             reply read has no deadline at all"
+            t.recv_response, None,
+            "first byte: the T17 budget, not a total"
         );
-        assert_eq!(t.recv_response, Some(Duration::from_secs(TIMEOUT_SECS)));
+        assert_eq!(t.recv_body, None, "reply body: idle only");
+        // T15: "Connect | 10 s with no answer (existing)".
+        assert_eq!(t.connect, Some(Duration::from_secs(10)));
+        // T16: "**60 s (D3)**. This replaces the 180 s totals".
+        assert_eq!(IDLE_TIMEOUT, Duration::from_secs(60));
     }
 
     #[test]
@@ -1915,5 +1987,499 @@ mod tests {
         assert!(parse_uk("00 0102030405060708090a0b0c0d0e0f").is_none());
         // Wrong length is still rejected.
         assert!(parse_uk("00").is_none());
+    }
+
+    // ── ST-K1a: stall-only key-service timeouts, mid-flight Stop (stop-design-v5 §2.7, §5.3)
+
+    /// Scaled T16 idle bound for the loopback tests (60 s in production).
+    const T_IDLE: Duration = Duration::from_millis(300);
+    /// How long a stub holds a stalled connection; far past every bound under test.
+    const STUB_HOLD: Duration = Duration::from_secs(20);
+
+    fn source_via(
+        host: &str,
+        idle: Duration,
+        resolve: impl Fn() -> Result<Vec<SocketAddr>, (GuardFail, String)> + Send + Sync + 'static,
+    ) -> OnlineSource {
+        let mut src = OnlineSource::new(format!("https://{host}/keys"), "s3cr3t");
+        src.test_net = Some(TestNet {
+            resolve: Arc::new(resolve),
+            post_url: format!("http://{host}/keys"),
+            idle,
+        });
+        src
+    }
+
+    fn ctx_with_mkb(len: usize) -> GuardCtx {
+        GuardCtx {
+            mkb: vec![0x5a; len],
+            samples: MIN_SAMPLE_UNITS,
+        }
+    }
+
+    /// What the loopback stub does with its one connection.
+    #[derive(Clone, Copy)]
+    enum Stub {
+        /// Read the whole request, then answer with this status and `{}`.
+        Answer(u16),
+        /// Read the whole request, then never answer.
+        NeverAnswer,
+        /// Read the request head only, then stop reading.
+        StallUpload,
+        /// Answer 200 with a 100-byte body, send 5 bytes of it, then stall.
+        StallBody,
+        /// Answer 200, then send an `n`-byte JSON body one byte per `gap`.
+        TrickleBody { n: usize, gap: Duration },
+        /// Read the body `chunk` bytes per `gap`, then answer 200 with `{}`.
+        SlowReader { chunk: usize, gap: Duration },
+    }
+
+    fn read_head(sock: &mut std::net::TcpStream) -> usize {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut byte) {
+                Ok(0) | Err(_) => return 0,
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        head.lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn read_body(sock: &mut std::net::TcpStream, mut left: usize, chunk: usize, gap: Duration) {
+        let mut buf = vec![0u8; chunk.max(1)];
+        while left > 0 {
+            let want = left.min(buf.len());
+            match sock.read(&mut buf[..want]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => left -= n,
+            }
+            if !gap.is_zero() {
+                std::thread::sleep(gap);
+            }
+        }
+    }
+
+    /// A one-connection HTTP/1.1 stub on loopback, playing the key service.
+    fn stub_server(kind: Stub) -> SocketAddr {
+        use std::io::Write as _;
+        let listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stub listener");
+        let addr = listener.local_addr().expect("stub address");
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let len = read_head(&mut sock);
+            let ok = |code: u16, body_len: usize| {
+                format!(
+                    "HTTP/1.1 {code} X\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                )
+            };
+            match kind {
+                Stub::Answer(code) => {
+                    read_body(&mut sock, len, 64 * 1024, Duration::ZERO);
+                    let _ = sock.write_all(format!("{}{{}}", ok(code, 2)).as_bytes());
+                }
+                Stub::NeverAnswer => {
+                    read_body(&mut sock, len, 64 * 1024, Duration::ZERO);
+                    std::thread::sleep(STUB_HOLD);
+                }
+                Stub::StallUpload => std::thread::sleep(STUB_HOLD),
+                Stub::StallBody => {
+                    read_body(&mut sock, len, 64 * 1024, Duration::ZERO);
+                    let _ = sock.write_all(format!("{}{{\"UK\"", ok(200, 100)).as_bytes());
+                    std::thread::sleep(STUB_HOLD);
+                }
+                Stub::TrickleBody { n, gap } => {
+                    read_body(&mut sock, len, 64 * 1024, Duration::ZERO);
+                    let _ = sock.write_all(ok(200, n).as_bytes());
+                    let body = format!("{{{}}}", " ".repeat(n - 2));
+                    for b in body.bytes() {
+                        std::thread::sleep(gap);
+                        if sock.write_all(&[b]).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Stub::SlowReader { chunk, gap } => {
+                    read_body(&mut sock, len, chunk, gap);
+                    let _ = sock.write_all(format!("{}{{}}", ok(200, 2)).as_bytes());
+                }
+            }
+            let _ = sock.flush();
+        });
+        addr
+    }
+
+    /// Polls `cond` every 10 ms until it holds or `within` passes.
+    fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < within {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// Runs `query_with` on this thread and cancels `halt` after `after`; returns the
+    /// result and how long after the cancel it came back.
+    fn query_cancelled_after(
+        src: &OnlineSource,
+        ctx: &GuardCtx,
+        after: Duration,
+    ) -> (Result<Vec<UnitKey>, Error>, Duration) {
+        let halt = Halt::new();
+        let canceller = {
+            let halt = halt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                halt.cancel();
+                std::time::Instant::now()
+            })
+        };
+        let out = src.query_with(ctx, &halt);
+        let returned = std::time::Instant::now();
+        let cancelled = canceller.join().expect("canceller");
+        (out, returned.saturating_duration_since(cancelled))
+    }
+
+    // KT1. Per spec, stop-design-v5 §2.7: "On Stop, the call returns `Halted` and
+    // records nothing." A hung host lookup must not hold the caller.
+    #[test]
+    fn query_halted_during_dns() {
+        let host = "kt1.test";
+        let src = source_via(host, T_IDLE, || {
+            std::thread::sleep(Duration::from_secs(3));
+            Err((GuardFail::Unreachable, "DNS resolution timed out".into()))
+        });
+        let (out, after_cancel) =
+            query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
+        assert_eq!(
+            out.expect_err("a Stop is never an answer").code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert!(
+            after_cancel <= Duration::from_secs(1),
+            "Halted took {after_cancel:?}"
+        );
+        assert_eq!(
+            take_last_decode_reachability(),
+            None,
+            "a Stop records nothing"
+        );
+        assert!(
+            eventually(Duration::from_secs(8), || query_slots_in_flight(host) == 0),
+            "the abandoned worker frees its slot when its lookup returns"
+        );
+    }
+
+    // KT2. Per spec, stop-design-v5 §2.7: "The worker is abandoned. It ends on its own
+    // at the next T15–T17 bound, and its slot is freed then."
+    #[test]
+    fn query_halted_during_post() {
+        let host = "kt2.test";
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        let (out, after_cancel) =
+            query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(150));
+        assert_eq!(
+            out.expect_err("a Stop is never an answer").code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert!(
+            after_cancel <= Duration::from_secs(1),
+            "Halted took {after_cancel:?}"
+        );
+        assert_eq!(
+            take_last_decode_reachability(),
+            None,
+            "a Stop records nothing"
+        );
+        assert!(
+            eventually(Duration::from_secs(5), || query_slots_in_flight(host) == 0),
+            "the worker ends at its own first-byte bound and frees its slot"
+        );
+    }
+
+    // KT3. Per spec, stop-design-v5 §2.7 (D4): "When the cap is full, the caller waits
+    // halt-aware for a slot." The cap is "4 per host".
+    #[test]
+    fn slot_cap_waits_halt_aware() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let host = "kt3.test";
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let src = Arc::new({
+            let entered = entered.clone();
+            source_via(host, T_IDLE, move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                Err((GuardFail::Unreachable, "released".into()))
+            })
+        });
+        let spawn_query = |halt: Halt| {
+            let src = src.clone();
+            std::thread::spawn(move || src.query_with(&ctx_with_mkb(0), &halt))
+        };
+        let first_four: Vec<_> = (0..4).map(|_| spawn_query(Halt::new())).collect();
+        assert!(eventually(Duration::from_secs(2), || entered
+            .load(Ordering::SeqCst)
+            == 4));
+
+        let fifth = spawn_query(Halt::new());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            4,
+            "the 5th query must wait for a slot"
+        );
+        assert_eq!(query_slots_in_flight(host), MAX_QUERY_WORKERS_PER_HOST);
+
+        // A cancel while waiting for a slot returns Halted and starts nothing.
+        let waiting = Halt::new();
+        let sixth = spawn_query(waiting.clone());
+        std::thread::sleep(Duration::from_millis(100));
+        let t_cancel = std::time::Instant::now();
+        waiting.cancel();
+        let sixth = sixth.join().expect("sixth query");
+        assert!(t_cancel.elapsed() <= Duration::from_secs(1));
+        assert_eq!(
+            sixth.expect_err("cancelled while waiting").code(),
+            libfreemkv::error::E_HALTED
+        );
+
+        // One slot frees, so exactly the waiting 5th proceeds.
+        release.send(()).unwrap();
+        assert!(eventually(Duration::from_secs(2), || entered
+            .load(Ordering::SeqCst)
+            == 5));
+        for _ in 0..4 {
+            release.send(()).unwrap();
+        }
+        for q in first_four.into_iter().chain([fifth]) {
+            assert_eq!(
+                q.join().expect("query").expect_err("unreachable").code(),
+                libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            5,
+            "the cancelled 6th never started"
+        );
+    }
+
+    // KT4 (T16 a). Per spec, stop-design-v5 §2.7: "Receive headers and body | **60 s with
+    // no bytes read** | every read that returns bytes". A slow reply that keeps moving lives.
+    #[test]
+    fn slow_trickle_response_not_timed_out() {
+        let n = 8;
+        let gap = T_IDLE / 2;
+        assert!(gap * n as u32 > 3 * T_IDLE, "total must exceed 3 × idle");
+        let addr = stub_server(Stub::TrickleBody { n, gap });
+        let src = source_via("kt4.test", T_IDLE, move || Ok(vec![addr]));
+        let out = src.query_with(&ctx_with_mkb(0), &Halt::new());
+        assert_eq!(out.expect("a moving reply is never timed out"), Vec::new());
+    }
+
+    // KT5 (T16 b). Per spec, stop-design-v5 T16: "no bytes moved" for 60 s → "`Transport`
+    // reachability". A reply that stops mid-body fails at idle, as a transport failure.
+    #[test]
+    fn stalled_response_body_times_out_on_idle() {
+        let addr = stub_server(Stub::StallBody);
+        let src = source_via("kt5.test", T_IDLE, move || Ok(vec![addr]));
+        let t0 = std::time::Instant::now();
+        let out = src.query_with(&ctx_with_mkb(0), &Halt::new());
+        let took = t0.elapsed();
+        assert_eq!(
+            out.expect_err("a stalled reply is no answer").code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE
+        );
+        assert!(
+            took <= T_IDLE + Duration::from_secs(1),
+            "stall cut after {took:?}"
+        );
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Transport)
+        );
+    }
+
+    // KT6 (T16 a, send side). Per spec, stop-design-v5 §2.7: "Send request and body |
+    // **60 s with no bytes written** | every write that moves bytes".
+    #[test]
+    fn slow_upload_not_timed_out() {
+        let gap = T_IDLE / 2;
+        let chunk = 1024 * 1024;
+        let mkb = 8 * 1024 * 1024;
+        let addr = stub_server(Stub::SlowReader { chunk, gap });
+        let src = source_via("kt6.test", T_IDLE, move || Ok(vec![addr]));
+        let t0 = std::time::Instant::now();
+        let out = src.query_with(&ctx_with_mkb(mkb), &Halt::new());
+        assert!(
+            t0.elapsed() > 3 * T_IDLE,
+            "the upload must outlast 3 × idle to prove anything"
+        );
+        assert_eq!(out.expect("a moving upload is never timed out"), Vec::new());
+    }
+
+    // KT7a. Per spec, stop-design-v5 T17: "**60 s + body / 256 KiB/s (D3)**" — the one
+    // phase with no byte signal while the server processes the upload.
+    #[test]
+    fn await_first_byte_budget_scales_with_body() {
+        let idle = Duration::from_secs(60);
+        assert_eq!(FIRST_BYTE_RATE, 256 * 1024);
+        assert_eq!(first_byte_budget(idle, 0), idle);
+        assert_eq!(first_byte_budget(idle, 256 * 1024), Duration::from_secs(61));
+        assert_eq!(
+            first_byte_budget(idle, 128 * 1024),
+            Duration::from_millis(60_500)
+        );
+        // The largest forwardable MKB (64 MiB) buys 256 s of server processing.
+        assert_eq!(
+            first_byte_budget(idle, 64 * 1024 * 1024),
+            Duration::from_secs(316)
+        );
+        assert_eq!(
+            first_byte_budget(idle, u64::MAX),
+            first_byte_budget(idle, u64::MAX)
+        );
+    }
+
+    // KT7b. Per spec, stop-design-v5 T17: a server that never answers after the body fails
+    // at "60 s + body / 256 KiB/s" as `Transport` — not at the bare idle bound.
+    #[test]
+    fn await_first_byte_budget_expires_without_first_byte() {
+        let mkb = 96 * 1024;
+        // A lower bound on the bytes written: the base64 MKB alone.
+        let floor = first_byte_budget(T_IDLE, (mkb as u64).div_ceil(3) * 4);
+        assert!(
+            floor >= T_IDLE + Duration::from_millis(400),
+            "the body must matter"
+        );
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("kt7.test", T_IDLE, move || Ok(vec![addr]));
+        let t0 = std::time::Instant::now();
+        let out = src.query_with(&ctx_with_mkb(mkb), &Halt::new());
+        let took = t0.elapsed();
+        assert_eq!(
+            out.expect_err("no first byte is no answer").code(),
+            libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE
+        );
+        assert!(
+            took >= floor,
+            "fired at {took:?}, before the {floor:?} first-byte budget"
+        );
+        assert!(
+            took <= floor + Duration::from_secs(1),
+            "fired late: {took:?}"
+        );
+        assert_eq!(
+            take_last_decode_reachability(),
+            Some(DecodeReachability::Transport)
+        );
+    }
+
+    // KT8. Per spec, stop-design-v5 §2.7: "Reachability is recorded on the caller's thread,
+    // and only when the worker's result arrives." RFC 9110 §15.6 (SS-20): "The 5xx (Server
+    // Error) class of status code indicates that the server is aware that it has erred".
+    #[test]
+    fn reachability_recorded_on_caller_thread_only_on_result() {
+        for (host, code) in [("kt8a.test", 200u16), ("kt8b.test", 503)] {
+            let addr = stub_server(Stub::Answer(code));
+            let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+            let _ = src.query_with(&ctx_with_mkb(0), &Halt::new());
+            assert_eq!(
+                take_last_decode_reachability(),
+                Some(DecodeReachability::Status(code)),
+                "an answer ({code}) is recorded on the calling thread"
+            );
+        }
+        // A Stop records nothing, then or later: the late worker result reaches no caller.
+        let host = "kt8c.test";
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        let (out, _) = query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
+        assert_eq!(
+            out.expect_err("stopped").code(),
+            libfreemkv::error::E_HALTED
+        );
+        assert!(eventually(
+            Duration::from_secs(5),
+            || query_slots_in_flight(host) == 0
+        ));
+        assert_eq!(
+            take_last_decode_reachability(),
+            None,
+            "a stopped query records nothing"
+        );
+    }
+
+    // KT10. Per spec, stop-design-v5 §2.7: "a Stop … lands within one slice even while DNS,
+    // connect, upload or download is in progress." Each stall is cancelled at its stage.
+    #[test]
+    fn stop_mid_flight_returns_within_a_slice() {
+        let idle = Duration::from_secs(2);
+        for (host, stub, mkb) in [
+            ("kt10a.test", Stub::NeverAnswer, 0),
+            ("kt10b.test", Stub::StallUpload, 8 * 1024 * 1024),
+            ("kt10c.test", Stub::StallBody, 0),
+        ] {
+            let addr = stub_server(stub);
+            let src = source_via(host, idle, move || Ok(vec![addr]));
+            let (out, after_cancel) =
+                query_cancelled_after(&src, &ctx_with_mkb(mkb), Duration::from_millis(300));
+            assert_eq!(
+                out.expect_err(host).code(),
+                libfreemkv::error::E_HALTED,
+                "{host}"
+            );
+            assert!(
+                after_cancel <= Duration::from_secs(1),
+                "{host}: Halted took {after_cancel:?}"
+            );
+            assert_eq!(
+                take_last_decode_reachability(),
+                None,
+                "{host}: a Stop records nothing"
+            );
+            // The abandoned worker ends at its own T16/T17 bound, which frees its slot.
+            let bound = first_byte_budget(idle, (mkb as u64).div_ceil(3) * 4 + 4096);
+            assert!(
+                eventually(bound + Duration::from_secs(2), || query_slots_in_flight(
+                    host
+                ) == 0),
+                "{host}: the worker's slot was never freed"
+            );
+        }
+    }
+
+    // G12. Per spec, RFC 9110 §15.4 (SS-20): "The 3xx (Redirection) class of status code
+    // indicates that further action needs to be taken by the user agent". Never followed.
+    // Guard: do not change without a spec citation proving otherwise.
+    #[test]
+    fn the_agent_keeps_zero_redirects_and_no_proxy_after_the_timeout_change() {
+        for agent in [
+            hardened_agent(Vec::new()),
+            hardened_agent_with(Vec::new(), T_IDLE),
+        ] {
+            assert_eq!(agent.config().max_redirects(), 0);
+            assert!(agent.config().proxy().is_none());
+        }
+    }
+
+    // G13. Per stop-design-v5 §5.9 G13: "the byte caps are unchanged: keysources
+    // `MAX_RESPONSE_BYTES`". Guard: do not change without a spec citation proving otherwise.
+    #[test]
+    fn the_reply_byte_cap_is_unchanged() {
+        assert_eq!(MAX_RESPONSE_BYTES, 1024 * 1024);
     }
 }
