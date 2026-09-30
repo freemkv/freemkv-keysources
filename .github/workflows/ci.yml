@@ -152,10 +152,10 @@ jobs:
           patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans licenses sources
-          manifest-path: freemkv-keysources/Cargo.toml
+      - uses: taiki-e/install-action@cargo-deny
+      # Run from the repo dir so the generated .cargo/config.toml path patches apply.
+      - run: cargo deny --all-features check advisories bans licenses sources
+        working-directory: freemkv-keysources
 
   # This crate ships wherever freemkv and autorip ship, and it drags in all of
   # libfreemkv's platform code (SCSI transports included). Build the tests, not
