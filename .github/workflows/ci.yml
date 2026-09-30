@@ -94,7 +94,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       # fmt runs on the MSRV pin; clippy runs on stable so new-lint debt is a
       # blocking gate the pinned toolchain would hide. Stable is installed first
@@ -125,7 +125,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -149,7 +149,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -182,7 +182,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -209,7 +209,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -250,7 +250,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:

@@ -96,7 +96,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -119,7 +119,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -145,7 +145,7 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv freemkv-unlock
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
