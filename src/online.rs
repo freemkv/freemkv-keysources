@@ -960,7 +960,7 @@ pub fn set_last_decode_reachability(outcome: Option<DecodeReachability>) {
 
 // Map a key-service HTTP status into the operator action it implies: 401/403
 // fix credentials, 429 back off, 5xx wait — none of them is "no key" (the
-// genuine miss is a 200 with an empty body), the original bug this fixes.
+// definitive 404/422 misses are handled before this function).
 fn classify_http_status(code: u16) -> Error {
     match code {
         401 | 403 => Error::KeyServiceUnauthorized,
@@ -989,8 +989,7 @@ fn interpret_reply(
         }
         Err(e) => {
             // A 4xx/5xx is still an ANSWER (record its status); a transport
-            // error is not (record `Transport`). Kept separate from the
-            // error-mapping below, which is unchanged.
+            // error is not (record `Transport`).
             let outcome = match &e {
                 ureq::Error::StatusCode(code) => DecodeReachability::Status(*code),
                 _ => DecodeReachability::Transport,
@@ -1001,6 +1000,19 @@ fn interpret_reply(
                 bump_active_progress();
             }
             record_decode_reachability(outcome);
+            // A definitive miss is an answer for these samples, not a dead source.
+            // In particular, FMTS 422 means this phase is not held: the resolver
+            // must still be able to ask the same source about the other phase.
+            if let ureq::Error::StatusCode(code @ (404 | 422)) = e {
+                tracing::info!(
+                    target: "freemkv::keysource",
+                    phase = "keyserver_post",
+                    http_status = code,
+                    elapsed_ms,
+                    "key service has no key for these samples"
+                );
+                return Ok(Vec::new());
+            }
             // 401/403/429/5xx demand different operator actions; collapsing
             // them is why a 502 was read as "no key". Each arm RETURNS the
             // classified error, never an empty vec, so it survives past here.
@@ -1132,9 +1144,8 @@ fn interpret_reply(
             }
         }
     }
-    // The genuine miss — the ONLY path returning `Ok(empty)` from a completed
-    // round-trip, logged distinctly from every failure above so a 502 can
-    // never again look like a missing key. `E7022` is the truth here.
+    // A successful JSON reply with no key is also a definitive miss, like
+    // 404/422 above. Keep it distinct from service failures such as a 502.
     tracing::info!(
         target: "freemkv::keysource",
         phase = "keyserver_post",
@@ -1742,7 +1753,7 @@ mod tests {
     }
 
     // Each status maps to a DIFFERENT operator action: fix the token
-    // (401/403), back off (429), wait (5xx) — never "no key" from a status.
+    // (401/403), back off (429), wait (5xx). Definitive misses bypass this mapping.
     #[test]
     fn http_status_maps_to_the_operator_action() {
         let cases: &[(u16, u16)] = &[
@@ -1752,7 +1763,6 @@ mod tests {
             (500, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
             (502, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
             (400, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
-            (404, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
         ];
         for (status, want) in cases {
             assert_eq!(
@@ -1763,7 +1773,7 @@ mod tests {
             assert_ne!(
                 classify_http_status(*status).code(),
                 libfreemkv::error::E_NO_DISC_KEY,
-                "no HTTP status may ever mean \"this disc has no key\""
+                "service failures must not mean \"this disc has no key\""
             );
         }
     }
@@ -1815,8 +1825,10 @@ mod tests {
 
         // A definitive 422 ("licensed but unresolved") / 404 is still an ANSWER:
         // record the status so the caller reads it as reachable (genuine no-key).
-        for status in [404u16, 422] {
-            let _ = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1);
+        for status in [422u16, 404] {
+            let keys = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1)
+                .expect("a definitive miss must allow the resolver to try the other FMTS phase");
+            assert!(keys.is_empty());
             assert_eq!(
                 take_last_decode_reachability(),
                 Some(DecodeReachability::Status(status)),
@@ -3087,7 +3099,7 @@ mod tests {
     fn recording_last_failure_does_not_erase_the_reachability_slot() {
         let addr = stub_server(Stub::Answer(422));
         let src = source_via("kuk1f.test", T_IDLE, move || Ok(vec![addr]));
-        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).unwrap().is_empty());
         assert_eq!(
             take_last_decode_reachability(),
             Some(DecodeReachability::Status(422)),
@@ -3096,7 +3108,7 @@ mod tests {
 
         let addr = stub_server(Stub::Answer(422));
         let src = source_via("kuk1g.test", T_IDLE, move || Ok(vec![addr]));
-        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).unwrap().is_empty());
         assert_eq!(
             take_last_decode_reachability(),
             Some(DecodeReachability::Status(422)),
