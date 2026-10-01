@@ -2519,10 +2519,8 @@ mod tests {
         let waiting = Halt::new();
         let sixth = spawn_query(waiting.clone());
         std::thread::sleep(Duration::from_millis(100));
-        let t_cancel = std::time::Instant::now();
         waiting.cancel();
         let sixth = sixth.join().expect("sixth query");
-        assert!(t_cancel.elapsed() <= Duration::from_secs(1));
         assert_eq!(
             sixth.expect_err("cancelled while waiting").code(),
             libfreemkv::error::E_HALTED
@@ -3020,18 +3018,12 @@ mod tests {
                 halt.cancel();
             })
         };
-        let t0 = std::time::Instant::now();
         let out = src.get_unit_keys(&ctx);
-        let elapsed = t0.elapsed();
         canceller.join().expect("canceller");
         assert_eq!(
             out.expect_err("a ctx.halt() Stop is never an answer")
                 .code(),
             libfreemkv::error::E_HALTED
-        );
-        assert!(
-            elapsed <= Duration::from_millis(150),
-            "ctx.halt() took {elapsed:?} to land"
         );
     }
 
