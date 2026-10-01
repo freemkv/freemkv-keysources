@@ -2675,7 +2675,8 @@ mod tests {
         // A Stop records nothing, then or later: the late worker result reaches no caller.
         let host = "kt8c.test";
         let addr = stub_server(Stub::NeverAnswer);
-        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        // An idle timeout far past the Stop, so only the Stop can end the query.
+        let src = source_via(host, Duration::from_secs(30), move || Ok(vec![addr]));
         let (out, _) = query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
         assert_eq!(
             out.expect_err("stopped").code(),
