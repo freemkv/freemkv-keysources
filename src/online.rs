@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
-use libfreemkv::halt::Progress;
+use libfreemkv::halt::Liveness;
 use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
 use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
@@ -350,14 +350,14 @@ struct IdleTransport<In> {
 }
 
 thread_local! {
-    // Progress for the query in flight on THIS thread (§2.7, T29), bumped by
+    // Liveness for the query in flight on THIS thread (§2.7, T29), bumped by
     // IdleTransport on every byte moved. Thread-local: ureq's cached Agent
     // reuses one connector across queries whose ctx.progress() differs.
-    static ACTIVE_QUERY_PROGRESS: std::cell::RefCell<Option<Progress>> =
+    static ACTIVE_QUERY_PROGRESS: std::cell::RefCell<Option<Liveness>> =
         const { std::cell::RefCell::new(None) };
 }
 
-// Bump this thread's active query Progress, if `PostJob::post` set one; a no-op
+// Bump this thread's active query Liveness, if `PostJob::post` set one; a no-op
 // off a worker thread (or with no ctx.progress()).
 fn bump_active_progress() {
     ACTIVE_QUERY_PROGRESS.with(|p| {
@@ -762,8 +762,8 @@ struct PostJob {
     /// The caller's Stop, re-checked after the lookup, before anything is sent.
     halt: Halt,
     /// §2.7, T29: bumped on every body byte moved and at answer; held `busy()`
-    /// for the call's duration. `None` when the ctx carries no `Progress`.
-    progress: Option<Progress>,
+    /// for the call's duration. `None` when the ctx carries no `Liveness`.
+    progress: Option<Liveness>,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -775,7 +775,7 @@ impl PostJob {
         // §2.1 bullet 3: "The K1 worker holds busy() while a key-service call is
         // in flight" — held for the worker's whole run, including past a Stop
         // the caller already gave up on (the worker still runs to its own bound).
-        let _busy = self.progress.as_ref().map(Progress::busy);
+        let _busy = self.progress.as_ref().map(Liveness::busy);
         ACTIVE_QUERY_PROGRESS.with(|p| *p.borrow_mut() = self.progress.clone());
         let answer = self.post();
         (answer, take_last_decode_reachability())
@@ -1896,7 +1896,7 @@ mod tests {
         mkb: Vec<u8>,
         samples: usize,
         halt: Option<Halt>,
-        progress: Option<Progress>,
+        progress: Option<Liveness>,
     }
     impl ResolveCtx for GuardCtx {
         fn disc_hash(&self) -> &str {
@@ -1920,7 +1920,7 @@ mod tests {
         fn halt(&self) -> Option<&Halt> {
             self.halt.as_ref()
         }
-        fn progress(&self) -> Option<&Progress> {
+        fn progress(&self) -> Option<&Liveness> {
             self.progress.as_ref()
         }
     }
@@ -3035,7 +3035,7 @@ mod tests {
         let gap = T_IDLE / 2;
         let addr = stub_server(Stub::TrickleBody { n, gap });
         let src = Arc::new(source_via("stk1b2.test", T_IDLE, move || Ok(vec![addr])));
-        let progress = Progress::new();
+        let progress = Liveness::new();
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
@@ -3064,13 +3064,13 @@ mod tests {
     }
 
     // §2.1 bullet 3: "The K1 worker holds `busy()` while a key-service call is in
-    // flight." An `idle_only` `StallTimer` on the same `Progress` must never see
+    // flight." An `idle_only` `StallTimer` on the same `Liveness` must never see
     // `Expired` while the call runs, even though a `NeverAnswer` stub sends nothing.
     #[test]
     fn busy_is_held_during_the_call() {
         let addr = stub_server(Stub::NeverAnswer);
         let src = Arc::new(source_via("stk1b3.test", T_IDLE, move || Ok(vec![addr])));
-        let progress = Progress::new();
+        let progress = Liveness::new();
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
