@@ -2264,6 +2264,9 @@ mod tests {
 
     /// Scaled T16 idle bound for the loopback tests (60 s in production).
     const T_IDLE: Duration = Duration::from_millis(300);
+    /// Idle bound for a Stop test against a silent stub: well past the Stop, so only the Stop
+    /// can end the query, and short enough for the abandoned worker to drain within the test.
+    const T_STOP_IDLE: Duration = Duration::from_secs(2);
     /// How long a stub holds a stalled connection; far past every bound under test.
     const STUB_HOLD: Duration = Duration::from_secs(20);
 
@@ -2458,7 +2461,7 @@ mod tests {
     fn query_halted_during_post() {
         let host = "kt2.test";
         let addr = stub_server(Stub::NeverAnswer);
-        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        let src = source_via(host, T_STOP_IDLE, move || Ok(vec![addr]));
         let (out, after_cancel) =
             query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(150));
         assert_eq!(
@@ -2475,7 +2478,7 @@ mod tests {
             "a Stop records nothing"
         );
         assert!(
-            eventually(Duration::from_secs(5), || query_slots_in_flight(host) == 0),
+            eventually(Duration::from_secs(10), || query_slots_in_flight(host) == 0),
             "the worker ends at its own first-byte bound and frees its slot"
         );
     }
@@ -2675,8 +2678,7 @@ mod tests {
         // A Stop records nothing, then or later: the late worker result reaches no caller.
         let host = "kt8c.test";
         let addr = stub_server(Stub::NeverAnswer);
-        // An idle timeout well past the Stop, so only the Stop can end the query.
-        let src = source_via(host, Duration::from_secs(2), move || Ok(vec![addr]));
+        let src = source_via(host, T_STOP_IDLE, move || Ok(vec![addr]));
         let (out, _) = query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
         assert_eq!(
             out.expect_err("stopped").code(),
