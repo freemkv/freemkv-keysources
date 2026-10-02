@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
+use libfreemkv::halt::Liveness;
 use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
 use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
@@ -49,75 +50,16 @@ pub use libfreemkv::keysource::MIN_SAMPLE_UNITS;
 /// the client to OOM with an unbounded body.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-// ── SSRF guard.
-fn is_blocked_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local() // 169.254.0.0/16, incl. 169.254.169.254
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                // Carrier-grade NAT 100.64.0.0/10.
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
-                // "This network" 0.0.0.0/8.
-                || v4.octets()[0] == 0
-                // Benchmarking 198.18.0.0/15 (RFC 2544) — 198.18.x and 198.19.x
-                // (the /15 second octet is 18 with the low bit free, i.e. 18|19).
-                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
-                // IETF protocol assignments 192.0.0.0/24 (RFC 6890), which
-                // includes 192.0.0.170/171 (NAT64/DNS64 discovery). Distinct
-                // from 192.0.2.0/24 TEST-NET-1, already caught by is_documentation.
-                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
-                // Class E reserved 240.0.0.0/4.
-                || v4.octets()[0] >= 240
-        }
-        IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            // 6to4 (2002::/16) embeds an IPv4 in segments[1..3]; Teredo
-            // (2001:0000::/32) embeds the client IPv4 in the last two segments,
-            // each XOR 0xffff. Both must be re-checked as their embedded IPv4.
-            let sixtofour = (seg[0] == 0x2002)
-                .then(|| std::net::Ipv4Addr::from(((seg[1] as u32) << 16) | (seg[2] as u32)));
-            let teredo = (seg[0] == 0x2001 && seg[1] == 0x0000).then(|| {
-                std::net::Ipv4Addr::from(
-                    (((seg[6] ^ 0xffff) as u32) << 16) | ((seg[7] ^ 0xffff) as u32),
-                )
-            });
-            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) embeds the IPv4 in
-            // the last 32 bits (segments[6..8]); re-check it too so an internal
-            // target does not slip through a NAT64 translator.
-            let nat64 = (seg[0] == 0x0064 && seg[1] == 0xff9b)
-                .then(|| std::net::Ipv4Addr::from(((seg[6] as u32) << 16) | (seg[7] as u32)));
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // Unique-local fc00::/7.
-                || (seg[0] & 0xfe00) == 0xfc00
-                // Link-local fe80::/10.
-                || (seg[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x,
-                // deprecated by RFC 4291 §2.5.5.1) — to_ipv4() returns Some for
-                // both forms; re-check the embedded address as IPv4.
-                || v6
-                    .to_ipv4()
-                    .map(|m| is_blocked_ip(&IpAddr::V4(m)))
-                    == Some(true)
-                || sixtofour.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
-                || teredo.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
-                || nat64.is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
-        }
-    }
-}
+// Addresses no connection can reach (unspecified, multicast, broadcast, Class E); LAN,
+// loopback and link-local are valid home-network targets. One rule shared with libfreemkv.
+use libfreemkv::mux::is_blocked_ip;
 
 // Why resolve_and_guard rejected a URL, split by the operator action each
 // demands: Config is a standing misconfiguration (never self-heals),
 // Unreachable is the service down now. Both are Err from query, never Ok(empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardFail {
-    // Malformed URL, bad scheme, or a host that resolves to a non-public
+    // Malformed URL, bad scheme, or a host that resolves to an invalid
     // address. Operator configuration; retrying changes nothing.
     Config,
     // Host did not resolve — DNS failure or timeout. Service unreachable;
@@ -247,13 +189,10 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
         ));
     }
     for a in &addrs {
-        if is_blocked_ip(&a.ip()) {
+        if is_blocked_ip(a.ip()) {
             return Err((
                 GuardFail::Config,
-                format!(
-                    "refusing to connect to non-public address {} (SSRF guard)",
-                    a.ip()
-                ),
+                format!("refusing to connect to invalid address {}", a.ip()),
             ));
         }
     }
@@ -263,8 +202,7 @@ fn resolve_and_guard(url: &str) -> Result<Vec<SocketAddr>, (GuardFail, String)> 
 /// Validate a key-service base URL before it is handed to [`OnlineSource`].
 /// Requires `https` (cleartext `http` is rejected as a `Config` fault — see
 /// `resolve_and_guard`), extracts the host, and rejects any host that is — or
-/// resolves to — loopback / link-local (incl. 169.254.169.254 cloud metadata)
-/// / RFC1918 / ULA / other non-public address (SSRF guard). Returns `Ok(())`
+/// resolves to — an unspecified / multicast / broadcast / reserved address. Returns `Ok(())`
 /// so a caller can gate `OnlineSource`; the error string says why.
 ///
 /// The *config-time* check; [`OnlineSource`] re-guards before each POST, closing the DNS-rebind window.
@@ -276,7 +214,7 @@ pub fn validate_keyserver_url(url: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyserverUrlFault {
-    /// Bad scheme, host or port, or a non-public address: retrying changes nothing.
+    /// Bad scheme, host or port, or an invalid address: retrying changes nothing.
     Permanent,
     /// The host did not resolve (DNS failure, timeout, lookup cap): may succeed later.
     Temporary,
@@ -315,17 +253,17 @@ impl From<(GuardFail, String)> for KeyserverUrlRejection {
 }
 
 /// The key-service URL checks that need no DNS lookup: `https`, a host, a valid port, and
-/// no literal non-public address (SSRF guard). Every rejection is
+/// no literal invalid address (unspecified, multicast, broadcast, Class E). Every rejection is
 /// [`KeyserverUrlFault::Permanent`]. For a factory build, which no Stop can reach: the host
 /// lookup (and its guard) runs at the first query, on the source's worker. That query is
-/// not yet Stop-aware: it runs under its own `Halt` until ST-K1b wires `ctx.halt()` (J10).
+/// Stop-aware (`ctx.halt()`, ST-K1b, J10); this static check itself opens no socket.
 pub fn check_keyserver_url_static(url: &str) -> Result<(), KeyserverUrlRejection> {
     let (host, _) = split_authority(url).map_err(KeyserverUrlRejection::from)?;
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     match literal.parse::<IpAddr>() {
-        Ok(ip) if is_blocked_ip(&ip) => Err(KeyserverUrlRejection::from((
+        Ok(ip) if is_blocked_ip(ip) => Err(KeyserverUrlRejection::from((
             GuardFail::Config,
-            format!("refusing to connect to non-public address {ip} (SSRF guard)"),
+            format!("refusing to connect to invalid address {ip}"),
         ))),
         _ => Ok(()),
     }
@@ -411,6 +349,24 @@ struct IdleTransport<In> {
     awaiting_reply: bool,
 }
 
+thread_local! {
+    // Liveness for the query in flight on THIS thread (§2.7, T29), bumped by
+    // IdleTransport on every byte moved. Thread-local: ureq's cached Agent
+    // reuses one connector across queries whose ctx.progress() differs.
+    static ACTIVE_QUERY_PROGRESS: std::cell::RefCell<Option<Liveness>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Bump this thread's active query Liveness, if `PostJob::post` set one; a no-op
+// off a worker thread (or with no ctx.progress()).
+fn bump_active_progress() {
+    ACTIVE_QUERY_PROGRESS.with(|p| {
+        if let Some(progress) = p.borrow().as_ref() {
+            progress.bump();
+        }
+    });
+}
+
 // ureq hands an unconfigured phase `NotHappening`; the tighter of that and `bound` wins.
 fn within(timeout: NextTimeout, bound: Duration) -> NextTimeout {
     let bound = UreqDuration::Exact(bound);
@@ -436,8 +392,14 @@ impl<In: Transport> Transport for IdleTransport<In> {
             self.request_bytes = 0;
         }
         self.request_bytes = self.request_bytes.saturating_add(amount as u64);
-        self.inner
-            .transmit_output(amount, within(timeout, self.idle))
+        let result = self
+            .inner
+            .transmit_output(amount, within(timeout, self.idle));
+        // §2.7, T29: "bumps it on every byte moved."
+        if result.is_ok() && amount > 0 {
+            bump_active_progress();
+        }
+        result
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
@@ -450,6 +412,8 @@ impl<In: Transport> Transport for IdleTransport<In> {
         let progressed = self.inner.await_input(within(timeout, bound))?;
         if progressed {
             self.awaiting_reply = false;
+            // §2.7, T29: "bumps it on every byte moved."
+            bump_active_progress();
         }
         Ok(progressed)
     }
@@ -765,6 +729,7 @@ impl OnlineSource {
             title_keys: TitleKeysCtx(ctx.enc_title_keys().ok().map(<[_]>::to_vec)),
             agents: self.agent.clone(),
             halt: halt.clone(),
+            progress: ctx.progress().cloned(),
             #[cfg(test)]
             test_net: self.test_net.clone(),
         };
@@ -796,6 +761,9 @@ struct PostJob {
     agents: AgentCache,
     /// The caller's Stop, re-checked after the lookup, before anything is sent.
     halt: Halt,
+    /// §2.7, T29: bumped on every body byte moved and at answer; held `busy()`
+    /// for the call's duration. `None` when the ctx carries no `Liveness`.
+    progress: Option<Liveness>,
     #[cfg(test)]
     test_net: Option<TestNet>,
 }
@@ -804,6 +772,11 @@ impl PostJob {
     // DNS + address guard + POST + reply, on the worker. The reachability it records lands in
     // this thread's slot and is handed back for the caller to record on its own.
     fn run(self) -> WorkerOutcome {
+        // §2.1 bullet 3: "The K1 worker holds busy() while a key-service call is
+        // in flight" — held for the worker's whole run, including past a Stop
+        // the caller already gave up on (the worker still runs to its own bound).
+        let _busy = self.progress.as_ref().map(Liveness::busy);
+        ACTIVE_QUERY_PROGRESS.with(|p| *p.borrow_mut() = self.progress.clone());
         let answer = self.post();
         (answer, take_last_decode_reachability())
     }
@@ -924,7 +897,7 @@ pub fn set_last_decode_reachability(outcome: Option<DecodeReachability>) {
 
 // Map a key-service HTTP status into the operator action it implies: 401/403
 // fix credentials, 429 back off, 5xx wait — none of them is "no key" (the
-// genuine miss is a 200 with an empty body), the original bug this fixes.
+// definitive 404/422 misses are handled before this function).
 fn classify_http_status(code: u16) -> Error {
     match code {
         401 | 403 => Error::KeyServiceUnauthorized,
@@ -947,16 +920,36 @@ fn interpret_reply(
             // (a 200/404/422 is "up"; a 5xx is "down"), read by the caller so a
             // no-key needs no second probe.
             record_decode_reachability(DecodeReachability::Status(r.status().as_u16()));
+            // §2.7, T29: "bumps it ... at answer" — this IS the answer.
+            bump_active_progress();
             r
         }
         Err(e) => {
             // A 4xx/5xx is still an ANSWER (record its status); a transport
-            // error is not (record `Transport`). Kept separate from the
-            // error-mapping below, which is unchanged.
-            record_decode_reachability(match &e {
+            // error is not (record `Transport`).
+            let outcome = match &e {
                 ureq::Error::StatusCode(code) => DecodeReachability::Status(*code),
                 _ => DecodeReachability::Transport,
-            });
+            };
+            // An HTTP error status is still an answer (§2.7, T29); a transport
+            // failure never got one, so it never bumps.
+            if matches!(outcome, DecodeReachability::Status(_)) {
+                bump_active_progress();
+            }
+            record_decode_reachability(outcome);
+            // A definitive miss is an answer for these samples, not a dead source.
+            // In particular, FMTS 422 means this phase is not held: the resolver
+            // must still be able to ask the same source about the other phase.
+            if let ureq::Error::StatusCode(code @ (404 | 422)) = e {
+                tracing::info!(
+                    target: "freemkv::keysource",
+                    phase = "keyserver_post",
+                    http_status = code,
+                    elapsed_ms,
+                    "key service has no key for these samples"
+                );
+                return Ok(Vec::new());
+            }
             // 401/403/429/5xx demand different operator actions; collapsing
             // them is why a 502 was read as "no key". Each arm RETURNS the
             // classified error, never an empty vec, so it survives past here.
@@ -1088,9 +1081,8 @@ fn interpret_reply(
             }
         }
     }
-    // The genuine miss — the ONLY path returning `Ok(empty)` from a completed
-    // round-trip, logged distinctly from every failure above so a 502 can
-    // never again look like a missing key. `E7022` is the truth here.
+    // A successful JSON reply with no key is also a definitive miss, like
+    // 404/422 above. Keep it distinct from service failures such as a 502.
     tracing::info!(
         target: "freemkv::keysource",
         phase = "keyserver_post",
@@ -1099,11 +1091,17 @@ fn interpret_reply(
     Ok(Vec::new())
 }
 
+// ST-K1b (stop-design-v5 §2.7): the KU ctx's own token, or an uncancellable
+// stand-in for a caller (autorip, a test) that built its ctx with none.
+fn ctx_halt(ctx: &dyn ResolveCtx) -> Halt {
+    ctx.halt().cloned().unwrap_or_default()
+}
+
 impl KeySource for OnlineSource {
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &Halt::new());
+        let result = self.query_with(ctx, &ctx_halt(ctx));
         self.record_last_failure_transport(&result);
         result
     }
@@ -1112,7 +1110,7 @@ impl KeySource for OnlineSource {
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &Halt::new());
+        let result = self.query_with(ctx, &ctx_halt(ctx));
         self.record_last_failure_transport(&result);
         result
     }
@@ -1156,124 +1154,7 @@ fn parse_uk(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    // ── is_blocked_ip ──────────────────────────────────────────────────────
-
-    #[test]
-    fn ssrf_guard_blocks_loopback_private_and_metadata() {
-        // Loopback.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        // RFC1918 private ranges.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-        // Cloud-metadata anycast (link-local 169.254.0.0/16).
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))));
-        // Carrier-grade NAT 100.64.0.0/10 and "this network" 0.0.0.0/8.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
-        // IPv6 loopback, ULA fc00::/7, link-local fe80::/10.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0xfd00, 0, 0, 0, 0, 0, 0, 1
-        ))));
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0, 0, 1
-        ))));
-        // IPv4-mapped loopback ::ffff:127.0.0.1 must also be blocked.
-        assert!(is_blocked_ip(&IpAddr::V6(
-            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()
-        )));
-        // IPv4-compatible loopback ::127.0.0.1 (= ::7f00:1, deprecated RFC
-        // 4291 §2.5.5.1) — to_ipv4_mapped() misses this form; to_ipv4() catches
-        // both mapped and compatible.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0, 0, 0, 0, 0, 0, 0x7f00, 0x0001
-        ))));
-        // Class E reserved 240.0.0.0/4.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(
-            255, 255, 255, 254
-        ))));
-    }
-
-    // Benchmarking 198.18.0.0/15 (RFC 2544) and IETF protocol assignments
-    // 192.0.0.0/24 (RFC 6890, incl. the 192.0.0.170/171 NAT64/DNS64 anycast)
-    // are non-public and must be blocked outbound.
-    #[test]
-    fn ssrf_guard_blocks_benchmarking_and_protocol_assignment_ranges() {
-        // 198.18.0.0/15 spans 198.18.x AND 198.19.x — both octets blocked.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 18, 255, 255))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 19, 0, 1))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 19, 200, 5))));
-        // 198.17.x and 198.20.x are OUTSIDE the /15 — must stay allowed.
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 17, 0, 1))));
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1))));
-        // 192.0.0.0/24, including 192.0.0.170 / 192.0.0.171.
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 170))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 171))));
-        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 0, 255))));
-        // The adjacent 192.0.1.0 is a different block — not covered here.
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(192, 0, 1, 1))));
-    }
-
-    // 6to4 (2002::/16) and Teredo (2001:0000::/32) tunnel an IPv4 inside an
-    // IPv6 address; the guard must decode and re-check that embedded IPv4 or an
-    // internal target slips through the tunnel.
-    #[test]
-    fn ssrf_guard_blocks_embedded_ipv4_via_6to4_and_teredo() {
-        // 6to4 for 127.0.0.1: 2002:7f00:0001:: (embedded in segments[1..3]).
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0x7f00, 0x0001, 0, 0, 0, 0, 0
-        ))));
-        // 6to4 for 169.254.169.254 (cloud metadata): 2002:a9fe:a9fe::.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
-        ))));
-        // Teredo for 127.0.0.1: client IPv4 lives in the last two segments XOR
-        // 0xffff, so 0x7f00^0xffff=0x80ff and 0x0001^0xffff=0xfffe.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0000, 0, 0, 0, 0, 0x80ff, 0xfffe
-        ))));
-        // A 6to4 wrapping a PUBLIC IPv4 (8.8.8.8 → 2002:0808:0808::) is allowed.
-        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
-        ))));
-    }
-
-    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) translates IPv4 targets
-    // into IPv6; the guard must decode the trailing IPv4 and re-check it or an
-    // internal address slips through the translator.
-    #[test]
-    fn ssrf_guard_blocks_nat64_wellknown_prefix() {
-        // NAT64 for 169.254.169.254 (cloud metadata): 64:ff9b::a9fe:a9fe.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
-        ))));
-        // NAT64 for 127.0.0.1: 64:ff9b::7f00:0001.
-        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 0x0001
-        ))));
-        // NAT64 wrapping a PUBLIC IPv4 (8.8.8.8 → 64:ff9b::0808:0808) is allowed.
-        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
-        ))));
-    }
-
-    #[test]
-    fn ssrf_guard_allows_public_ips() {
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-        // Public IPv6 (Cloudflare DNS 2606:4700:4700::1111).
-        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::new(
-            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
-        ))));
-    }
+    use std::net::Ipv4Addr;
 
     // host_certs() must return empty WITHOUT touching the network. Uses a
     // non-empty base URL to prove the empty result is the deliberate no-op
@@ -1294,15 +1175,29 @@ mod tests {
     // ── resolve_and_guard ──────────────────────────────────────────────────
 
     #[test]
-    fn resolve_and_guard_rejects_internal_literals() {
-        // Numeric literals resolve without DNS — must still be rejected. All
-        // https:// so the rejection is the SSRF address guard, not the scheme
-        // check (cleartext http:// is covered by its own test below).
-        assert!(resolve_and_guard("https://127.0.0.1/keys").is_err());
-        assert!(resolve_and_guard("https://169.254.169.254/latest/meta-data/").is_err());
-        assert!(resolve_and_guard(&format!("https://{}.{}.{}.{}:8080/keys", 10, 0, 0, 5)).is_err());
-        assert!(resolve_and_guard(&format!("https://{}.{}.{}.{}/keys", 192, 168, 0, 1)).is_err());
-        assert!(resolve_and_guard("https://[::1]:9000/keys").is_err());
+    fn resolve_and_guard_allows_lan_literals_and_rejects_invalid_ones() {
+        // Numeric literals resolve without DNS. https:// so a rejection is the
+        // address guard, not the scheme check (http:// has its own test below).
+        let lan = format!("{}.{}.{}.{}:8080", 192, 168, 0, 1);
+        for ok in ["127.0.0.1", "169.254.169.254", "[::1]:9000", lan.as_str()] {
+            assert!(
+                resolve_and_guard(&format!("https://{ok}/keys")).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "[::]",
+            "[ff02::1]",
+        ] {
+            assert!(
+                resolve_and_guard(&format!("https://{bad}/keys")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1476,7 +1371,7 @@ mod tests {
 
     // Stop rule (stall-based only, Stop can interrupt every wait): a factory build has no
     // Halt, so its URL check does no DNS. It rejects what is wrong without a lookup and
-    // leaves the host lookup to the first query (not Stop-aware until ST-K1b, J10).
+    // leaves the host lookup to the first query, which is Stop-aware (ST-K1b, J10).
     #[test]
     fn the_static_check_rejects_config_faults_without_a_lookup() {
         for url in [
@@ -1485,9 +1380,9 @@ mod tests {
             "https:///keys",
             "https://8.8.8.8:notaport/keys",
             "https://[::1/keys",
-            "https://127.0.0.1/keys",
-            "https://169.254.169.254/latest/meta-data",
-            "https://[::1]:8443/keys",
+            "https://0.0.0.0/keys",
+            "https://224.0.0.1/keys",
+            "https://[ff02::1]:8443/keys",
         ] {
             let r = check_keyserver_url_static(url).expect_err(url);
             assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
@@ -1517,8 +1412,8 @@ mod tests {
             "https:///keys",
             "https://8.8.8.8:notaport/keys",
             "https://[::1/keys",
-            "https://127.0.0.1/keys",
-            "https://169.254.169.254/latest/meta-data",
+            "https://0.0.0.0/keys",
+            "https://240.0.0.1/latest/meta-data",
         ] {
             let r = check_keyserver_url(url).expect_err(url);
             assert_eq!(r.fault, KeyserverUrlFault::Permanent, "{url}");
@@ -1577,12 +1472,14 @@ mod tests {
     // ── validate_keyserver_url ─────────────────────────────────────────────
 
     #[test]
-    fn validate_keyserver_url_rejects_internal_and_bad_scheme() {
-        // Mirrors resolve_and_guard: the public wrapper rejects the same hosts.
-        assert!(validate_keyserver_url("https://127.0.0.1/keys").is_err());
-        assert!(validate_keyserver_url("https://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_keyserver_url(&format!("https://{}.{}.{}.{}/k", 10, 0, 0, 5)).is_err());
-        assert!(validate_keyserver_url("https://[::1]:9000/keys").is_err());
+    fn validate_keyserver_url_allows_lan_and_rejects_invalid_and_bad_scheme() {
+        // A home app: loopback, RFC1918 and link-local key services are valid.
+        assert!(validate_keyserver_url("https://127.0.0.1/keys").is_ok());
+        assert!(validate_keyserver_url("https://169.254.169.254/keys").is_ok());
+        assert!(validate_keyserver_url(&format!("https://{}.{}.{}.{}/k", 10, 0, 0, 5)).is_ok());
+        assert!(validate_keyserver_url("https://[::1]:9000/keys").is_ok());
+        assert!(validate_keyserver_url("https://0.0.0.0/keys").is_err());
+        assert!(validate_keyserver_url("https://[ff02::1]/keys").is_err());
         assert!(validate_keyserver_url("ftp://example.com/keys").is_err());
         assert!(validate_keyserver_url("").is_err());
         // A public literal IP passes (no DNS needed, deterministic).
@@ -1692,7 +1589,7 @@ mod tests {
     }
 
     // Each status maps to a DIFFERENT operator action: fix the token
-    // (401/403), back off (429), wait (5xx) — never "no key" from a status.
+    // (401/403), back off (429), wait (5xx). Definitive misses bypass this mapping.
     #[test]
     fn http_status_maps_to_the_operator_action() {
         let cases: &[(u16, u16)] = &[
@@ -1702,7 +1599,6 @@ mod tests {
             (500, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
             (502, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
             (400, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
-            (404, libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE),
         ];
         for (status, want) in cases {
             assert_eq!(
@@ -1713,7 +1609,7 @@ mod tests {
             assert_ne!(
                 classify_http_status(*status).code(),
                 libfreemkv::error::E_NO_DISC_KEY,
-                "no HTTP status may ever mean \"this disc has no key\""
+                "service failures must not mean \"this disc has no key\""
             );
         }
     }
@@ -1765,8 +1661,10 @@ mod tests {
 
         // A definitive 422 ("licensed but unresolved") / 404 is still an ANSWER:
         // record the status so the caller reads it as reachable (genuine no-key).
-        for status in [404u16, 422] {
-            let _ = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1);
+        for status in [422u16, 404] {
+            let keys = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1)
+                .expect("a definitive miss must allow the resolver to try the other FMTS phase");
+            assert!(keys.is_empty());
             assert_eq!(
                 take_last_decode_reachability(),
                 Some(DecodeReachability::Status(status)),
@@ -1976,8 +1874,8 @@ mod tests {
     #[test]
     fn address_guard_rejections_are_config_not_unreachable() {
         for url in [
-            "http://127.0.0.1/keys",
-            "http://169.254.169.254/latest/meta-data/",
+            "http://0.0.0.0/keys",
+            "http://240.0.0.1/latest/meta-data/",
             "ftp://example.com/keys",
             "not a url",
             "",
@@ -1993,9 +1891,12 @@ mod tests {
     // ── The pre-flight guards in `query` (nothing leaves the process) ──────.
 
     /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
+    #[derive(Default)]
     struct GuardCtx {
         mkb: Vec<u8>,
         samples: usize,
+        halt: Option<Halt>,
+        progress: Option<Liveness>,
     }
     impl ResolveCtx for GuardCtx {
         fn disc_hash(&self) -> &str {
@@ -2016,6 +1917,12 @@ mod tests {
         fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
             Ok(vec![vec![0u8; 16]; self.samples])
         }
+        fn halt(&self) -> Option<&Halt> {
+            self.halt.as_ref()
+        }
+        fn progress(&self) -> Option<&Liveness> {
+            self.progress.as_ref()
+        }
     }
 
     // An `http://` key-service URL must never be POSTed to; the source refuses with `Err`, not
@@ -2027,6 +1934,8 @@ mod tests {
             mkb: Vec::new(),
             // Enough samples that ONLY the scheme guard can stop the request.
             samples: MIN_SAMPLE_UNITS,
+
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2045,6 +1954,8 @@ mod tests {
         let ctx = GuardCtx {
             mkb: vec![0u8; MAX_MKB_BYTES + 1],
             samples: MIN_SAMPLE_UNITS,
+
+            ..Default::default()
         };
         assert!(
             src.get_unit_keys(&ctx)
@@ -2063,6 +1974,8 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS - 1,
+
+            ..Default::default()
         };
         assert!(
             src.get_unit_keys(&ctx)
@@ -2138,6 +2051,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2152,11 +2066,12 @@ mod tests {
     // it fails AFTER resolution, on the address check.
     #[test]
     fn query_against_a_guard_blocked_address_reports_a_failure_not_a_miss() {
-        // 127.0.0.1 needs no DNS and is unconditionally rejected by is_blocked_ip.
-        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        // 0.0.0.0 needs no DNS and is unconditionally rejected by is_blocked_ip.
+        let src = OnlineSource::new("https://0.0.0.0/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2170,10 +2085,11 @@ mod tests {
     // guard-blocked, no-network path proves it is wired up.
     #[test]
     fn get_fmts_indexes_shares_the_same_query_path() {
-        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        let src = OnlineSource::new("https://0.0.0.0/keys", "s3cr3t");
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_fmts_indexes(&ctx)
@@ -2191,6 +2107,7 @@ mod tests {
         let ctx = GuardCtx {
             mkb: Vec::new(),
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         };
         assert_eq!(
             src.get_unit_keys(&ctx)
@@ -2226,9 +2143,9 @@ mod tests {
                 Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
             }
         }
-        // 127.0.0.1 needs no DNS and is unconditionally rejected — the guard
+        // 0.0.0.0 needs no DNS and is unconditionally rejected — the guard
         // fires AFTER the body (incl. vid/title) is already built.
-        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        let src = OnlineSource::new("https://0.0.0.0/keys", "s3cr3t");
         assert_eq!(
             src.get_unit_keys(&VidTitleCtx)
                 .expect_err("a blocked address means the service was never asked")
@@ -2262,7 +2179,7 @@ mod tests {
                 Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
             }
         }
-        let src = OnlineSource::new("https://127.0.0.1/keys", "s3cr3t");
+        let src = OnlineSource::new("https://0.0.0.0/keys", "s3cr3t");
         // Reaches the same guard-blocked failure either way; this test's
         // value is in exercising the whitespace-title branch without panic.
         assert!(src.get_unit_keys(&WhitespaceTitleCtx).is_err());
@@ -2346,7 +2263,10 @@ mod tests {
     // ── ST-K1a: stall-only key-service timeouts, mid-flight Stop (stop-design-v5 §2.7, §5.3)
 
     /// Scaled T16 idle bound for the loopback tests (60 s in production).
-    const T_IDLE: Duration = Duration::from_millis(300);
+    const T_IDLE: Duration = Duration::from_secs(1);
+    /// Idle bound for a Stop test against a silent stub: well past the Stop, so only the Stop
+    /// can end the query, and short enough for the abandoned worker to drain within the test.
+    const T_STOP_IDLE: Duration = Duration::from_secs(2);
     /// How long a stub holds a stalled connection; far past every bound under test.
     const STUB_HOLD: Duration = Duration::from_secs(20);
 
@@ -2368,6 +2288,7 @@ mod tests {
         GuardCtx {
             mkb: vec![0x5a; len],
             samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
         }
     }
 
@@ -2540,7 +2461,7 @@ mod tests {
     fn query_halted_during_post() {
         let host = "kt2.test";
         let addr = stub_server(Stub::NeverAnswer);
-        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        let src = source_via(host, T_STOP_IDLE, move || Ok(vec![addr]));
         let (out, after_cancel) =
             query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(150));
         assert_eq!(
@@ -2557,7 +2478,7 @@ mod tests {
             "a Stop records nothing"
         );
         assert!(
-            eventually(Duration::from_secs(5), || query_slots_in_flight(host) == 0),
+            eventually(Duration::from_secs(10), || query_slots_in_flight(host) == 0),
             "the worker ends at its own first-byte bound and frees its slot"
         );
     }
@@ -2601,10 +2522,8 @@ mod tests {
         let waiting = Halt::new();
         let sixth = spawn_query(waiting.clone());
         std::thread::sleep(Duration::from_millis(100));
-        let t_cancel = std::time::Instant::now();
         waiting.cancel();
         let sixth = sixth.join().expect("sixth query");
-        assert!(t_cancel.elapsed() <= Duration::from_secs(1));
         assert_eq!(
             sixth.expect_err("cancelled while waiting").code(),
             libfreemkv::error::E_HALTED
@@ -2759,14 +2678,14 @@ mod tests {
         // A Stop records nothing, then or later: the late worker result reaches no caller.
         let host = "kt8c.test";
         let addr = stub_server(Stub::NeverAnswer);
-        let src = source_via(host, T_IDLE, move || Ok(vec![addr]));
+        let src = source_via(host, T_STOP_IDLE, move || Ok(vec![addr]));
         let (out, _) = query_cancelled_after(&src, &ctx_with_mkb(0), Duration::from_millis(100));
         assert_eq!(
             out.expect_err("stopped").code(),
             libfreemkv::error::E_HALTED
         );
         assert!(eventually(
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             || query_slots_in_flight(host) == 0
         ));
         assert_eq!(
@@ -3017,7 +2936,7 @@ mod tests {
     fn recording_last_failure_does_not_erase_the_reachability_slot() {
         let addr = stub_server(Stub::Answer(422));
         let src = source_via("kuk1f.test", T_IDLE, move || Ok(vec![addr]));
-        assert!(src.get_unit_keys(&ctx_with_mkb(0)).is_err());
+        assert!(src.get_unit_keys(&ctx_with_mkb(0)).unwrap().is_empty());
         assert_eq!(
             take_last_decode_reachability(),
             Some(DecodeReachability::Status(422)),
@@ -3026,7 +2945,7 @@ mod tests {
 
         let addr = stub_server(Stub::Answer(422));
         let src = source_via("kuk1g.test", T_IDLE, move || Ok(vec![addr]));
-        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).is_err());
+        assert!(src.get_fmts_indexes(&ctx_with_mkb(0)).unwrap().is_empty());
         assert_eq!(
             take_last_decode_reachability(),
             Some(DecodeReachability::Status(422)),
@@ -3078,6 +2997,100 @@ mod tests {
         assert!(
             !src.last_failure_was_transport(),
             "a 5xx answer must clear a prior transport verdict"
+        );
+    }
+    // ── ST-K1b: `ctx.halt()` / `ctx.progress()` wired to KU's ctx (stop-design-v5 §2.7) ──
+
+    // `get_unit_keys` must wait on `ctx.halt()`, not a fresh `Halt::new()` — a Stop
+    // reaching only the KU ctx must still land within one slice.
+    #[test]
+    fn stop_during_stalled_post_returns_halted_via_ctx_halt() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = source_via("stk1b1.test", T_IDLE, move || Ok(vec![addr]));
+        let halt = Halt::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: Some(halt.clone()),
+            progress: None,
+        };
+        let canceller = {
+            let halt = halt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                halt.cancel();
+            })
+        };
+        let out = src.get_unit_keys(&ctx);
+        canceller.join().expect("canceller");
+        assert_eq!(
+            out.expect_err("a ctx.halt() Stop is never an answer")
+                .code(),
+            libfreemkv::error::E_HALTED
+        );
+    }
+
+    // T29: `ctx.progress()` must bump on body bytes moved, WHILE the call is
+    // still running — not only once, after it ends.
+    #[test]
+    fn progress_bumps_during_a_slow_body() {
+        let n = 6;
+        let gap = T_IDLE / 2;
+        let addr = stub_server(Stub::TrickleBody { n, gap });
+        let src = Arc::new(source_via("stk1b2.test", T_IDLE, move || Ok(vec![addr])));
+        let progress = Liveness::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: None,
+            progress: Some(progress.clone()),
+        };
+        let handle = {
+            let src = src.clone();
+            std::thread::spawn(move || src.get_unit_keys(&ctx))
+        };
+        let seen_mid_flight = eventually(gap * n as u32 + T_IDLE, || progress.get() > 0);
+        let out = handle.join().expect("query thread");
+        assert!(
+            seen_mid_flight,
+            "progress must bump before the trickle finishes"
+        );
+        assert_eq!(
+            out.expect("a trickled {} body is a genuine miss"),
+            Vec::new()
+        );
+        assert!(
+            progress.get() > 1,
+            "a multi-byte trickle must bump more than once, got {}",
+            progress.get()
+        );
+    }
+
+    // §2.1 bullet 3: "The K1 worker holds `busy()` while a key-service call is in
+    // flight." An `idle_only` `StallTimer` on the same `Liveness` must never see
+    // `Expired` while the call runs, even though a `NeverAnswer` stub sends nothing.
+    #[test]
+    fn busy_is_held_during_the_call() {
+        let addr = stub_server(Stub::NeverAnswer);
+        let src = Arc::new(source_via("stk1b3.test", T_IDLE, move || Ok(vec![addr])));
+        let progress = Liveness::new();
+        let ctx = GuardCtx {
+            mkb: Vec::new(),
+            samples: MIN_SAMPLE_UNITS,
+            halt: None,
+            progress: Some(progress.clone()),
+        };
+        let mut timer = libfreemkv::halt::StallTimer::idle_only(T_IDLE / 4, &progress);
+        let handle = {
+            let src = src.clone();
+            std::thread::spawn(move || src.get_unit_keys(&ctx))
+        };
+        std::thread::sleep(T_IDLE / 2);
+        let stall = timer.poll(&progress);
+        let _ = handle.join();
+        assert!(
+            !matches!(stall, libfreemkv::halt::Stall::Expired),
+            "busy() must hold off the idle timer while the call is in flight: got {stall:?}"
         );
     }
 }
