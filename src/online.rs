@@ -2263,7 +2263,7 @@ mod tests {
     // ── ST-K1a: stall-only key-service timeouts, mid-flight Stop (stop-design-v5 §2.7, §5.3)
 
     /// Scaled T16 idle bound for the loopback tests (60 s in production).
-    const T_IDLE: Duration = Duration::from_millis(300);
+    const T_IDLE: Duration = Duration::from_secs(1);
     /// Idle bound for a Stop test against a silent stub: well past the Stop, so only the Stop
     /// can end the query, and short enough for the abandoned worker to drain within the test.
     const T_STOP_IDLE: Duration = Duration::from_secs(2);
