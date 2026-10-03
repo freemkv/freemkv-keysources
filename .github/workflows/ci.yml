@@ -53,7 +53,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -67,7 +67,7 @@ jobs:
   changelog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -88,7 +88,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -119,7 +119,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -143,7 +143,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -176,7 +176,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -203,7 +203,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -244,7 +244,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-keysources
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
