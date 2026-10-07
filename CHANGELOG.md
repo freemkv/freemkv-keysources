@@ -4,7 +4,7 @@
 
 ### Added
 
-- The online source logs the connection-slot wait and the DNS lookup time (address count only, never the address) before each key-service POST.
+- The online source logs its connection-slot wait and DNS time before each request.
 
 ## [1.8.1] — 2026-10-07
 
