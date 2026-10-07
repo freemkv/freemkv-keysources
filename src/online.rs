@@ -517,7 +517,9 @@ fn run_on_worker(
     halt: &Halt,
     work: impl FnOnce() -> WorkerOutcome + Send + 'static,
 ) -> Result<Vec<UnitKey>, Error> {
+    let waited = std::time::Instant::now();
     let slot = acquire_query_slot(host, halt)?;
+    tracing::info!(target: "freemkv::keysource", phase = "keyserver_slot", waited_ms = waited.elapsed().as_millis() as u64, "key-service connection slot acquired");
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("keysource-online".into())
@@ -788,7 +790,20 @@ impl PostJob {
             None => resolve_and_guard(&self.url),
         };
         #[cfg(not(test))]
-        let guarded = resolve_and_guard(&self.url);
+        let guarded = {
+            let t0 = std::time::Instant::now();
+            let g = resolve_and_guard(&self.url);
+            // Count only: the addresses themselves are never logged.
+            tracing::info!(
+                target: "freemkv::keysource",
+                phase = "keyserver_dns",
+                ok = g.is_ok(),
+                addrs = g.as_ref().map(|a| a.len()).unwrap_or(0),
+                elapsed_ms = t0.elapsed().as_millis() as u64,
+                "key-service host resolved"
+            );
+            g
+        };
         // Resolve + SSRF-guard the host just before the POST and pin the validated addresses,
         // so a DNS rebind after config time can't redirect the request to an internal host.
         let pinned = match guarded {

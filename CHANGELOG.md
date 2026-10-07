@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- The online source logs the connection-slot wait and the DNS lookup time (address count only, never the address) before each key-service POST.
+
 ## [1.8.1] — 2026-10-07
 
 ### Changed
