@@ -551,33 +551,39 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
     };
+    write_atomic_with_temp(path, text, &tmp)
+}
+
+fn write_atomic_with_temp(path: &Path, text: &str, tmp: &Path) -> Result<(), Error> {
+    let werr = || Error::KeydbWrite {
+        path: path.display().to_string(),
+    };
+    // Exclusive creation also rejects stale files and symlinks. Only clean up
+    // after successful creation; a collision never grants ownership.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(tmp).map_err(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "keydb temp create failed; keydb unchanged");
+        werr()
+    })?;
     let write_result = (|| -> std::io::Result<()> {
-        // The temp file is renamed onto keydb.cfg, which holds AACS key
-        // material and the host private key/cert — create it 0600 on Unix so
-        // umask can't leave the keys world-readable. Non-unix keeps create().
-        #[cfg(unix)]
-        let mut f = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?
-        };
-        #[cfg(not(unix))]
-        let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
-        f.sync_all()?;
+        libfreemkv::io::durable_sync_file(&f, None, &mut |_, _| {})?;
         Ok(())
     })();
+    drop(f);
     if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
         tracing::warn!(error = %e, path = %path.display(), "keydb write/fsync failed; keydb unchanged");
         return Err(werr());
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = std::fs::rename(tmp, path) {
+        let _ = std::fs::remove_file(tmp);
         tracing::warn!(error = %e, path = %path.display(), "keydb rename failed; keydb unchanged");
         return Err(werr());
     }

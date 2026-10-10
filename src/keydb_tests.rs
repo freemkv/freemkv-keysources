@@ -1181,8 +1181,39 @@ fn save_extracts_the_cfg_member_from_a_valid_zip() {
     assert_eq!(result.entries, 1);
 }
 
-// `write_atomic` when the temp file cannot be CREATED (unwritable
-// parent) must clean up and surface `Error::KeydbWrite`.
+#[test]
+fn atomic_update_never_truncates_or_removes_an_existing_temp_file() {
+    let dir = scratch("write-atomic-temp-collision");
+    let target = dir.join("keydb.cfg");
+    let temporary = dir.join("reserved.tmp");
+    std::fs::write(&target, b"original database").unwrap();
+    std::fs::write(&temporary, b"unrelated file").unwrap();
+    assert!(write_atomic_with_temp(&target, "new database", &temporary).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original database");
+    assert_eq!(std::fs::read(&temporary).unwrap(), b"unrelated file");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_update_never_follows_or_removes_an_existing_temp_symlink() {
+    let dir = scratch("write-atomic-temp-symlink");
+    let target = dir.join("keydb.cfg");
+    let temporary = dir.join("reserved.tmp");
+    let unrelated = dir.join("unrelated");
+    std::fs::write(&target, b"original database").unwrap();
+    std::fs::write(&unrelated, b"unrelated file").unwrap();
+    std::os::unix::fs::symlink(&unrelated, &temporary).unwrap();
+    assert!(write_atomic_with_temp(&target, "new database", &temporary).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"original database");
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated file");
+    assert!(
+        std::fs::symlink_metadata(&temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn write_atomic_failure_when_temp_file_cannot_be_created() {
