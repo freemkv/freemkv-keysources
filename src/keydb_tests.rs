@@ -1220,8 +1220,8 @@ fn write_atomic_failure_when_temp_file_cannot_be_created() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("write-atomic-unwritable");
     let target = dir.join("keydb.cfg");
-    // Parent dir exists (so create_dir_all is a no-op) but is read-only,
-    // so `File::create(&tmp)` fails with permission denied.
+    // Read-only parent: open_temp fails with PermissionDenied (not
+    // AlreadyExists), covering its non-retry error branch via write_atomic_named.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let result = write_atomic(&target, "0xAAAA = x\n");
     // Restore write permission so the scratch dir can be cleaned up by a
@@ -1375,22 +1375,49 @@ fn write_atomic_never_removes_user_files_sharing_the_prefix() {
 /// A relative keydb path has an empty parent; cleanup must still run (in ".").
 #[test]
 fn reclaim_handles_relative_path_with_empty_parent() {
+    // cwd is process-wide: serialize, and restore it. Other tests use absolute paths.
+    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("relative");
     let old = std::env::current_dir().unwrap();
-    // Run reclaim against "." without changing the process cwd: use the helper
-    // directly with the dir-resolution logic.
     let stale = dir.join("keydb.tmp.1.2");
     std::fs::write(&stale, "stale").unwrap();
     age_file(&stale, 7200);
     assert_eq!(temp_dir_of(Path::new("keydb.cfg")), Path::new("."));
     assert_eq!(temp_dir_of(&dir.join("keydb.cfg")), dir.as_path());
+    std::env::set_current_dir(&dir).unwrap();
+    reclaim_stale_temps(
+        Path::new("keydb.cfg"),
+        std::time::SystemTime::now(),
+        STALE_TEMP_AGE,
+    );
+    std::env::set_current_dir(&old).unwrap();
+    assert!(!stale.exists());
+}
+
+/// A symlink named like a stale generated temp is never followed or removed,
+/// even when it points at an old regular file.
+#[cfg(unix)]
+#[test]
+fn reclaim_leaves_symlink_to_old_regular_file() {
+    let dir = scratch("symlink-old-target");
+    let target = dir.join("victim");
+    std::fs::write(&target, "mine").unwrap();
+    age_file(&target, 7200);
+    let link = dir.join("keydb.tmp.1.2");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
     reclaim_stale_temps(
         &dir.join("keydb.cfg"),
         std::time::SystemTime::now(),
         STALE_TEMP_AGE,
     );
-    assert!(!stale.exists());
-    assert_eq!(old, std::env::current_dir().unwrap());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
 }
 
 /// A fresh foreign temp (possibly a concurrent writer's) and unrelated names

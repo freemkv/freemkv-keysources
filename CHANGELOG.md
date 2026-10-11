@@ -5,6 +5,8 @@
 ### Fixed
 
 - An existing temporary file (a symlink or a loosely-permissioned leftover) is no longer followed or reused, so the keydb cannot end up following a symlink or keeping non-0600 permissions. Stale temporary copies are cleaned up.
+- The temporary file is flushed with `durable_sync_file` instead of `sync_all`.
+- `save()` deletes sibling files named `<stem>.tmp.<digits>.<digits>[.<digits>]` that are older than 1 hour (abandoned temporaries).
 
 ## [1.8.3] — 2026-10-08
 
