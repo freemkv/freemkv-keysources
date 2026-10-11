@@ -1309,20 +1309,88 @@ fn age_file(p: &std::path::Path, secs: u64) {
         .unwrap();
 }
 
-/// 16+ old stale temps (same pid, as after container restarts) must not block
-/// a save, and are reclaimed.
+/// 16+ leftover temps in the old (v1.8.3 / b6b6f73) `keydb.tmp.<pid>.<n>` format
+/// with this process's own pid must not block a save, even when fresh.
+#[test]
+fn write_atomic_not_blocked_by_many_old_format_temps() {
+    let dir = scratch("noblock");
+    let path = dir.join("keydb.cfg");
+    for i in 0..20 {
+        let stale = dir.join(format!("keydb.tmp.{}.{i}", std::process::id()));
+        std::fs::write(&stale, "stale").unwrap();
+    }
+    write_atomic(&path, "0xBBBB = new\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+    assert_eq!(temp_siblings(&dir).len(), 20, "fresh temps are not removed");
+}
+
+/// Old leftovers (both the old 2-number and new 3-number name formats) are
+/// reclaimed once older than an hour.
 #[test]
 fn write_atomic_reclaims_old_stale_temps() {
     let dir = scratch("reclaim");
     let path = dir.join("keydb.cfg");
     for i in 0..20 {
-        let stale = dir.join(format!("keydb.tmp.1.{i}"));
+        let name = if i % 2 == 0 {
+            format!("keydb.tmp.1.{i}")
+        } else {
+            format!("keydb.tmp.1.123456789.{i}")
+        };
+        let stale = dir.join(name);
         std::fs::write(&stale, "stale key material").unwrap();
         age_file(&stale, 7200);
     }
     write_atomic(&path, "0xBBBB = new\n").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
     assert!(temp_siblings(&dir).is_empty(), "{:?}", temp_siblings(&dir));
+}
+
+/// Only names we generate are reclaimed: user files that merely share the
+/// `keydb.tmp.` prefix survive, however old.
+#[test]
+fn write_atomic_never_removes_user_files_sharing_the_prefix() {
+    let dir = scratch("userfiles");
+    let path = dir.join("keydb.cfg");
+    let keep = [
+        "keydb.tmp.cfg",
+        "keydb.tmp.backup-2026",
+        "keydb.tmp.1",
+        "keydb.tmp.1.",
+        "keydb.tmp.1.2.3.4",
+        "keydb.tmp.1.x",
+        "keydb.tmp",
+        "keydb.tmpx.1.2",
+    ];
+    for n in keep {
+        let p = dir.join(n);
+        std::fs::write(&p, "mine").unwrap();
+        age_file(&p, 7200);
+    }
+    write_atomic(&path, "0xBBBB = new\n").unwrap();
+    for n in keep {
+        assert_eq!(std::fs::read_to_string(dir.join(n)).unwrap(), "mine", "{n}");
+    }
+}
+
+/// A relative keydb path has an empty parent; cleanup must still run (in ".").
+#[test]
+fn reclaim_handles_relative_path_with_empty_parent() {
+    let dir = scratch("relative");
+    let old = std::env::current_dir().unwrap();
+    // Run reclaim against "." without changing the process cwd: use the helper
+    // directly with the dir-resolution logic.
+    let stale = dir.join("keydb.tmp.1.2");
+    std::fs::write(&stale, "stale").unwrap();
+    age_file(&stale, 7200);
+    assert_eq!(temp_dir_of(Path::new("keydb.cfg")), Path::new("."));
+    assert_eq!(temp_dir_of(&dir.join("keydb.cfg")), dir.as_path());
+    reclaim_stale_temps(
+        &dir.join("keydb.cfg"),
+        std::time::SystemTime::now(),
+        STALE_TEMP_AGE,
+    );
+    assert!(!stale.exists());
+    assert_eq!(old, std::env::current_dir().unwrap());
 }
 
 /// A fresh foreign temp (possibly a concurrent writer's) and unrelated names
@@ -1361,7 +1429,7 @@ fn write_atomic_skips_dangling_symlink_candidate() {
             .file_type()
             .is_symlink()
     );
-    // Old dangling symlinks are also never removed by reclaim.
+    // Even far-future "old" dangling symlinks matching our name are never removed by reclaim.
     reclaim_stale_temps(
         &path,
         std::time::SystemTime::now() + std::time::Duration::from_secs(99999),
