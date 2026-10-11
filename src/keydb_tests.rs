@@ -1292,6 +1292,20 @@ fn write_atomic_replaces_existing_and_leaves_no_temp() {
     assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
 }
 
+/// A stale temp holding the next temp name must not fail the update, and must
+/// be left untouched.
+#[test]
+fn write_atomic_skips_stale_temp_name() {
+    let dir = scratch("stale-temp");
+    let path = dir.join("keydb.cfg");
+    let counter = std::sync::atomic::AtomicU64::new(7);
+    let stale = path.with_extension(format!("tmp.{}.7", std::process::id()));
+    std::fs::write(&stale, "stale").unwrap();
+    write_atomic_counted(&path, "0xBBBB = new\n", &counter).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
+}
+
 /// A failed write (parent path is a file → ENOTDIR on create_dir_all) leaves
 /// the prior keydb intact and surfaces KeydbWrite.
 #[test]

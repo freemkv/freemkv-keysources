@@ -542,15 +542,26 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
             werr()
         })?;
     }
-    let tmp = {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-        path.with_extension(format!(
-            "tmp.{}.{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ))
-    };
+    use std::sync::atomic::AtomicU64;
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    write_atomic_counted(path, text, &TMP_COUNTER)
+}
+
+fn write_atomic_counted(
+    path: &Path,
+    text: &str,
+    counter: &std::sync::atomic::AtomicU64,
+) -> Result<(), Error> {
+    // A stale temp (same pid after a restart) holds the name: skip to the next
+    // counter, bounded. create_new still guards the final choice; we never touch it.
+    let mut tmp = path.to_path_buf();
+    for _ in 0..16 {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+        if std::fs::symlink_metadata(&tmp).is_err() {
+            break;
+        }
+    }
     write_atomic_with_temp(path, text, &tmp)
 }
 
