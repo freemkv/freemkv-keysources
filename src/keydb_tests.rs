@@ -1292,18 +1292,120 @@ fn write_atomic_replaces_existing_and_leaves_no_temp() {
     assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
 }
 
-/// A stale temp holding the next temp name must not fail the update, and must
-/// be left untouched.
+fn temp_siblings(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp."))
+        .collect();
+    v.sort();
+    v
+}
+
+fn age_file(p: &std::path::Path, secs: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+        .unwrap();
+}
+
+/// 16+ old stale temps (same pid, as after container restarts) must not block
+/// a save, and are reclaimed.
 #[test]
-fn write_atomic_skips_stale_temp_name() {
-    let dir = scratch("stale-temp");
+fn write_atomic_reclaims_old_stale_temps() {
+    let dir = scratch("reclaim");
     let path = dir.join("keydb.cfg");
-    let counter = std::sync::atomic::AtomicU64::new(7);
-    let stale = path.with_extension(format!("tmp.{}.7", std::process::id()));
-    std::fs::write(&stale, "stale").unwrap();
-    write_atomic_counted(&path, "0xBBBB = new\n", &counter).unwrap();
+    for i in 0..20 {
+        let stale = dir.join(format!("keydb.tmp.1.{i}"));
+        std::fs::write(&stale, "stale key material").unwrap();
+        age_file(&stale, 7200);
+    }
+    write_atomic(&path, "0xBBBB = new\n").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
-    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "stale");
+    assert!(temp_siblings(&dir).is_empty(), "{:?}", temp_siblings(&dir));
+}
+
+/// A fresh foreign temp (possibly a concurrent writer's) and unrelated names
+/// are left alone.
+#[test]
+fn write_atomic_leaves_fresh_and_unrelated_files() {
+    let dir = scratch("fresh");
+    let path = dir.join("keydb.cfg");
+    let fresh = dir.join("keydb.tmp.9.9.9");
+    std::fs::write(&fresh, "inflight").unwrap();
+    let other = dir.join("other.tmp.1.1");
+    std::fs::write(&other, "x").unwrap();
+    age_file(&other, 7200);
+    write_atomic(&path, "0xBBBB = new\n").unwrap();
+    assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "inflight");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "x");
+}
+
+/// A dangling symlink at a candidate name is skipped, not followed or removed.
+#[cfg(unix)]
+#[test]
+fn write_atomic_skips_dangling_symlink_candidate() {
+    let dir = scratch("symlink");
+    let path = dir.join("keydb.cfg");
+    let link = dir.join("keydb.tmp.1.1.0");
+    let victim = dir.join("victim");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let good = dir.join("keydb.tmp.1.1.1");
+    let mut names = vec![good.clone(), link.clone()];
+    write_atomic_named(&path, "0xBBBB = new\n", &mut || names.pop().unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+    assert!(!victim.exists(), "symlink target must not be created");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // Old dangling symlinks are also never removed by reclaim.
+    reclaim_stale_temps(
+        &path,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(99999),
+        STALE_TEMP_AGE,
+    );
+    assert!(std::fs::symlink_metadata(&link).is_ok());
+}
+
+/// A name taken between probe and create (AlreadyExists) moves to the next
+/// candidate instead of failing the save.
+#[test]
+fn write_atomic_already_exists_moves_to_next_name() {
+    let dir = scratch("race");
+    let path = dir.join("keydb.cfg");
+    let taken = dir.join("keydb.tmp.1.1.0");
+    std::fs::write(&taken, "racer").unwrap();
+    let mut names = vec![dir.join("keydb.tmp.1.1.1"), taken.clone()];
+    write_atomic_named(&path, "0xBBBB = new\n", &mut || names.pop().unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), "racer");
+}
+
+/// Bounded: all candidates taken fails with KeydbWrite.
+#[test]
+fn write_atomic_exhausted_candidates_fail() {
+    let dir = scratch("exhaust");
+    let path = dir.join("keydb.cfg");
+    let taken = dir.join("keydb.tmp.1.1.0");
+    std::fs::write(&taken, "racer").unwrap();
+    assert!(matches!(
+        write_atomic_named(&path, "x", &mut || taken.clone()),
+        Err(Error::KeydbWrite { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn write_atomic_file_mode_is_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("mode");
+    let path = dir.join("keydb.cfg");
+    write_atomic(&path, "0xBBBB = new\n").unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 /// A failed write (parent path is a file → ENOTDIR on create_dir_all) leaves

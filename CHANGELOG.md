@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Keydb updates no longer fail after interrupted updates in containers; stale temporary copies are cleaned up.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed

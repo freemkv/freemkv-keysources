@@ -20,6 +20,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -253,7 +259,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -284,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-keysources"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "base64",
  "flate2",
@@ -297,12 +303,15 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "aes",
+ "anyhow",
  "base64",
+ "h8-asm",
  "num-bigint",
  "num-traits",
+ "pioneer-optical",
  "rand",
  "serde",
  "serde_json",
@@ -334,6 +343,12 @@ dependencies = [
  "r-efi",
  "rand_core",
 ]
+
+[[package]]
+name = "h8-asm"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07f60b20bbdeac16166434ca88ab1ea59438a0d5fcc79399c5efd6f7469c5a93"
 
 [[package]]
 name = "hashbrown"
@@ -503,11 +518,12 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "aes",
  "base64",
  "crossbeam-channel",
+ "flate2",
  "freemkv-unlock",
  "libc",
  "memchr",
@@ -616,6 +632,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pioneer-optical"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeeb81f9ecac8a92a76fb8c5ca95ebea9b85c378233ac2ef007f9d30632000fb"
+dependencies = [
+ "flate2",
+ "h8-asm",
+ "miniz_oxide",
+ "serde",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -707,9 +735,12 @@ dependencies = [
 
 [[package]]
 name = "roxmltree"
-version = "0.20.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rustix"
@@ -721,7 +752,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1297,15 +1328,3 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
-
-[[patch.unused]]
-name = "freemkv-engine"
-version = "1.7.7"
-
-[[patch.unused]]
-name = "freemkv-i18n"
-version = "1.7.7"
-
-[[patch.unused]]
-name = "freemkv-keysources"
-version = "1.7.7"

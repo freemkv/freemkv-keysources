@@ -542,35 +542,97 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
             werr()
         })?;
     }
-    use std::sync::atomic::AtomicU64;
+    reclaim_stale_temps(path, std::time::SystemTime::now(), STALE_TEMP_AGE);
+    use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-    write_atomic_counted(path, text, &TMP_COUNTER)
+    // Pid alone repeats across restarts (fixed PID 1 in containers) and the
+    // counter restarts at 0, so add the wall-clock nanos to make names unique
+    // across processes and restarts.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    write_atomic_named(path, text, &mut || {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        temp_path(path, std::process::id(), nanos, n)
+    })
 }
 
-fn write_atomic_counted(
-    path: &Path,
-    text: &str,
-    counter: &std::sync::atomic::AtomicU64,
-) -> Result<(), Error> {
-    // A stale temp (same pid after a restart) holds the name: skip to the next
-    // counter, bounded. create_new still guards the final choice; we never touch it.
-    let mut tmp = path.to_path_buf();
-    for _ in 0..16 {
-        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
-        if std::fs::symlink_metadata(&tmp).is_err() {
-            break;
+/// Temps older than this are presumed abandoned by a dead writer.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+const TEMP_ATTEMPTS: usize = 16;
+
+fn temp_path(path: &Path, pid: u32, nanos: u128, n: u64) -> PathBuf {
+    path.with_extension(format!("tmp.{pid}.{nanos}.{n}"))
+}
+
+// Best-effort removal of our own abandoned temps (`<stem>.tmp.*`, e.g.
+// `keydb.tmp.*`): regular files only (never follows symlinks), older than
+// `max_age` so a concurrent writer's in-flight temp is never touched.
+fn reclaim_stale_temps(path: &Path, now: std::time::SystemTime, max_age: std::time::Duration) {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let prefix = format!("{stem}.tmp.");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(error = %e, "keydb stale temp scan failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|n| n.starts_with(&prefix)) {
+            continue;
+        }
+        let p = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > max_age);
+        if old && let Err(e) = std::fs::remove_file(&p) {
+            tracing::debug!(error = %e, path = %p.display(), "keydb stale temp removal failed");
         }
     }
-    write_atomic_with_temp(path, text, &tmp)
 }
 
-fn write_atomic_with_temp(path: &Path, text: &str, tmp: &Path) -> Result<(), Error> {
-    let werr = || Error::KeydbWrite {
+// Try up to TEMP_ATTEMPTS candidate names; a name that exists (stale file,
+// symlink, or a racing writer) just moves us to the next candidate.
+fn write_atomic_named(
+    path: &Path,
+    text: &str,
+    next_name: &mut dyn FnMut() -> PathBuf,
+) -> Result<(), Error> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let tmp = next_name();
+        match open_temp(&tmp) {
+            Ok(f) => return write_atomic_finish(path, text, &tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "keydb temp create failed; keydb unchanged");
+                return Err(Error::KeydbWrite {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+    }
+    tracing::warn!(path = %path.display(), "keydb temp names exhausted; keydb unchanged");
+    Err(Error::KeydbWrite {
         path: path.display().to_string(),
-    };
-    // Exclusive creation also rejects stale files and symlinks. Only clean up
-    // after successful creation; a collision never grants ownership.
+    })
+}
+
+// Exclusive creation also rejects stale files and symlinks; a collision never
+// grants ownership.
+fn open_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -578,10 +640,26 @@ fn write_atomic_with_temp(path: &Path, text: &str, tmp: &Path) -> Result<(), Err
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut f = options.open(tmp).map_err(|e| {
-        tracing::warn!(error = %e, path = %path.display(), "keydb temp create failed; keydb unchanged");
-        werr()
+    options.open(tmp)
+}
+
+#[cfg(test)]
+fn write_atomic_with_temp(path: &Path, text: &str, tmp: &Path) -> Result<(), Error> {
+    let f = open_temp(tmp).map_err(|_| Error::KeydbWrite {
+        path: path.display().to_string(),
     })?;
+    write_atomic_finish(path, text, tmp, f)
+}
+
+fn write_atomic_finish(
+    path: &Path,
+    text: &str,
+    tmp: &Path,
+    mut f: std::fs::File,
+) -> Result<(), Error> {
+    let werr = || Error::KeydbWrite {
+        path: path.display().to_string(),
+    };
     let write_result = (|| -> std::io::Result<()> {
         f.write_all(text.as_bytes())?;
         libfreemkv::io::durable_sync_file(&f, None, &mut |_, _| {})?;
