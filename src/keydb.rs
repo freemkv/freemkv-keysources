@@ -258,17 +258,12 @@ impl KeydbSource {
         }
     }
 
-    /// Validate, decompress, and crash-safely persist raw keydb bytes (plain
-    /// text, `.zip`, or `.gz`) to THIS source's own [`path`](Self::path).
-    ///
-    /// The bytes are decompressed (zip / gz / plain), checked for at least
-    /// one recognisable keydb entry, then atomically written to the source's
-    /// path (sibling-temp + fsync + rename + parent-dir fsync). Decompressed
-    /// size is capped at [`MAX_KEYDB_BYTES`] (decompression-bomb guard).
-    /// Also deletes sibling files named `<stem>.tmp.<digits>.<digits>[.<digits>]`
-    /// older than 1 h (abandoned temps of dead writers).
-    /// Writes to the source's own path, not a hardcoded default, so the
-    /// caller decides the destination (CLI `--keydb`, the autorip service path).
+    /// Validate, decompress (zip / gz / plain) and crash-safely persist raw keydb bytes to
+    /// THIS source's own [`path`](Self::path), which the caller chose (CLI `--keydb`, the
+    /// service path). The text must hold at least one recognisable keydb entry and is capped
+    /// at [`MAX_KEYDB_BYTES`] (decompression-bomb guard); it is written by sibling temp,
+    /// fsync, rename and parent-folder fsync. Also deletes sibling files named
+    /// `<stem>.tmp.<digits>.<digits>[.<digits>]` older than 1 h (abandoned temps).
     pub fn save(&self, bytes: &[u8]) -> Result<UpdateResult, Error> {
         let text = if bytes.starts_with(b"PK\x03\x04") {
             extract_zip(bytes)?
@@ -703,10 +698,8 @@ fn write_atomic_finish(
         tracing::warn!(error = %e, path = %path.display(), "keydb rename failed; keydb unchanged");
         return Err(werr());
     }
-    // Durably commit the new dirent: on POSIX filesystems (ext2, some NFS) a
-    // crash right after the rename can lose the directory entry even though the
-    // rename returned. Best-effort (swallowed on failure); no-op on Windows.
-    // `temp_dir_of`, not `parent()`: a bare relative name has parent "".
+    // Durably commit the new dirent (ext2, some NFS can lose it after a crash); best-effort,
+    // no-op on Windows. `temp_dir_of`, not `parent()`: a bare relative name has parent "".
     libfreemkv::io::fsync::dir(temp_dir_of(path));
     Ok(())
 }
