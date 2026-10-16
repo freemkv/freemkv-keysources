@@ -19,9 +19,14 @@ hex encoding as optional JSON `bdp`. Missing or malformed SVM data does not
 prevent ordinary unit-key resolution.
 
 Use `resolve_unit_keys()` (or `resolve_fmts_indexes()`) to receive both
-`result.keys` and `result.bdp`. The latter is a `Vec<Vec<u8>>` of opaque binary
-records decoded from the response's hex `BDP` array; no match yields an empty
-vector. The legacy key-only methods continue returning only keys. No second
+`result.keys` and `result.bdp`. The latter is a `Vec<BdPlusRecord>` retaining
+each binary `selector` and its ordered `Vec<Option<Vec<u8>>>` responses. The wire
+shape is `BDP: [{selector_hex, responses: [{index, data_hex}]}]`: null means
+missing, an empty hex string means found but empty; there is no status field.
+Indices 0–6 are the fixed `svq-seven-v1` request profile: `[1]`, `[6,0,0]`,
+`[6,0,1]`, `[7,4]`, `[7,6]`, `[7,5]`, `[7,0]`, all with empty request blobs.
+This profile is not automatic discovery of all requests needed by every disc.
+No match yields an empty vector. The legacy key-only methods continue returning only keys. No second
 request is made and records are not cached as shared "last response" state.
 
 Ordinary responses retain the 1 MiB cap. Requests carrying a derived BD+ ID

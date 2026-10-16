@@ -666,11 +666,23 @@ fn inject_bdp(body: &mut serde_json::Value, svm: Option<&[u8]>) {
 
 /// An optional malformed companion must not discard otherwise valid unit keys.
 /// Reject the entire companion set, rather than quietly return a partial set.
-fn parse_bdp_records(value: Option<&serde_json::Value>) -> Vec<Vec<u8>> {
+fn parse_bdp_records(
+    value: Option<&serde_json::Value>,
+) -> Vec<libfreemkv::keysource::BdPlusRecord> {
     let Some(value) = value else {
         return Vec::new();
     };
-    let parse = || -> Option<Vec<Vec<u8>>> {
+    fn decode_hex(value: &serde_json::Value) -> Option<Vec<u8>> {
+        let hex = value.as_str()?;
+        if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
+    }
+    let parse = || -> Option<Vec<libfreemkv::keysource::BdPlusRecord>> {
         let array = value.as_array()?;
         if array.len() > 256 {
             return None;
@@ -678,19 +690,43 @@ fn parse_bdp_records(value: Option<&serde_json::Value>) -> Vec<Vec<u8>> {
         let mut bytes = 0usize;
         array
             .iter()
-            .map(|value| {
-                let hex = value.as_str()?;
-                bytes = bytes.checked_add(hex.len() / 2)?;
-                if bytes > MAX_BDP_RESPONSE_BYTES / 2
-                    || hex.len() % 2 != 0
-                    || !hex.bytes().all(|b| b.is_ascii_hexdigit())
-                {
+            .map(|record| {
+                let selector_hex = record.get("selector_hex")?;
+                if !(12..=62).contains(&selector_hex.as_str()?.len()) {
                     return None;
                 }
-                (0..hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-                    .collect()
+                let selector = decode_hex(selector_hex)?;
+                let responses = record.get("responses")?.as_array()?;
+                // Fixed svq-seven-v1 profile: never shift slots when a lookup misses.
+                if responses.len() != 7 {
+                    return None;
+                }
+                let responses = responses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, response)| {
+                        if response.get("index")?.as_u64()? != index as u64 {
+                            return None;
+                        }
+                        let value = response.get("data_hex")?;
+                        if value.is_null() {
+                            return Some(None);
+                        }
+                        if value.as_str()?.len() > 2 * 1024 * 1024 {
+                            return None;
+                        }
+                        let data = decode_hex(value)?;
+                        bytes = bytes.checked_add(data.len())?;
+                        if bytes > MAX_BDP_RESPONSE_BYTES / 2 {
+                            return None;
+                        }
+                        Some(Some(data))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(libfreemkv::keysource::BdPlusRecord {
+                    selector,
+                    responses,
+                })
             })
             .collect()
     };
@@ -699,7 +735,6 @@ fn parse_bdp_records(value: Option<&serde_json::Value>) -> Vec<Vec<u8>> {
         Vec::new()
     })
 }
-
 impl OnlineSource {
     pub fn new(base_url: impl Into<String>, secret: impl Into<String>) -> Self {
         Self {

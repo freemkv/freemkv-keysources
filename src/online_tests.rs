@@ -403,6 +403,17 @@ fn reply(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
         .expect("stub response")
 }
 
+fn bdp_fixture() -> serde_json::Value {
+    serde_json::json!([
+        {"selector_hex":"67656e65726963303036", "responses": (0..7).map(|index| serde_json::json!({
+            "index":index, "data_hex": match index { 0 => Some(""), 1 => Some("00FF80"), _ => None }
+        })).collect::<Vec<_>>()},
+        {"selector_hex":"7064756d70303033", "responses": (0..7).map(|index| serde_json::json!({
+            "index":index, "data_hex": if index == 3 { Some("1234") } else { None }
+        })).collect::<Vec<_>>()}
+    ])
+}
+
 fn primary_svm_fixture() -> Vec<u8> {
     let mut svm = vec![0; 24 + 0x1000 + 40];
     svm[..8].copy_from_slice(b"BDSVM_CC");
@@ -448,12 +459,23 @@ fn bdp_response_preserves_binary_and_never_discards_valid_keys() {
         )
         .unwrap()
     };
-    let result = make(serde_json::json!(["00FF80", "", "1234"]));
+    let result = make(bdp_fixture());
     assert_eq!(result.keys.len(), 1);
-    assert_eq!(
-        result.bdp,
-        vec![vec![0, 255, 128], vec![], vec![0x12, 0x34]]
-    );
+    assert_eq!(result.bdp.len(), 2);
+    assert_eq!(result.bdp[0].selector, b"generic006");
+    assert_eq!(result.bdp[0].responses[0], Some(vec![]));
+    assert_eq!(result.bdp[0].responses[1], Some(vec![0, 255, 128]));
+    assert_eq!(result.bdp[0].responses[2], None);
+    assert_eq!(result.bdp[1].selector, b"pdump003");
+    assert_eq!(result.bdp[1].responses[3], Some(vec![0x12, 0x34]));
+    for (field, value) in [
+        ("index", serde_json::json!(9)),
+        ("data_hex", serde_json::json!("x")),
+    ] {
+        let mut bad = bdp_fixture();
+        bad[0]["responses"][0][field] = value;
+        assert!(make(bad).bdp.is_empty());
+    }
     for malformed in [
         serde_json::json!(["00", "x"]),
         serde_json::json!("00"),
@@ -1232,7 +1254,9 @@ fn bdp_round_trip_uses_one_post_and_returns_request_scoped_binary() {
                 assert!(request.get("bdp").is_none());
             }
             assert!(request.get("svm").is_none());
-            let body = r#"{"UK":["000102030405060708090a0b0c0d0e0f"],"BDP":["00ff80"]}"#;
+            let body =
+                serde_json::json!({"UK":["000102030405060708090a0b0c0d0e0f"],"BDP":bdp_fixture()})
+                    .to_string();
             write!(
                 socket,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1252,7 +1276,7 @@ fn bdp_round_trip_uses_one_post_and_returns_request_scoped_binary() {
         assert_eq!(
             result.bdp,
             if include_svm {
-                vec![vec![0, 255, 128]]
+                parse_bdp_records(Some(&bdp_fixture()))
             } else {
                 vec![]
             }

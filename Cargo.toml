@@ -50,7 +50,7 @@ codegen-units = 1
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", rev = "d50351871f9801ba4a4e7e0d067db55bc96edb93" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", rev = "0bda04cb9a231e6d416fac43bb7a07e3a83dfe04" }
 freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.4" }
 
 [lints.clippy]
