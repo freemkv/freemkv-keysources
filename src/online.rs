@@ -635,21 +635,18 @@ fn pinned_agent(
 /// disc capture. Hashes a fixed image; it never executes or transmits the SVM.
 fn bdp_id(svm: &[u8]) -> Option<[u8; 20]> {
     use sha1::{Digest, Sha1};
-    let header = svm.get(..24)?;
-    if &header[..8] != b"BDSVM_CC" {
+    let svm = libfreemkv::bdplus::Svm::parse(svm).ok()?;
+    let section = svm.primary();
+    let body = section.body();
+    if body.as_bytes().len() < 0x1000 {
         return None;
     }
-    let length = u32::from_be_bytes(header[20..24].try_into().ok()?) as usize;
-    if !(0x1000..0x1fffc1).contains(&length) {
-        return None;
-    }
-    let trailer_start = 24 + length;
-    let trailer = svm.get(trailer_start..trailer_start + 40)?;
-    let sample_len = (length - 0x1000).min(0x1fe0);
-    let sample = svm.get(0x1018..0x1018 + sample_len)?;
+    let payload = body.payload();
+    let sample_len = payload.len().min(0x1fe0);
+    let sample = &payload[..sample_len];
     let mut image = [0xaa; 8224];
-    image[..24].copy_from_slice(header);
-    image[24..64].copy_from_slice(trailer);
+    image[..24].copy_from_slice(section.header().as_bytes());
+    image[24..64].copy_from_slice(section.trailer());
     image[64..64 + sample_len].copy_from_slice(sample);
     Some(Sha1::digest(image).into())
 }

@@ -443,6 +443,21 @@ fn bdp_id_and_request_are_protocol_compatible() {
 }
 
 #[test]
+fn bdp_id_samples_payload_not_prefix_or_payload_tail() {
+    let length = 0x1000 + 8160 + 16;
+    let mut svm = vec![0; 24 + length + 40];
+    svm[..8].copy_from_slice(b"BDSVM_CC");
+    svm[20..24].copy_from_slice(&(length as u32).to_be_bytes());
+    let id = bdp_id(&svm).expect("valid SVM");
+    svm[24 + 0x1000 + 8160] = 1;
+    assert_eq!(bdp_id(&svm), Some(id));
+    svm[24 + 0x1000 - 1] = 1;
+    assert_eq!(bdp_id(&svm), Some(id));
+    svm[24 + 0x1000 + 8159] = 1;
+    assert_ne!(bdp_id(&svm), Some(id));
+}
+
+#[test]
 fn bdp_response_preserves_binary_and_never_discards_valid_keys() {
     let make = |bdp: serde_json::Value| {
         interpret_response(
