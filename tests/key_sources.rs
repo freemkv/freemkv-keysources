@@ -55,6 +55,7 @@ impl Drop for Scratch {
 /// Bare `DiscInputs` keyed only by disc hash — the lookup key a keydb uses.
 fn inputs(hash: &str) -> DiscInputs {
     DiscInputs {
+        svm: None,
         disc_hash: hash.into(),
         volume_id: [0u8; 16],
         version: libfreemkv::aacs::mkb::AACS_MAJOR_UHD,

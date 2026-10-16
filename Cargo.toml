@@ -21,6 +21,7 @@ libfreemkv = "1.8"
 # OnlineSource: POST disc inputs + samples to a key service over HTTP.
 ureq = { version = "3", features = ["json"] }
 serde_json = "1"
+sha1 = "0.11"
 base64 = "0.23"
 # KeydbSource::save: decompress a downloaded keydb (.zip / .gz). Same versions
 # already in the resolved graph via libfreemkv — no new tree, no new HTTP stack.
@@ -49,7 +50,7 @@ codegen-units = 1
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.8.4" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", rev = "d50351871f9801ba4a4e7e0d067db55bc96edb93" }
 freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.4" }
 
 [lints.clippy]

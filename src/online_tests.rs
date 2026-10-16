@@ -403,6 +403,73 @@ fn reply(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
         .expect("stub response")
 }
 
+fn primary_svm_fixture() -> Vec<u8> {
+    let mut svm = vec![0; 24 + 0x1000 + 40];
+    svm[..8].copy_from_slice(b"BDSVM_CC");
+    svm[20..24].copy_from_slice(&0x1000u32.to_be_bytes());
+    svm[24 + 0x1000..].fill(0x77);
+    svm
+}
+
+#[test]
+fn bdp_id_and_request_are_protocol_compatible() {
+    let svm = primary_svm_fixture();
+    let mut body = serde_json::json!({"title":"disc"});
+    inject_bdp(&mut body, None);
+    assert!(body.get("bdp").is_none());
+    inject_bdp(&mut body, Some(b"bad"));
+    assert!(body.get("bdp").is_none());
+    inject_bdp(&mut body, Some(&svm));
+    assert_eq!(body["bdp"], "fb712a5739ccdd9a9d4340cea8a9d7122c7b1c5b");
+    assert!(body.get("svm").is_none());
+    let mut ignored_code = svm.clone();
+    ignored_code[100] = 0xff;
+    assert_eq!(bdp_id(&svm), bdp_id(&ignored_code));
+    let mut trailer = svm.clone();
+    *trailer.last_mut().unwrap() ^= 1;
+    assert_ne!(bdp_id(&svm), bdp_id(&trailer));
+    assert!(bdp_id(&svm[..svm.len() - 1]).is_none());
+}
+
+#[test]
+fn bdp_response_preserves_binary_and_never_discards_valid_keys() {
+    let make = |bdp: serde_json::Value| {
+        interpret_response(
+            Ok(reply(
+                200,
+                &serde_json::json!({
+                    "UK":["000102030405060708090a0b0c0d0e0f"],"BDP":bdp
+                })
+                .to_string(),
+            )),
+            &BareCtx,
+            0,
+            true,
+        )
+        .unwrap()
+    };
+    let result = make(serde_json::json!(["00FF80", "", "1234"]));
+    assert_eq!(result.keys.len(), 1);
+    assert_eq!(
+        result.bdp,
+        vec![vec![0, 255, 128], vec![], vec![0x12, 0x34]]
+    );
+    for malformed in [
+        serde_json::json!(["00", "x"]),
+        serde_json::json!("00"),
+        serde_json::json!([42]),
+        serde_json::json!(["é"]),
+        serde_json::json!(vec!["00"; 257]),
+    ] {
+        let result = make(malformed);
+        assert_eq!(result.keys.len(), 1);
+        assert!(result.bdp.is_empty());
+    }
+    let no_key =
+        interpret_response(Ok(reply(200, r#"{"BDP":["00ff"]}"#)), &BareCtx, 0, true).unwrap();
+    assert!(no_key.keys.is_empty() && no_key.bdp.is_empty());
+}
+
 // THE regression: a 5xx for ~seven hours was reported as "no key" and
 // sent operators hunting a VUK that was never missing. A 5xx must be a
 // source FAILURE, distinguishable from a 200 with no entry.
@@ -736,12 +803,16 @@ fn address_guard_rejections_are_config_not_unreachable() {
 /// A `ResolveCtx` whose MKB size and sample COUNT are dialled per guard.
 #[derive(Default)]
 struct GuardCtx {
+    svm: Option<Vec<u8>>,
     mkb: Vec<u8>,
     samples: usize,
     halt: Option<Halt>,
     progress: Option<Liveness>,
 }
 impl ResolveCtx for GuardCtx {
+    fn svm(&self) -> Option<&[u8]> {
+        self.svm.as_deref()
+    }
     fn disc_hash(&self) -> &str {
         "0x422EB"
     }
@@ -1125,6 +1196,69 @@ fn source_via(
         idle,
     });
     src
+}
+
+#[test]
+fn bdp_round_trip_uses_one_post_and_returns_request_scoped_binary() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    for include_svm in [true, false] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut socket);
+            let mut len = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    len = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut bytes = vec![0; len.unwrap()];
+            reader.read_exact(&mut bytes).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if include_svm {
+                assert_eq!(request["bdp"], "fb712a5739ccdd9a9d4340cea8a9d7122c7b1c5b");
+            } else {
+                assert!(request.get("bdp").is_none());
+            }
+            assert!(request.get("svm").is_none());
+            let body = r#"{"UK":["000102030405060708090a0b0c0d0e0f"],"BDP":["00ff80"]}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let source = source_via("bdp-round-trip.test", T_IDLE, move || Ok(vec![addr]));
+        let ctx = GuardCtx {
+            svm: include_svm.then(primary_svm_fixture),
+            samples: MIN_SAMPLE_UNITS,
+            ..Default::default()
+        };
+        let result = source.resolve_unit_keys(&ctx).unwrap();
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(
+            result.bdp,
+            if include_svm {
+                vec![vec![0, 255, 128]]
+            } else {
+                vec![]
+            }
+        );
+        worker.join().unwrap();
+    }
 }
 
 fn ctx_with_mkb(len: usize) -> GuardCtx {
@@ -1854,6 +1988,7 @@ fn stop_during_stalled_post_returns_halted_via_ctx_halt() {
         samples: MIN_SAMPLE_UNITS,
         halt: Some(halt.clone()),
         progress: None,
+        svm: None,
     };
     let canceller = {
         let halt = halt.clone();
@@ -1885,6 +2020,7 @@ fn progress_bumps_during_a_slow_body() {
         samples: MIN_SAMPLE_UNITS,
         halt: None,
         progress: Some(progress.clone()),
+        svm: None,
     };
     let handle = {
         let src = src.clone();
@@ -1920,6 +2056,7 @@ fn busy_is_held_during_the_call() {
         samples: MIN_SAMPLE_UNITS,
         halt: None,
         progress: Some(progress.clone()),
+        svm: None,
     };
     let mut timer = libfreemkv::halt::StallTimer::idle_only(T_IDLE / 4, &progress);
     let handle = {

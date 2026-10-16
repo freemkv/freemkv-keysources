@@ -727,6 +727,7 @@ impl KeySource for KeydbSource {
             Ok(db) => {
                 let r = Self::resolve_from(&db, ctx);
                 Ok(UnitKeyResolution {
+                    bdp: Vec::new(),
                     keys: r.keys,
                     matched: r.matched,
                     miss_path: r.miss_path,

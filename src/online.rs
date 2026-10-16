@@ -11,7 +11,7 @@ use crate::uks_from_vuk;
 use base64::Engine;
 use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::halt::Liveness;
-use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx};
+use libfreemkv::keysource::{DecodeSampleSet, ResolveCtx, UnitKeyResolution};
 use libfreemkv::{Error, Halt, KeySource};
 use ureq::config::Config;
 use ureq::http::Uri;
@@ -46,9 +46,12 @@ const WORKER_POLL_SLICE: Duration = Duration::from_millis(20);
 /// callers (the CLI, autorip) sample at least this many.
 pub use libfreemkv::keysource::MIN_SAMPLE_UNITS;
 /// Hard cap on the key-service response body. A real unit-key reply is a few
-/// hundred bytes; bound the read so a malicious/compromised server can't drive
+/// hundred bytes, but optional hex BD+ records are larger; bound the read so a malicious/compromised server can't drive
 /// the client to OOM with an unbounded body.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Opt-in companion responses carry hex binary records. Ordinary key requests
+/// retain their existing 1 MiB limit; only requests with a derived BD+ ID use this.
+const MAX_BDP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 // Addresses no connection can reach (unspecified, multicast, broadcast, Class E); LAN,
 // loopback and link-local are valid home-network targets. One rule shared with libfreemkv.
@@ -508,7 +511,7 @@ fn query_slots_in_flight(host: &str) -> usize {
 }
 
 /// What a worker hands back: the source's answer and the reachability of its POST, if any.
-type WorkerOutcome = (Result<Vec<UnitKey>, Error>, Option<DecodeReachability>);
+type WorkerOutcome = (Result<UnitKeyResolution, Error>, Option<DecodeReachability>);
 
 // Runs `work` (DNS + POST) on a worker in one of `host`'s slots. Per spec, stop-design-v5
 // §2.7: "The caller never blocks inside ureq"; on Stop it returns `Halted` within a slice.
@@ -516,7 +519,7 @@ fn run_on_worker(
     host: &str,
     halt: &Halt,
     work: impl FnOnce() -> WorkerOutcome + Send + 'static,
-) -> Result<Vec<UnitKey>, Error> {
+) -> Result<UnitKeyResolution, Error> {
     let waited = std::time::Instant::now();
     let slot = acquire_query_slot(host, halt)?;
     tracing::info!(target: "freemkv::keysource", phase = "keyserver_slot", waited_ms = waited.elapsed().as_millis() as u64, "key-service connection slot acquired");
@@ -628,6 +631,75 @@ fn pinned_agent(
     agent
 }
 
+/// Server protocol identity, deliberately owned by this adapter rather than
+/// disc capture. Hashes a fixed image; it never executes or transmits the SVM.
+fn bdp_id(svm: &[u8]) -> Option<[u8; 20]> {
+    use sha1::{Digest, Sha1};
+    let header = svm.get(..24)?;
+    if &header[..8] != b"BDSVM_CC" {
+        return None;
+    }
+    let length = u32::from_be_bytes(header[20..24].try_into().ok()?) as usize;
+    if !(0x1000..0x1fffc1).contains(&length) {
+        return None;
+    }
+    let trailer_start = 24 + length;
+    let trailer = svm.get(trailer_start..trailer_start + 40)?;
+    let sample_len = (length - 0x1000).min(0x1fe0);
+    let sample = svm.get(0x1018..0x1018 + sample_len)?;
+    let mut image = [0xaa; 8224];
+    image[..24].copy_from_slice(header);
+    image[24..64].copy_from_slice(trailer);
+    image[64..64 + sample_len].copy_from_slice(sample);
+    Some(Sha1::digest(image).into())
+}
+
+fn inject_bdp(body: &mut serde_json::Value, svm: Option<&[u8]>) {
+    let Some(svm) = svm else { return };
+    if let Some(id) = bdp_id(svm) {
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        body["bdp"] = hex.into();
+    } else {
+        tracing::warn!(target: "freemkv::keysource", "invalid primary SVM; omitting BD+ ID");
+    }
+}
+
+/// An optional malformed companion must not discard otherwise valid unit keys.
+/// Reject the entire companion set, rather than quietly return a partial set.
+fn parse_bdp_records(value: Option<&serde_json::Value>) -> Vec<Vec<u8>> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let parse = || -> Option<Vec<Vec<u8>>> {
+        let array = value.as_array()?;
+        if array.len() > 256 {
+            return None;
+        }
+        let mut bytes = 0usize;
+        array
+            .iter()
+            .map(|value| {
+                let hex = value.as_str()?;
+                bytes = bytes.checked_add(hex.len() / 2)?;
+                if bytes > MAX_BDP_RESPONSE_BYTES / 2
+                    || hex.len() % 2 != 0
+                    || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return None;
+                }
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect()
+            })
+            .collect()
+    };
+    parse().unwrap_or_else(|| {
+        tracing::warn!(target: "freemkv::keysource", "invalid BD+ companion records; keeping unit keys only");
+        Vec::new()
+    })
+}
+
 impl OnlineSource {
     pub fn new(base_url: impl Into<String>, secret: impl Into<String>) -> Self {
         Self {
@@ -647,14 +719,19 @@ impl OnlineSource {
 
     // The server-resolved Unit Keys for this disc: one round-trip, returning a terminal `UK` or
     // a `VUK` derived locally. `Ok`/`Err` draw the miss-vs-outage distinction; `halt` stops it.
+    #[cfg(test)]
     fn query_with(&self, ctx: &dyn ResolveCtx, halt: &Halt) -> Result<Vec<UnitKey>, Error> {
+        self.query_reply(ctx, halt).map(|r| r.keys)
+    }
+
+    fn query_reply(&self, ctx: &dyn ResolveCtx, halt: &Halt) -> Result<UnitKeyResolution, Error> {
         // Reset the per-thread decode-reachability slot so it reflects ONLY this
         // query afterwards: `Some(..)` once a POST answers/transport-fails, `None`
         // if we short-circuit before the network. See `take_last_decode_reachability`.
         clear_decode_reachability();
         // No configured service: nothing to resolve.
         if self.base_url.is_empty() {
-            return Ok(Vec::new());
+            return Ok(UnitKeyResolution::default());
         }
         // Refuse to transmit over plaintext: the body carries base64 key material and, when
         // configured, a replayable bearer token. `Err`, not `Ok(empty)`
@@ -680,7 +757,7 @@ impl OnlineSource {
                 cap = MAX_MKB_BYTES,
                 "MKB exceeds the key-service forward cap; skipping the online source for this disc (no key from online)"
             );
-            return Ok(Vec::new());
+            return Ok(UnitKeyResolution::default());
         }
         // Prove the minimum by TYPE: `DecodeSampleSet` only exists with >=
         // MIN_SAMPLE_UNITS units, so the request can't be built under-sized
@@ -694,7 +771,7 @@ impl OnlineSource {
                 min = MIN_SAMPLE_UNITS,
                 "too few content samples for a reliable online key request; skipping the online source"
             );
-            return Ok(Vec::new());
+            return Ok(UnitKeyResolution::default());
         };
         let b64 = base64::engine::general_purpose::STANDARD;
         let mut body = serde_json::json!({
@@ -722,6 +799,7 @@ impl OnlineSource {
         {
             body["title"] = serde_json::Value::String(label.to_string());
         }
+        inject_bdp(&mut body, ctx.svm());
         // Everything below touches the network, so it runs on a worker; the body and the
         // title keys (for a VUK reply) are read here, on the caller's thread.
         let job = PostJob {
@@ -746,7 +824,7 @@ impl OnlineSource {
     // KU-K1 (J15): classify the query just finished, from a PEEK (never a
     // `take`) at the slot — a caller downstream of `resolve` (freemkv-library's
     // server) still needs to read the same verdict once (`query_with` clears it).
-    fn record_last_failure_transport(&self, result: &Result<Vec<UnitKey>, Error>) {
+    fn record_last_failure_transport<T>(&self, result: &Result<T, Error>) {
         let transport = result.is_err()
             && LAST_DECODE_REACHABILITY.with(|c| c.get()) == Some(DecodeReachability::Transport);
         self.last_failure_transport
@@ -783,7 +861,7 @@ impl PostJob {
         (answer, take_last_decode_reachability())
     }
 
-    fn post(self) -> Result<Vec<UnitKey>, Error> {
+    fn post(self) -> Result<UnitKeyResolution, Error> {
         #[cfg(test)]
         let guarded = match &self.test_net {
             Some(t) => (t.resolve)(),
@@ -856,8 +934,18 @@ impl PostJob {
         // `hardened_agent`. SECURITY: never log `body` — it carries base64 key material.
         tracing::info!(target: "freemkv::keysource", phase = "keyserver_post", "begin");
         let post_t0 = std::time::Instant::now();
+        let requested_bdp = self.body.get("bdp").is_some();
         let sent = req.send_json(self.body);
-        interpret_reply(sent, &self.title_keys, post_t0.elapsed().as_millis() as u64)
+        let mut reply = interpret_response(
+            sent,
+            &self.title_keys,
+            post_t0.elapsed().as_millis() as u64,
+            requested_bdp,
+        )?;
+        if !requested_bdp {
+            reply.bdp.clear();
+        }
+        Ok(reply)
     }
 }
 
@@ -924,11 +1012,26 @@ fn classify_http_status(code: u16) -> Error {
 // Turn the raw key-service POST outcome into this source's answer. Split
 // out of `query` so the reply -> verdict mapping is testable WITHOUT a
 // network. SECURITY: logs status/byte-count/labels only — never `body`.
+#[cfg(test)]
 fn interpret_reply(
     sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ctx: &dyn ResolveCtx,
     elapsed_ms: u64,
 ) -> Result<Vec<UnitKey>, Error> {
+    interpret_response(sent, ctx, elapsed_ms, false).map(|r| r.keys)
+}
+
+fn interpret_response(
+    sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ctx: &dyn ResolveCtx,
+    elapsed_ms: u64,
+    requested_bdp: bool,
+) -> Result<UnitKeyResolution, Error> {
+    let response_limit = if requested_bdp {
+        MAX_BDP_RESPONSE_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
     let mut resp = match sent {
         Ok(r) => {
             // The service answered — record its status for the reachability slot
@@ -963,7 +1066,7 @@ fn interpret_reply(
                     elapsed_ms,
                     "key service has no key for these samples"
                 );
-                return Ok(Vec::new());
+                return Ok(UnitKeyResolution::default());
             }
             // 401/403/429/5xx demand different operator actions; collapsing
             // them is why a 502 was read as "no key". Each arm RETURNS the
@@ -1008,21 +1111,21 @@ fn interpret_reply(
     let read = resp
         .body_mut()
         .as_reader()
-        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .take(response_limit as u64 + 1)
         .read_to_end(&mut buf);
     if read.is_err() {
         // Per spec, stop-design-v5 T16: "no bytes moved" for 60 s → "`Transport` reachability".
         // A reply that stops mid-body never finished answering.
         record_decode_reachability(DecodeReachability::Transport);
     }
-    if read.is_err() || buf.len() > MAX_RESPONSE_BYTES {
+    if read.is_err() || buf.len() > response_limit {
         // Length only — never the body, which carries base64 key material.
         // A truncated / over-cap body is the service failing mid-answer: the
         // question went unanswered, so this is a source failure, not a miss.
         tracing::warn!(
             target: "freemkv::keysource",
             phase = "keyserver_post",
-            cap = MAX_RESPONSE_BYTES,
+            cap = response_limit,
             "key-service reply was unreadable or over the size cap; no ANSWER from online"
         );
         return Err(Error::KeyServiceUnavailable);
@@ -1075,14 +1178,24 @@ fn interpret_reply(
             }
         }
         if !out.is_empty() {
-            return Ok(out);
+            return Ok(UnitKeyResolution {
+                keys: out,
+                bdp: parse_bdp_records(json.get("BDP")),
+                ..Default::default()
+            });
         }
     }
     // A VUK is derived to the terminal keys locally, via the disc's
     // encrypted title keys from the context — the library owns the crypto.
     if let Some(vuk) = json.get("VUK").and_then(|u| u.as_str()).and_then(parse_uk) {
         match ctx.enc_title_keys() {
-            Ok(enc) => return Ok(uks_from_vuk(&vuk, enc)),
+            Ok(enc) => {
+                return Ok(UnitKeyResolution {
+                    keys: uks_from_vuk(&vuk, enc),
+                    bdp: parse_bdp_records(json.get("BDP")),
+                    ..Default::default()
+                });
+            }
             Err(_) => {
                 // The SERVICE answered; the DISC's encrypted title keys are
                 // what could not be read — a disc-side reason, not `Err` here.
@@ -1092,7 +1205,7 @@ fn interpret_reply(
                     "key-service returned a VUK but the disc's encrypted title keys \
                      are unreadable; cannot derive unit keys"
                 );
-                return Ok(Vec::new());
+                return Ok(UnitKeyResolution::default());
             }
         }
     }
@@ -1103,7 +1216,7 @@ fn interpret_reply(
         phase = "keyserver_post",
         "key service has no key for this disc"
     );
-    Ok(Vec::new())
+    Ok(UnitKeyResolution::default())
 }
 
 // ST-K1b (stop-design-v5 §2.7): the KU ctx's own token, or an uncancellable
@@ -1113,21 +1226,26 @@ fn ctx_halt(ctx: &dyn ResolveCtx) -> Halt {
 }
 
 impl KeySource for OnlineSource {
+    fn resolve_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
+        let result = self.query_reply(ctx, &ctx_halt(ctx));
+        self.record_last_failure_transport(&result);
+        result
+    }
+
+    fn resolve_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
+        self.resolve_unit_keys(ctx)
+    }
     // Base per-CPS-unit Unit Keys via `query`: `Ok(empty)` means the service answered with no
     // key, `Err` means it could not answer.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &ctx_halt(ctx));
-        self.record_last_failure_transport(&result);
-        result
+        self.resolve_unit_keys(ctx).map(|r| r.keys)
     }
 
     // AACS 2.1 forensic index set: same `query` round-trip as
     // `get_unit_keys`, but the mux's samples are a single-phase anchor batch
     // and the service's array position tags each forensic index.
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        let result = self.query_with(ctx, &ctx_halt(ctx));
-        self.record_last_failure_transport(&result);
-        result
+        self.resolve_fmts_indexes(ctx).map(|r| r.keys)
     }
 
     fn label(&self) -> &'static str {
