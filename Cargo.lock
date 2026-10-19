@@ -304,12 +304,13 @@ dependencies = [
  "serde_json",
  "tracing",
  "ureq",
- "zip",
+ "zip 9.0.5",
 ]
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.8.5"
+version = "1.8.4"
+source = "git+https://github.com/freemkv/freemkv-unlock?tag=v1.8.4#5a09422c6a8aba667879e569bddaf1f0624ed3c3"
 dependencies = [
  "aes",
  "anyhow",
@@ -503,9 +504,9 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.2.2"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
+checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
 dependencies = [
  "hybrid-array",
 ]
@@ -524,7 +525,8 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.8.5"
+version = "1.8.4"
+source = "git+https://github.com/freemkv/libfreemkv?tag=v1.8.4#2622b3fc5afe8eb4ebcd85f58eb0d498a3f6c743"
 dependencies = [
  "aes",
  "base64",
@@ -542,7 +544,7 @@ dependencies = [
  "sha2",
  "socket2",
  "tracing",
- "zip",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -1307,6 +1309,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
+ "zopfli",
 ]
 
 [[package]]
