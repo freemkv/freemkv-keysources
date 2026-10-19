@@ -519,7 +519,10 @@ fn extract_zip(data: &[u8]) -> Result<String, Error> {
 
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(|_| Error::KeydbParse)?;
-        if file.name().ends_with(".cfg") || file.name().ends_with(".CFG") {
+        if file
+            .name()
+            .is_ok_and(|n| n.ends_with(".cfg") || n.ends_with(".CFG"))
+        {
             return read_capped_to_string(file);
         }
     }
