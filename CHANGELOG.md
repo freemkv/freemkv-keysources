@@ -5,15 +5,16 @@
 ### Fixed
 
 - zip 9, for RUSTSEC-2026-0367, -0368 and -0369.
+- Keydb saves no longer sweep old sibling files by name and age. Operator files and paused writers' open temporaries are preserved; crash-abandoned temporaries may remain. Saves still clean up their own temporary on handled failure.
 
 ## [1.8.4] — 2026-10-11
 
 ### Fixed
 
 - The locked rustls is 0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349 (TLS secrets in `Debug`, ECH, certificate decompression, key-exchange downgrade).
-- An existing temporary file (a symlink or a loosely-permissioned leftover) is no longer followed or reused, so the keydb cannot end up following a symlink or keeping non-0600 permissions. Stale temporary copies are cleaned up.
+- An existing temporary file (a symlink or a loosely-permissioned leftover) is no longer followed or reused, so the keydb cannot end up following a symlink or keeping non-0600 permissions. The stale-temporary cleanup introduced here is removed in 1.8.5 (see above).
 - The temporary file is flushed with `durable_sync_file` instead of `sync_all`.
-- `save()` deletes sibling files named `<stem>.tmp.<digits>.<digits>[.<digits>]` that are older than 1 hour (abandoned temporaries).
+- `save()` introduced deletion of sibling files named `<stem>.tmp.<digits>.<digits>[.<digits>]` older than 1 hour. Name and age do not establish ownership; 1.8.5 removes this cleanup.
 
 ## [1.8.3] — 2026-10-08
 

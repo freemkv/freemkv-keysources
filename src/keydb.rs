@@ -262,8 +262,8 @@ impl KeydbSource {
     /// THIS source's own [`path`](Self::path), which the caller chose (CLI `--keydb`, the
     /// service path). The text must hold at least one recognisable keydb entry and is capped
     /// at [`MAX_KEYDB_BYTES`] (decompression-bomb guard); it is written by sibling temp,
-    /// fsync, rename and parent-folder fsync. Also deletes sibling files named
-    /// `<stem>.tmp.<digits>.<digits>[.<digits>]` older than 1 h (abandoned temps).
+    /// fsync, rename and parent-folder fsync. Existing sibling files are left alone,
+    /// including old temporaries that may still belong to another writer.
     pub fn save(&self, bytes: &[u8]) -> Result<UpdateResult, Error> {
         let text = if bytes.starts_with(b"PK\x03\x04") {
             extract_zip(bytes)?
@@ -542,7 +542,6 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
             werr()
         })?;
     }
-    reclaim_stale_temps(path, std::time::SystemTime::now(), STALE_TEMP_AGE);
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     // Pid alone repeats across restarts (fixed PID 1 in containers) and the
@@ -558,8 +557,6 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
     })
 }
 
-/// Temps older than this are presumed abandoned by a dead writer.
-const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 const TEMP_ATTEMPTS: usize = 16;
 
 fn temp_path(path: &Path, pid: u32, nanos: u128, n: u64) -> PathBuf {
@@ -571,61 +568,6 @@ fn temp_dir_of(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
-    }
-}
-
-// True only for names we generate: `<stem>.tmp.<digits>.<digits>` (v1.8.3
-// leftovers) or `<stem>.tmp.<digits>.<digits>.<digits>`. Anything else the
-// user may own (e.g. `keydb.tmp.cfg`) is never matched.
-fn is_our_temp_name(name: &str, stem: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix(stem)
-        .and_then(|r| r.strip_prefix(".tmp."))
-    else {
-        return false;
-    };
-    let parts: Vec<&str> = rest.split('.').collect();
-    (parts.len() == 2 || parts.len() == 3)
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-}
-
-// Best-effort removal of our own abandoned temps: regular files whose name we
-// generated (see `is_our_temp_name`), older than `max_age` so a concurrent
-// writer's in-flight temp is never touched. Never follows symlinks.
-fn reclaim_stale_temps(path: &Path, now: std::time::SystemTime, max_age: std::time::Duration) {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return;
-    };
-    let dir = temp_dir_of(path);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!(error = %e, "keydb stale temp scan failed");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_str().is_some_and(|n| is_our_temp_name(n, stem)) {
-            continue;
-        }
-        let p = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            continue;
-        };
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        let old = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age > max_age);
-        if old && let Err(e) = std::fs::remove_file(&p) {
-            tracing::debug!(error = %e, path = %p.display(), "keydb stale temp removal failed");
-        }
     }
 }
 

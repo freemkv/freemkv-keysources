@@ -1309,6 +1309,44 @@ fn age_file(p: &std::path::Path, secs: u64) {
         .unwrap();
 }
 
+/// Candidate names retain every supplied uniqueness component without depending
+/// on the shared process counter or wall-clock timing.
+#[test]
+fn temp_path_includes_pid_nanos_and_counter() {
+    let path = Path::new("keydb.cfg");
+    assert_eq!(
+        temp_path(path, 42, 1234567890123456789, 7),
+        Path::new("keydb.tmp.42.1234567890123456789.7")
+    );
+    assert_eq!(
+        temp_path(path, 42, 1234567890123456790, 7),
+        Path::new("keydb.tmp.42.1234567890123456790.7")
+    );
+}
+
+/// A paused writer still owns its open temporary, however old its mtime.
+#[test]
+fn write_atomic_preserves_aged_active_writer() {
+    let dir = scratch("aged-active-writer");
+    let path = dir.join("keydb.cfg");
+    let temporary = temp_path(&path, std::process::id(), 123456789, 0);
+    let first_writer = open_temp(&temporary).unwrap();
+    age_file(&temporary, 7200);
+
+    write_atomic(&path, "second writer\n").unwrap();
+    assert!(
+        temporary.exists(),
+        "the active writer's pathname was removed"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "second writer\n");
+    write_atomic_finish(&path, "first writer complete\n", &temporary, first_writer).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "first writer complete\n"
+    );
+    assert!(!temporary.exists());
+}
+
 /// 16+ leftover temps in the old (v1.8.3 / b6b6f73) `keydb.tmp.<pid>.<n>` format
 /// with this process's own pid must not block a save, even when fresh.
 #[test]
@@ -1324,29 +1362,29 @@ fn write_atomic_not_blocked_by_many_old_format_temps() {
     assert_eq!(temp_siblings(&dir).len(), 20, "fresh temps are not removed");
 }
 
-/// Old leftovers (both the old 2-number and new 3-number name formats) are
-/// reclaimed once older than an hour.
+/// Numeric names and old mtimes cannot establish ownership of operator files.
 #[test]
-fn write_atomic_reclaims_old_stale_temps() {
-    let dir = scratch("reclaim");
+fn write_atomic_preserves_aged_numeric_operator_files() {
+    let dir = scratch("numeric-operator-files");
     let path = dir.join("keydb.cfg");
-    for i in 0..20 {
-        let name = if i % 2 == 0 {
-            format!("keydb.tmp.1.{i}")
-        } else {
-            format!("keydb.tmp.1.123456789.{i}")
-        };
-        let stale = dir.join(name);
-        std::fs::write(&stale, "stale key material").unwrap();
-        age_file(&stale, 7200);
+    let keep = ["keydb.tmp.2025.10", "keydb.tmp.2025.10.26"];
+    for name in keep {
+        let operator_file = dir.join(name);
+        std::fs::write(&operator_file, format!("operator data: {name}\n")).unwrap();
+        age_file(&operator_file, 7200);
     }
     write_atomic(&path, "0xBBBB = new\n").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
-    assert!(temp_siblings(&dir).is_empty(), "{:?}", temp_siblings(&dir));
+    for name in keep {
+        assert_eq!(
+            std::fs::read(dir.join(name)).ok().as_deref(),
+            Some(format!("operator data: {name}\n").as_bytes()),
+            "operator file {name} must retain its bytes"
+        );
+    }
 }
 
-/// Only names we generate are reclaimed: user files that merely share the
-/// `keydb.tmp.` prefix survive, however old.
+/// User files sharing the `keydb.tmp.` prefix survive, however old.
 #[test]
 fn write_atomic_never_removes_user_files_sharing_the_prefix() {
     let dir = scratch("userfiles");
@@ -1372,45 +1410,28 @@ fn write_atomic_never_removes_user_files_sharing_the_prefix() {
     }
 }
 
-/// A relative keydb path has an empty parent; cleanup must still run (in ".").
+/// Directory sync uses "." for a bare relative destination.
 #[test]
-fn reclaim_handles_relative_path_with_empty_parent() {
-    // cwd is process-wide: serialize, and restore it. Other tests use absolute paths.
-    static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = CWD.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = scratch("relative");
-    let old = std::env::current_dir().unwrap();
-    let stale = dir.join("keydb.tmp.1.2");
-    std::fs::write(&stale, "stale").unwrap();
-    age_file(&stale, 7200);
+fn temp_dir_of_handles_relative_path_with_empty_parent() {
     assert_eq!(temp_dir_of(Path::new("keydb.cfg")), Path::new("."));
-    assert_eq!(temp_dir_of(&dir.join("keydb.cfg")), dir.as_path());
-    std::env::set_current_dir(&dir).unwrap();
-    reclaim_stale_temps(
-        Path::new("keydb.cfg"),
-        std::time::SystemTime::now(),
-        STALE_TEMP_AGE,
+    assert_eq!(
+        temp_dir_of(Path::new("parent/keydb.cfg")),
+        Path::new("parent")
     );
-    std::env::set_current_dir(&old).unwrap();
-    assert!(!stale.exists());
 }
 
 /// A symlink named like a stale generated temp is never followed or removed,
 /// even when it points at an old regular file.
 #[cfg(unix)]
 #[test]
-fn reclaim_leaves_symlink_to_old_regular_file() {
+fn write_atomic_leaves_symlink_to_old_regular_file() {
     let dir = scratch("symlink-old-target");
     let target = dir.join("victim");
     std::fs::write(&target, "mine").unwrap();
     age_file(&target, 7200);
     let link = dir.join("keydb.tmp.1.2");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    reclaim_stale_temps(
-        &dir.join("keydb.cfg"),
-        std::time::SystemTime::now(),
-        STALE_TEMP_AGE,
-    );
+    write_atomic(&dir.join("keydb.cfg"), "0xBBBB = new\n").unwrap();
     assert!(
         std::fs::symlink_metadata(&link)
             .unwrap()
@@ -1456,12 +1477,7 @@ fn write_atomic_skips_dangling_symlink_candidate() {
             .file_type()
             .is_symlink()
     );
-    // Even far-future "old" dangling symlinks matching our name are never removed by reclaim.
-    reclaim_stale_temps(
-        &path,
-        std::time::SystemTime::now() + std::time::Duration::from_secs(99999),
-        STALE_TEMP_AGE,
-    );
+    write_atomic(&path, "0xCCCC = newer\n").unwrap();
     assert!(std::fs::symlink_metadata(&link).is_ok());
 }
 
