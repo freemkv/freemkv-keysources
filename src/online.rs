@@ -376,7 +376,7 @@ fn within(timeout: NextTimeout, bound: Duration) -> NextTimeout {
         } else {
             bound
         },
-        reason: timeout.reason,
+        ..timeout
     }
 }
 

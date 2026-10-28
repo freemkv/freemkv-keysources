@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Builds with ureq 3.5, whose `NextTimeout` gained per-read and per-write fields; the lockfile now tests 3.5.
 - Keydb saves no longer sweep old sibling files by name and age. Operator files and paused writers' open temporaries are preserved; crash-abandoned temporaries may remain. Saves still clean up their own temporary on handled failure.
 
 ## [1.8.5] — 2026-10-19
