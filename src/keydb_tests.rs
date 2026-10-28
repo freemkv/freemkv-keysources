@@ -1181,6 +1181,42 @@ fn save_extracts_the_cfg_member_from_a_valid_zip() {
     assert_eq!(result.entries, 1);
 }
 
+fn zip_with_member(name: &str, body: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+    let opts = zip::write::SimpleFileOptions::default();
+    writer.start_file(name, opts).unwrap();
+    writer.write_all(body).unwrap();
+    writer.finish().unwrap();
+    buf
+}
+
+/// An uppercase `.CFG` member extracts too.
+#[test]
+fn save_extracts_an_uppercase_cfg_extension_member() {
+    let buf = zip_with_member("KEYDB.CFG", b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD = Test\n");
+    let src = KeydbSource::new(scratch("save-zip-upper-cfg").join("k.cfg"));
+    assert_eq!(src.save(&buf).expect("KEYDB.CFG must extract").entries, 1);
+}
+
+/// A member name that is not UTF-8 and lacks the UTF-8 flag: pins the real
+/// behaviour (zip falls back to cp437, so the name decodes and extracts).
+#[test]
+fn save_extracts_a_cfg_member_with_a_non_utf8_name() {
+    let mut buf = zip_with_member("KEYDBX.cfg", b"0xAABBCCDDAABBCCDDAABBCCDDAABBCCDD = Test\n");
+    let mut patched = 0;
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"KEYDBX.cfg") {
+            buf[i + 5] = 0xE9; // cp437 'Θ', invalid as UTF-8
+            patched += 1;
+        }
+    }
+    assert_eq!(patched, 2, "local and central headers");
+    let src = KeydbSource::new(scratch("save-zip-non-utf8").join("k.cfg"));
+    assert_eq!(src.save(&buf).expect("cp437 name decodes").entries, 1);
+}
+
 #[test]
 fn atomic_update_never_truncates_or_removes_an_existing_temp_file() {
     let dir = scratch("write-atomic-temp-collision");
@@ -1347,10 +1383,10 @@ fn write_atomic_preserves_aged_active_writer() {
     assert!(!temporary.exists());
 }
 
-/// 16+ leftover temps in the old (v1.8.3 / b6b6f73) `keydb.tmp.<pid>.<n>` format
-/// with this process's own pid must not block a save, even when fresh.
+/// Old 2-part `keydb.tmp.<pid>.<i>` temps (even fresh, own pid) are left alone
+/// and do not block a save; generated names are 3-part so they never collide.
 #[test]
-fn write_atomic_not_blocked_by_many_old_format_temps() {
+fn write_atomic_leaves_old_two_part_temps_and_still_saves() {
     let dir = scratch("noblock");
     let path = dir.join("keydb.cfg");
     for i in 0..20 {
@@ -1360,6 +1396,43 @@ fn write_atomic_not_blocked_by_many_old_format_temps() {
     write_atomic(&path, "0xBBBB = new\n").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "0xBBBB = new\n");
     assert_eq!(temp_siblings(&dir).len(), 20, "fresh temps are not removed");
+}
+
+/// Collisions skip to the next candidate: 15 taken names still
+/// save; 16 taken names fail and leave the target untouched.
+#[test]
+fn write_atomic_skips_colliding_temp_names_up_to_the_attempt_cap() {
+    let dir = scratch("collide-cap");
+    let path = dir.join("keydb.cfg");
+    std::fs::write(&path, "original\n").unwrap();
+    let names: Vec<_> = (0..16u64)
+        .map(|n| temp_path(&path, std::process::id(), 42, n))
+        .collect();
+    for p in &names {
+        std::fs::write(p, "squatter").unwrap();
+    }
+    // All attempts collide: fails, nothing touched.
+    let mut i = 0;
+    let mut all_taken = || {
+        let p = names[i % names.len()].clone();
+        i += 1;
+        p
+    };
+    assert!(write_atomic_named(&path, "new\n", &mut all_taken).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    // Free the last candidate: the final attempt succeeds.
+    std::fs::remove_file(names.last().unwrap()).unwrap();
+    let mut i = 0;
+    let mut last_free = || {
+        let p = names[i % names.len()].clone();
+        i += 1;
+        p
+    };
+    write_atomic_named(&path, "new\n", &mut last_free).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+    for p in &names[..names.len() - 1] {
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "squatter");
+    }
 }
 
 /// Numeric names and old mtimes cannot establish ownership of operator files.
@@ -1384,7 +1457,8 @@ fn write_atomic_preserves_aged_numeric_operator_files() {
     }
 }
 
-/// User files sharing the `keydb.tmp.` prefix survive, however old.
+/// User files sharing the `keydb.tmp.` prefix survive, however old, including
+/// names matching the removed sweep's `tmp.<digits>.<digits>[.<digits>]` shape.
 #[test]
 fn write_atomic_never_removes_user_files_sharing_the_prefix() {
     let dir = scratch("userfiles");
@@ -1398,6 +1472,9 @@ fn write_atomic_never_removes_user_files_sharing_the_prefix() {
         "keydb.tmp.1.x",
         "keydb.tmp",
         "keydb.tmpx.1.2",
+        "keydb.tmp.4242.1700000000000000000",
+        "keydb.tmp.4242.1700000000000000000.7",
+        "keydb.tmp.1.2",
     ];
     for n in keep {
         let p = dir.join(n);
