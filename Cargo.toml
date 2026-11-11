@@ -43,8 +43,8 @@ libfreemkv = { version = "1.8", features = ["test-util"] }
 lto = "thin"
 codegen-units = 1
 
-# libfreemkv is git-only (off crates.io). Redirect the bare `libfreemkv = "1.6"`
-# req above to the git tag — committed and CI-visible. The release script
+# libfreemkv is git-only (off crates.io). Redirect the bare `libfreemkv = "1.8"`
+# req above to the git tag — committed and CI-visible. release-orchestrate.yml
 # rewrites this tag to the new version before regenerating Cargo.lock. Local dev
 # overrides it with a path patch via the gitignored .cargo/config.toml (a
 # config-level [patch.crates-io] wins over this manifest one for the same crate).
