@@ -1639,3 +1639,59 @@ fn to_keydb_cfg_round_trip_keeps_every_disc_entry_from_fuzz_input() {
     let reparsed = KeyDb::parse(&db.to_keydb_cfg());
     assert_eq!(db.disc_entries.len(), reparsed.disc_entries.len());
 }
+
+#[test]
+fn max_keydb_bytes_is_128_mib() {
+    assert_eq!(MAX_KEYDB_BYTES, 134_217_728);
+}
+
+#[test]
+fn is_parseable_entry_line_accepts_both_dk_shapes() {
+    let k = "0x01010101010101010101010101010101";
+    let positioned = format!(
+        "| DK | DEVICE_KEY {k} | DEVICE_NODE 0x0800 | KEY_UV 0x00000400 | KEY_U_MASK_SHIFT 0x17"
+    );
+    let orphan = format!("| DK | DEVICE_KEY {k}");
+    assert!(is_parseable_entry_line(&positioned));
+    assert!(is_parseable_entry_line(&orphan));
+    assert!(!is_parseable_entry_line("| DK | DEVICE_KEY 0xZZ"));
+}
+
+#[test]
+fn parse_orphan_dk_rejects_each_position_field_alone() {
+    let k = "0x01010101010101010101010101010101";
+    for field in [
+        "DEVICE_NODE 0x0800",
+        "KEY_UV 0x00000400",
+        "KEY_U_MASK_SHIFT 0x17",
+    ] {
+        let line = format!("| DK | DEVICE_KEY {k} | {field}");
+        assert!(KeyDb::parse_orphan_dk(&line).is_none(), "{field}");
+    }
+}
+
+#[test]
+fn disc_entry_trailing_tag_without_value_is_ignored() {
+    for tag in ["M", "I", "V", "U"] {
+        let line = format!("0xab = T | {tag}");
+        let e = KeyDb::parse_disc_entry(&line).expect("entry parses");
+        assert!(e.media_key.is_none() && e.vid.is_none() && e.vuk.is_none());
+        assert!(e.unit_keys.is_empty());
+    }
+}
+
+#[test]
+fn disc_entry_value_is_not_rescanned_as_a_tag() {
+    let k = "0x0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+    for first in ["M", "I", "V", "U"] {
+        let line = format!("0xab = T | {first} | V | {k}");
+        let e = KeyDb::parse_disc_entry(&line).expect("entry parses");
+        assert!(e.vuk.is_none(), "value of {first} must be skipped");
+    }
+    let line = format!("0xab = T | V | I | {k}");
+    let e = KeyDb::parse_disc_entry(&line).unwrap();
+    assert!(e.vid.is_none());
+    let line = format!("0xab = T | I | M | {k}");
+    let e = KeyDb::parse_disc_entry(&line).unwrap();
+    assert!(e.media_key.is_none());
+}

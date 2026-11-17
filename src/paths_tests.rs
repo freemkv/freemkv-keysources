@@ -38,3 +38,16 @@ fn default_path_matches_search_head() {
         keydb_search_paths().into_iter().next()
     );
 }
+
+#[test]
+fn existing_path_finds_the_keydb_next_to_the_exe() {
+    let Some(p) = expected_local() else { return };
+    if p.exists() {
+        assert_eq!(existing_keydb_path(), Some(p));
+        return;
+    }
+    std::fs::write(&p, b"").unwrap();
+    let found = existing_keydb_path();
+    std::fs::remove_file(&p).ok();
+    assert_eq!(found, Some(p));
+}

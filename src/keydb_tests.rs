@@ -1644,3 +1644,62 @@ fn load_failure_maps_io_kind_to_the_right_verdict() {
         "an unusable keydb must surface as KeydbInvalid"
     );
 }
+
+// A keyless match whose derivation failed reports its reason; a match that did
+// yield keys reports none (unless the reason is NoVid).
+#[test]
+fn miss_path_names_the_reason_only_when_keyless_or_no_vid() {
+    let mut e = blank_entry(HASH);
+    let db = db_with(e.clone(), Vec::new());
+    let c = ctx(HASH, vec![[0x44u8; 16]], Some(Vid([0x66u8; 16])));
+    let r = KeydbSource::resolve_from(&db, &c);
+    assert!(r.keys.is_empty());
+    assert_eq!(r.miss_path, vec![KeyNode::NoDerivableKey]);
+
+    e.unit_keys = vec![(1, [0x55u8; 16])];
+    let db = db_with(e, Vec::new());
+    let r = KeydbSource::resolve_from(&db, &c);
+    assert_eq!(r.keys.len(), 1);
+    assert!(r.miss_path.is_empty(), "partial keys + non-NoVid reason");
+}
+
+#[test]
+fn resolve_unit_keys_reads_the_file_and_reports_the_match() {
+    let dir = scratch("resolve-uk");
+    let path = dir.join("keydb.cfg");
+    std::fs::write(&path, format!("0xaabb = T | U | 1-0x{}\n", "01".repeat(16))).unwrap();
+    let src = KeydbSource::new(&path);
+    let r = KeySource::resolve_unit_keys(&src, &ctx(HASH, Vec::new(), None)).unwrap();
+    assert_eq!(r.keys.len(), 1);
+    assert_eq!(r.keys[0].key, [0x01u8; 16]);
+    assert!(r.matched);
+    assert_eq!(r.store_entries, Some(1));
+    assert!(r.matched_entry.is_some());
+}
+
+#[test]
+fn save_drops_the_parsed_cache() {
+    let dir = scratch("save-invalidate");
+    let path = dir.join("keydb.cfg");
+    let body = format!("0xaabb = T | U | 1-0x{}\n", "01".repeat(16));
+    std::fs::write(&path, &body).unwrap();
+    let src = KeydbSource::new(&path);
+    src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+    assert!(src.cache.lock().unwrap().is_some());
+    src.save(body.as_bytes()).unwrap();
+    assert!(src.cache.lock().unwrap().is_none());
+}
+
+// A non-AlreadyExists create error stops at the first candidate name.
+#[test]
+fn write_atomic_named_does_not_retry_other_errors() {
+    let dir = scratch("no-retry");
+    let path = dir.join("missing-dir").join("keydb.cfg");
+    let mut calls = 0;
+    let r = write_atomic_named(&path, "x", &mut || {
+        calls += 1;
+        dir.join("missing-dir").join(format!("t.{calls}"))
+    });
+    assert!(matches!(r, Err(Error::KeydbWrite { .. })));
+    assert_eq!(calls, 1);
+}

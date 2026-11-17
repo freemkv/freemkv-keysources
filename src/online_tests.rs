@@ -1934,3 +1934,239 @@ fn busy_is_held_during_the_call() {
         "busy() must hold off the idle timer while the call is in flight: got {stall:?}"
     );
 }
+
+// ── Mutation-hardening ─────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct FakeInner {
+    buffers: ureq::unversioned::transport::LazyBuffers,
+    write_ok: bool,
+    open: bool,
+    tls: bool,
+}
+impl FakeInner {
+    fn new(write_ok: bool, open: bool, tls: bool) -> Self {
+        Self {
+            buffers: ureq::unversioned::transport::LazyBuffers::new(16, 16),
+            write_ok,
+            open,
+            tls,
+        }
+    }
+}
+impl Transport for FakeInner {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+    fn transmit_output(&mut self, _amount: usize, _t: NextTimeout) -> Result<(), ureq::Error> {
+        if self.write_ok {
+            Ok(())
+        } else {
+            Err(ureq::Error::Io(std::io::ErrorKind::BrokenPipe.into()))
+        }
+    }
+    fn await_input(&mut self, _t: NextTimeout) -> Result<bool, ureq::Error> {
+        Ok(true)
+    }
+    fn is_open(&mut self) -> bool {
+        self.open
+    }
+    fn is_tls(&self) -> bool {
+        self.tls
+    }
+}
+
+fn idle_over(inner: FakeInner) -> IdleTransport<FakeInner> {
+    IdleTransport {
+        inner,
+        idle: T_IDLE,
+        request_bytes: 0,
+        awaiting_reply: false,
+    }
+}
+
+#[test]
+fn idle_transport_forwards_is_open_and_is_tls() {
+    let mut t = idle_over(FakeInner::new(true, true, true));
+    assert!(t.is_open());
+    assert!(t.is_tls());
+    let mut t = idle_over(FakeInner::new(true, false, false));
+    assert!(!t.is_open());
+    assert!(!t.is_tls());
+}
+
+#[test]
+fn idle_transport_bumps_progress_only_for_successful_nonempty_writes() {
+    let progress = Liveness::new();
+    ACTIVE_QUERY_PROGRESS.with(|p| *p.borrow_mut() = Some(progress.clone()));
+    let mut ok = idle_over(FakeInner::new(true, true, false));
+    let mut bad = idle_over(FakeInner::new(false, true, false));
+
+    let before = progress.get();
+    ok.transmit_output(0, NextTimeout::default()).unwrap();
+    assert_eq!(progress.get(), before, "a zero-byte write moves nothing");
+
+    assert!(bad.transmit_output(5, NextTimeout::default()).is_err());
+    assert_eq!(progress.get(), before, "a failed write moves nothing");
+
+    ok.transmit_output(5, NextTimeout::default()).unwrap();
+    assert!(progress.get() > before, "a real write bumps");
+    ACTIVE_QUERY_PROGRESS.with(|p| *p.borrow_mut() = None);
+}
+
+#[test]
+fn within_takes_the_tighter_of_timeout_and_bound() {
+    let t = |after| NextTimeout {
+        after,
+        ..NextTimeout::default()
+    };
+    let bound = Duration::from_secs(5);
+    assert_eq!(
+        within(t(UreqDuration::from_secs(1)), bound).after,
+        UreqDuration::from_secs(1)
+    );
+    assert_eq!(
+        within(t(UreqDuration::from_secs(9)), bound).after,
+        UreqDuration::from_secs(5)
+    );
+    assert_eq!(
+        within(t(UreqDuration::NotHappening), bound).after,
+        UreqDuration::from_secs(5)
+    );
+}
+
+#[test]
+fn query_slot_is_released_only_when_the_last_one_drops() {
+    let host = "slot-release.test";
+    let halt = Halt::new();
+    let a = acquire_query_slot(host, &halt).unwrap();
+    let b = acquire_query_slot(host, &halt).unwrap();
+    assert_eq!(query_slots_in_flight(host), 2);
+    drop(a);
+    assert_eq!(query_slots_in_flight(host), 1);
+    drop(b);
+    assert_eq!(query_slots_in_flight(host), 0);
+    assert!(!QUERY_INFLIGHT.lock().unwrap().contains_key(host));
+}
+
+#[test]
+fn title_keys_ctx_is_an_empty_shell_around_the_title_keys() {
+    let none = TitleKeysCtx(None);
+    assert_eq!(none.disc_hash(), "");
+    assert_eq!(none.title(), None);
+    assert!(none.vid().is_none());
+    assert!(none.mkb().unwrap().is_empty());
+    assert!(none.enc_title_keys().is_err());
+    assert!(none.samples(4).unwrap().is_empty());
+
+    let some = TitleKeysCtx(Some(vec![[7u8; 16], [9u8; 16]]));
+    assert_eq!(some.enc_title_keys().unwrap(), &[[7u8; 16], [9u8; 16]]);
+    let empty = TitleKeysCtx(Some(Vec::new()));
+    assert!(empty.enc_title_keys().unwrap().is_empty());
+}
+
+#[test]
+fn query_with_clears_the_previous_reachability() {
+    set_last_decode_reachability(Some(DecodeReachability::Transport));
+    let src = OnlineSource::new("", "");
+    assert!(src.query_with(&BareCtx, &Halt::new()).unwrap().is_empty());
+    assert_eq!(take_last_decode_reachability(), None);
+}
+
+#[test]
+fn an_mkb_exactly_at_the_cap_is_still_forwarded() {
+    let src = OnlineSource::new("https://0.0.0.0/keys", "s3cr3t");
+    let ctx = GuardCtx {
+        mkb: vec![0u8; MAX_MKB_BYTES],
+        samples: MIN_SAMPLE_UNITS,
+        ..Default::default()
+    };
+    assert!(
+        src.get_unit_keys(&ctx).is_err(),
+        "at-cap MKB reaches the address guard, not the skip"
+    );
+}
+
+#[test]
+fn interpret_reply_classifies_http_errors_by_status() {
+    for (status, want) in [
+        (401u16, libfreemkv::error::E_KEY_SERVICE_UNAUTHORIZED),
+        (403, libfreemkv::error::E_KEY_SERVICE_UNAUTHORIZED),
+        (429, libfreemkv::error::E_KEY_SERVICE_RATE_LIMITED),
+    ] {
+        let err = interpret_reply(Err(ureq::Error::StatusCode(status)), &BareCtx, 1)
+            .expect_err("an HTTP error is a source failure");
+        assert_eq!(err.code(), want, "HTTP {status}");
+    }
+}
+
+#[test]
+fn a_reply_one_byte_over_the_cap_is_rejected_even_if_the_prefix_is_valid() {
+    let head = r#"{"UK":["000102030405060708090a0b0c0d0e0f"]}"#;
+    let over = format!("{head}{}", " ".repeat(MAX_RESPONSE_BYTES + 1 - head.len()));
+    assert_eq!(over.len(), MAX_RESPONSE_BYTES + 1);
+    assert_eq!(
+        interpret_reply(Ok(reply(200, &over)), &BareCtx, 1)
+            .expect_err("over-cap is never an answer")
+            .code(),
+        libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+    );
+}
+
+struct TitleCtx(Option<&'static str>);
+impl ResolveCtx for TitleCtx {
+    fn disc_hash(&self) -> &str {
+        "0x422EB"
+    }
+    fn title(&self) -> Option<&str> {
+        self.0
+    }
+    fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+        None
+    }
+    fn mkb(&self) -> Result<&[u8], Error> {
+        Ok(&[])
+    }
+    fn enc_title_keys(&self) -> Result<&[[u8; 16]], Error> {
+        Ok(&[])
+    }
+    fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(vec![vec![0u8; 16]; MIN_SAMPLE_UNITS])
+    }
+}
+
+// One-connection loopback stub that hands back the request body it received.
+fn body_capture_stub() -> (SocketAddr, mpsc::Receiver<String>) {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let len = read_head(&mut sock);
+        let mut body = vec![0u8; len];
+        let _ = sock.read_exact(&mut body);
+        let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+        let _ =
+            sock.write_all(b"HTTP/1.1 200 X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    });
+    (addr, rx)
+}
+
+#[test]
+fn the_request_carries_a_trimmed_title_only_when_nonempty() {
+    for (title, want) in [
+        (Some("  My Disc  "), Some("My Disc")),
+        (Some("   "), None),
+        (None, None),
+    ] {
+        let (addr, rx) = body_capture_stub();
+        let src = source_via("title-body.test", T_IDLE, move || Ok(vec![addr]));
+        src.query_with(&TitleCtx(title), &Halt::new()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(body.get("title").and_then(|t| t.as_str()), want);
+    }
+}

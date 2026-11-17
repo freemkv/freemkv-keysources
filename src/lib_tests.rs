@@ -170,3 +170,105 @@ fn multi_source_host_certs_passes_mkb_through_to_inner_sources() {
         "the gen must reach the inner source's filter"
     );
 }
+
+// Scripted resolve_unit_keys results.
+#[derive(Clone, Copy)]
+enum Script {
+    Keys,
+    Matched(u8),
+    Miss,
+    Fail,
+}
+struct Scripted(Script);
+impl KeySource for Scripted {
+    fn get_unit_keys(&self, _ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, libfreemkv::Error> {
+        Ok(Vec::new())
+    }
+    fn resolve_unit_keys(
+        &self,
+        _ctx: &dyn ResolveCtx,
+    ) -> Result<libfreemkv::keysource::UnitKeyResolution, libfreemkv::Error> {
+        use libfreemkv::keysource::UnitKeyResolution;
+        match self.0 {
+            Script::Keys => Ok(UnitKeyResolution {
+                keys: vec![UnitKey::new(0, [7u8; 16])],
+                matched: true,
+                ..Default::default()
+            }),
+            Script::Matched(n) => Ok(UnitKeyResolution {
+                matched: true,
+                store_entries: Some(n as usize),
+                ..Default::default()
+            }),
+            Script::Miss => Ok(UnitKeyResolution::default()),
+            Script::Fail => Err(libfreemkv::Error::KeydbInvalid),
+        }
+    }
+}
+
+struct NoCtx;
+impl ResolveCtx for NoCtx {
+    fn disc_hash(&self) -> &str {
+        "0x00"
+    }
+    fn vid(&self) -> Option<libfreemkv::aacs::types::Vid> {
+        None
+    }
+    fn title(&self) -> Option<&str> {
+        None
+    }
+    fn mkb(&self) -> Result<&[u8], libfreemkv::Error> {
+        Ok(&[])
+    }
+    fn enc_title_keys(&self) -> Result<&[[u8; 16]], libfreemkv::Error> {
+        Ok(&[])
+    }
+    fn samples(&self, _n: usize) -> Result<Vec<Vec<u8>>, libfreemkv::Error> {
+        Ok(Vec::new())
+    }
+}
+
+fn multi_of(s: &[Script]) -> MultiSource {
+    MultiSource::new(
+        s.iter()
+            .map(|x| Box::new(Scripted(*x)) as Box<dyn KeySource>)
+            .collect(),
+    )
+}
+
+#[test]
+fn multi_resolve_returns_first_source_with_keys() {
+    let r = multi_of(&[Script::Keys]).resolve_unit_keys(&NoCtx).unwrap();
+    assert_eq!(r.keys.len(), 1);
+    // A keyless match before it must not win over later keys.
+    let r = multi_of(&[Script::Matched(1), Script::Keys])
+        .resolve_unit_keys(&NoCtx)
+        .unwrap();
+    assert_eq!(r.keys.len(), 1);
+}
+
+#[test]
+fn multi_resolve_first_matched_miss_survives() {
+    let r = multi_of(&[Script::Miss, Script::Matched(1), Script::Matched(2)])
+        .resolve_unit_keys(&NoCtx)
+        .unwrap();
+    assert!(r.matched && r.keys.is_empty());
+    assert_eq!(r.store_entries, Some(1));
+}
+
+#[test]
+fn multi_resolve_failure_beats_plain_miss_but_not_a_match() {
+    assert!(
+        multi_of(&[Script::Fail, Script::Miss])
+            .resolve_unit_keys(&NoCtx)
+            .is_err()
+    );
+    let r = multi_of(&[Script::Fail, Script::Matched(3)])
+        .resolve_unit_keys(&NoCtx)
+        .unwrap();
+    assert_eq!(r.store_entries, Some(3));
+    let r = multi_of(&[Script::Miss, Script::Miss])
+        .resolve_unit_keys(&NoCtx)
+        .unwrap();
+    assert!(!r.matched && r.keys.is_empty() && r.store_entries.is_none());
+}
