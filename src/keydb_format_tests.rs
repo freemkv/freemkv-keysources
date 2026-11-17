@@ -1615,3 +1615,27 @@ fn test_resolve_keys_vuk_path() {
         eprintln!("VUK derivation verified");
     }
 }
+
+/// Fuzz finding: a disc row whose hash field is not `0x` + hex (here
+/// `0X =\t  `, which trims to `0x =`) used to load as its own entry. Written
+/// back by `to_keydb_cfg` it re-parsed under a different hash, colliding with
+/// another row and silently losing a disc entry. Such rows are rejected and
+/// counted, never loaded.
+#[test]
+fn parse_rejects_a_disc_hash_that_is_not_hex() {
+    let (db, stats) = KeyDb::parse_counted("0X =\t   =  =\n0x = T\n0xAB CD = T\n0xab = T\n");
+    assert_eq!(db.disc_entries.len(), 1, "only the hex hash loads");
+    assert!(db.find_disc("0xab").is_some());
+    assert_eq!(stats.disc_rejected, 3, "non-hex hashes are counted");
+    assert!(!is_parseable_entry_line("0X =\t   =  ="));
+}
+
+/// Fuzz crash input (keysources `parsers` target): every disc entry must
+/// survive a `to_keydb_cfg` → `parse` round trip.
+#[test]
+fn to_keydb_cfg_round_trip_keeps_every_disc_entry_from_fuzz_input() {
+    let input = "0X  =  =\t\n    0X =\t   =  =\t\nXH";
+    let db = KeyDb::parse(input);
+    let reparsed = KeyDb::parse(&db.to_keydb_cfg());
+    assert_eq!(db.disc_entries.len(), reparsed.disc_entries.len());
+}
