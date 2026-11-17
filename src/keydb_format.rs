@@ -775,7 +775,15 @@ impl KeyDb {
     fn parse_disc_entry(line: &str) -> Option<DiscEntry> {
         // 0x<hash> = <title> | D | <date> | M | 0x<mk> | I | 0x<id> | V | 0x<vuk> | U | <unit_keys> ; <comment>
         let (hash_part, rest) = line.split_once(" = ")?;
-        let disc_hash: Arc<str> = Arc::from(hash_part.trim().to_lowercase());
+        // The hash must be `0x` + hex digits and nothing else. Anything looser
+        // (whitespace, a stray `=`) would load here but re-parse under a
+        // different hash after `to_keydb_cfg`, colliding with another row.
+        let hash = hash_part.trim().to_lowercase();
+        let digits = hash.strip_prefix("0x")?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let disc_hash: Arc<str> = Arc::from(hash);
 
         // The trailing `;` comment (e.g. "; MKBv76/BEE/FindVUK 1.74 -
         // VolumeSize: 81309007872 (UHD)") carries metadata the key fields
