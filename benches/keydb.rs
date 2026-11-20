@@ -47,7 +47,7 @@ impl ResolveCtx for HashCtx {
 struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
@@ -57,7 +57,7 @@ impl Rng {
     fn hex(&mut self, bytes: usize) -> String {
         let mut s = String::with_capacity(bytes * 2);
         while s.len() < bytes * 2 {
-            s.push_str(&format!("{:016x}", self.next()));
+            s.push_str(&format!("{:016x}", self.next_u64()));
         }
         s.truncate(bytes * 2);
         s
