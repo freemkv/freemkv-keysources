@@ -6,10 +6,11 @@
 //! per-disc Unit Keys, then VUK, then a Media Key (stored / PK pool / DK pool) via
 //! `derive_vuk`.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::uks_from_vuk;
 use libfreemkv::aacs::derive::{derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk};
@@ -117,7 +118,18 @@ impl CacheEntry {
 /// `host_certs()`, the trait `host_certs(mkb)`, and `get_unit_keys`, and each used to re-read +
 /// re-parse the whole ~62 MiB file. A replaced keydb is picked up on the next call, with one
 /// narrow exception.
+///
+/// The cache lives behind an `Arc`, so a clone is cheap and SHARES it: every clone sees one
+/// parse. [`KeydbSource::new`] makes a source with its own cache;
+/// [`KeydbSource::shared`] hands out clones of one process-wide source per path, so a caller
+/// that builds a fresh source per key acquisition still parses the file once.
+#[derive(Clone)]
 pub struct KeydbSource {
+    inner: Arc<Inner>,
+}
+
+// The state every clone of one `KeydbSource` shares.
+struct Inner {
     path: PathBuf,
     // Mutex, not RwLock: the guarded section is a stamp compare + Arc clone,
     // so there's nothing for concurrent readers to win. Poisoning recovers
@@ -135,11 +147,10 @@ pub struct KeydbSource {
     warnings: AtomicUsize,
 }
 
-impl KeydbSource {
-    /// A keydb source reading the given `keydb.cfg` path.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+impl Inner {
+    fn new(path: PathBuf) -> Self {
         Self {
-            path: path.into(),
+            path,
             cache: Mutex::new(None),
             parses: AtomicUsize::new(0),
             mtime_granularity: MTIME_GRANULARITY,
@@ -147,12 +158,68 @@ impl KeydbSource {
         }
     }
 
+    fn invalidate(&self) {
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+// The process-wide sources behind `KeydbSource::shared`, keyed by the path as given. Held
+// strongly for the process lifetime: a later acquisition, after every earlier handle was
+// dropped, must still find the parse.
+static SHARED: LazyLock<Mutex<HashMap<PathBuf, Arc<Inner>>>> = LazyLock::new(Default::default);
+
+// The shared source registered for `path`, if any. The registry lock is released on return,
+// so callers never hold it while taking a cache lock.
+fn shared_inner(path: &Path) -> Option<Arc<Inner>> {
+    SHARED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .cloned()
+}
+
+impl KeydbSource {
+    /// A keydb source reading the given `keydb.cfg` path, with its OWN cache (clones of it
+    /// share that cache; other sources do not). A long-lived process that builds sources
+    /// repeatedly for lookups should use [`Self::shared`].
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(Inner::new(path.into())),
+        }
+    }
+
+    /// The process-wide keydb source for `path`: every call with the same path returns a
+    /// clone of ONE source, so its parsed keydb survives the caller dropping each handle.
+    ///
+    /// The registry is keyed by the path exactly as given (no canonicalisation), so pass
+    /// the same path every time; it holds each source for the process lifetime. The file
+    /// is still re-checked on every lookup, so a replaced keydb is re-read exactly as with
+    /// [`Self::new`], and [`Self::save`] / [`Self::update`] through ANY source for the same
+    /// path also drop the shared cache.
+    ///
+    /// How the engine should call it: wherever it builds a keydb source for a lookup (the
+    /// per-acquire key-source factory and the scan-time host-cert lookup), replace
+    /// `Box::new(KeydbSource::new(path.clone()))` with
+    /// `Box::new(KeydbSource::shared(path.clone()))`, and
+    /// `KeydbSource::new(path).host_certs()` with `KeydbSource::shared(path).host_certs()`.
+    /// Nothing else changes: the boxed handle is still dropped after each acquisition, only
+    /// the cache behind it is kept. Writers (`save` / `update` from a settings or CLI
+    /// updater) can keep using [`Self::new`].
+    pub fn shared(path: impl Into<PathBuf>) -> Self {
+        let mut registry = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = registry
+            .entry(path.into())
+            .or_insert_with_key(|p| Arc::new(Inner::new(p.clone())))
+            .clone();
+        Self { inner }
+    }
+
     // Log the parser's rejection summary and count the emission — the count
     // is the only way to assert, without a `tracing` dev-dependency, that the
     // corruption warning is NOT swallowed by the cache. See `cached_db`.
     fn emit_parse_stats(&self, stats: &crate::keydb_format::ParseStats) {
         if stats.log() {
-            self.warnings.fetch_add(1, Ordering::Relaxed);
+            self.inner.warnings.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -161,30 +228,34 @@ impl KeydbSource {
     /// still parsing once.
     #[cfg(test)]
     fn warning_count(&self) -> usize {
-        self.warnings.load(Ordering::Relaxed)
+        self.inner.warnings.load(Ordering::Relaxed)
     }
 
-    /// Test-only: override the settle window (see the field's doc).
+    /// Test-only: override the settle window (see the field's doc). Only on a fresh,
+    /// unshared source: not one from [`Self::shared`], not one already cloned.
     #[cfg(test)]
     fn with_mtime_granularity(mut self, g: std::time::Duration) -> Self {
-        self.mtime_granularity = g;
+        Arc::get_mut(&mut self.inner)
+            .expect("with_mtime_granularity needs a fresh, unshared source")
+            .mtime_granularity = g;
         self
     }
 
     // The parsed keydb, from cache when unchanged (errors mirror KeyDb::load). ONE OPEN, ONE
     // IDENTITY: stamp (fstat) and bytes share one handle.
     fn cached_db(&self) -> std::io::Result<Arc<KeyDb>> {
-        let file = std::fs::File::open(&self.path)?;
+        let inner = &*self.inner;
+        let file = std::fs::File::open(&inner.path)?;
         let stamp = FileStamp::of(&file.metadata()?);
         let stamped_at = std::time::SystemTime::now();
         // Fast path: a settled cache hit under a brief lock (stamp compare +
         // Arc clone). Re-emit the rejection summary on EVERY hit — a hit skips
         // `KeyDb::parse`, else a corrupt keydb warns once then serves silently.
         {
-            let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = inner.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref()
                 && entry.stamp == stamp
-                && entry.is_settled(self.mtime_granularity)
+                && entry.is_settled(inner.mtime_granularity)
             {
                 self.emit_parse_stats(&entry.stats);
                 return Ok(entry.db.clone());
@@ -193,21 +264,21 @@ impl KeydbSource {
         // Miss: parse the ~62 MiB file OUTSIDE the lock so a reparse can't stall
         // every other worker. Stamp (fstat) and bytes still come from the ONE
         // open handle, preserving the one-open-one-identity invariant.
-        let (db, stats) = KeyDb::load_counted(file, &self.path)?;
+        let (db, stats) = KeyDb::load_counted(file, &inner.path)?;
         let db = Arc::new(db);
         // Re-acquire and double-check: a peer may have installed the same
         // settled stamp while we parsed — adopt theirs and drop our redundant
         // parse rather than racing a lost update.
-        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = inner.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.as_ref()
             && entry.stamp == stamp
-            && entry.is_settled(self.mtime_granularity)
+            && entry.is_settled(inner.mtime_granularity)
         {
             self.emit_parse_stats(&entry.stats);
             return Ok(entry.db.clone());
         }
         self.emit_parse_stats(&stats);
-        self.parses.fetch_add(1, Ordering::Relaxed);
+        inner.parses.fetch_add(1, Ordering::Relaxed);
         *guard = Some(CacheEntry {
             stamp,
             stamped_at,
@@ -217,17 +288,23 @@ impl KeydbSource {
         Ok(db)
     }
 
-    /// Drop the cached parse. Called after this source WRITES the file, so the
-    /// next lookup re-reads it without depending on mtime resolution.
+    /// Drop the cached parse, and the shared source's for the same path when that is a
+    /// different source. Called after this source WRITES the file, so the next lookup
+    /// through either re-reads it without depending on mtime resolution.
     fn invalidate_cache(&self) {
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.inner.invalidate();
+        if let Some(shared) = shared_inner(&self.inner.path)
+            && !Arc::ptr_eq(&shared, &self.inner)
+        {
+            shared.invalidate();
+        }
     }
 
     /// Cache misses so far — the number of real file reads + parses. Test-only
     /// observability for the cache (see [`Self::cached_db`]).
     #[cfg(test)]
     fn parse_count(&self) -> usize {
-        self.parses.load(Ordering::Relaxed)
+        self.inner.parses.load(Ordering::Relaxed)
     }
 
     // Turn a KeyDb::load failure into this source's verdict: MISSING is the documented benign
@@ -239,7 +316,7 @@ impl KeydbSource {
             std::io::ErrorKind::InvalidData => {
                 tracing::warn!(
                     target: "freemkv::keysource",
-                    path = %self.path.display(),
+                    path = %self.inner.path.display(),
                     "keydb.cfg is unusable (over the size cap or not valid UTF-8) — this is a corrupt or truncated keydb, NOT a disc without a key"
                 );
                 Some(Error::KeydbInvalid)
@@ -247,12 +324,12 @@ impl KeydbSource {
             kind => {
                 tracing::warn!(
                     target: "freemkv::keysource",
-                    path = %self.path.display(),
+                    path = %self.inner.path.display(),
                     io_kind = ?kind,
                     "keydb.cfg could not be read — NOT a disc without a key"
                 );
                 Some(Error::KeydbLoad {
-                    path: self.path.display().to_string(),
+                    path: self.inner.path.display().to_string(),
                 })
             }
         }
@@ -288,12 +365,12 @@ impl KeydbSource {
             return Err(Error::KeydbInvalid);
         }
 
-        write_atomic(&self.path, &text)?;
+        write_atomic(&self.inner.path, &text)?;
         // The file this source reads was just replaced; drop the parsed copy.
         self.invalidate_cache();
 
         Ok(UpdateResult {
-            path: self.path.clone(),
+            path: self.inner.path.clone(),
             entries,
             bytes: text.len(),
         })

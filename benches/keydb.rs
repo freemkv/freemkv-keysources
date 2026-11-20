@@ -205,6 +205,29 @@ fn main() {
     });
     time("warm host_certs()", 1000, || src.host_certs());
     drop(src);
+    show_rss("warm KeydbSource dropped");
+
+    // The engine's intended path: a fresh handle per acquisition and per scan,
+    // one parse per process behind them.
+    time("KeydbSource::shared + first lookup (cold)", 1, || {
+        KeydbSource::shared(&path)
+            .get_unit_keys(&hit)
+            .expect("lookup")
+    });
+    time("KeydbSource::shared per acquire + hit", 1000, || {
+        KeydbSource::shared(&path)
+            .get_unit_keys(&hit)
+            .expect("lookup")
+    });
+    time("KeydbSource::shared per acquire + miss", 1000, || {
+        KeydbSource::shared(&path)
+            .get_unit_keys(&miss)
+            .expect("lookup")
+    });
+    time("KeydbSource::shared per scan + host_certs", 1000, || {
+        KeydbSource::shared(&path).host_certs()
+    });
+    show_rss("shared source registered (held for process)");
 
     std::fs::remove_dir_all(&dir).ok();
 }

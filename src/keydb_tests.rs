@@ -1685,9 +1685,131 @@ fn save_drops_the_parsed_cache() {
     std::fs::write(&path, &body).unwrap();
     let src = KeydbSource::new(&path);
     src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
-    assert!(src.cache.lock().unwrap().is_some());
+    assert!(src.inner.cache.lock().unwrap().is_some());
     src.save(body.as_bytes()).unwrap();
-    assert!(src.cache.lock().unwrap().is_none());
+    assert!(src.inner.cache.lock().unwrap().is_none());
+}
+
+// ── KeydbSource::shared / Clone: one parse across handles ───────────────────
+
+// A keydb with one disc row (unit key `k`), aged past the settle window so a
+// cached parse is trusted.
+fn settled_keydb(tag: &str, k: u8) -> std::path::PathBuf {
+    let dir = scratch(tag);
+    let path = dir.join("keydb.cfg");
+    std::fs::write(
+        &path,
+        format!("0xaabb = T | U | 1-0x{}\n", format!("{k:02x}").repeat(16)),
+    )
+    .unwrap();
+    age_file(&path, 3600);
+    path
+}
+
+#[test]
+fn two_shared_handles_for_one_path_parse_once() {
+    let path = settled_keydb("shared-once", 0x01);
+    let a = KeydbSource::shared(&path);
+    assert_eq!(
+        a.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16]
+    );
+    drop(a);
+    // A later acquisition, after every earlier handle is gone, reuses the parse.
+    let b = KeydbSource::shared(&path);
+    assert_eq!(
+        b.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16]
+    );
+    assert_eq!(b.host_certs().len(), 0);
+    assert_eq!(
+        b.parse_count(),
+        1,
+        "the shared source must parse the file once"
+    );
+    assert!(Arc::ptr_eq(&b.inner, &KeydbSource::shared(&path).inner));
+}
+
+#[test]
+fn a_clone_shares_the_cache() {
+    let path = settled_keydb("clone-shares", 0x01);
+    let a = KeydbSource::new(&path);
+    let b = a.clone();
+    a.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+    b.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+    assert_eq!(
+        a.parse_count(),
+        1,
+        "a clone must reuse the original's parse"
+    );
+    // `new` stays per-instance: a second `new` does not see the first's cache.
+    let c = KeydbSource::new(&path);
+    c.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+    assert_eq!(c.parse_count(), 1);
+    assert_eq!(a.parse_count(), 1);
+}
+
+// A save through a SEPARATE `new()` source (the settings / CLI updater) must be
+// seen by the shared source at once, even with the stamp forced back to match.
+#[cfg(unix)]
+#[test]
+fn a_save_through_new_is_seen_by_the_shared_source() {
+    let path = settled_keydb("shared-save", 0x01);
+    pin_mtime(&path);
+    let shared = KeydbSource::shared(&path);
+    assert_eq!(
+        shared.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16]
+    );
+    assert!(shared.inner.cache.lock().unwrap().is_some());
+
+    let body = format!("0xaabb = T | U | 1-0x{}\n", "02".repeat(16));
+    KeydbSource::new(&path).save(body.as_bytes()).unwrap();
+    assert!(
+        shared.inner.cache.lock().unwrap().is_none(),
+        "save through another source must drop the shared cache"
+    );
+    pin_mtime(&path);
+    assert_eq!(
+        shared.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x02u8; 16]
+    );
+    assert_eq!(shared.parse_count(), 2);
+}
+
+#[test]
+fn shared_sources_for_different_paths_are_independent() {
+    let p1 = settled_keydb("shared-indep-1", 0x01);
+    let p2 = settled_keydb("shared-indep-2", 0x02);
+    let a = KeydbSource::shared(&p1);
+    let b = KeydbSource::shared(&p2);
+    assert!(!Arc::ptr_eq(&a.inner, &b.inner));
+    assert_eq!(
+        a.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16]
+    );
+    assert_eq!(
+        b.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x02u8; 16]
+    );
+    assert_eq!(a.parse_count(), 1);
+    assert_eq!(b.parse_count(), 1);
+    // Saving one path leaves the other's cache alone.
+    let body = format!("0xaabb = T | U | 1-0x{}\n", "03".repeat(16));
+    KeydbSource::new(&p1).save(body.as_bytes()).unwrap();
+    assert!(a.inner.cache.lock().unwrap().is_none());
+    assert!(b.inner.cache.lock().unwrap().is_some());
+}
+
+// A save through the shared source itself drops its own (and only) cache.
+#[test]
+fn a_save_through_the_shared_source_drops_its_cache() {
+    let path = settled_keydb("shared-self-save", 0x01);
+    let shared = KeydbSource::shared(&path);
+    shared.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap();
+    let body = format!("0xaabb = T | U | 1-0x{}\n", "02".repeat(16));
+    shared.save(body.as_bytes()).unwrap();
+    assert!(shared.inner.cache.lock().unwrap().is_none());
 }
 
 // A non-AlreadyExists create error stops at the first candidate name.
