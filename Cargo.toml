@@ -39,6 +39,12 @@ test-hooks = []
 # KU-P1). CI resolves it through the sibling path patch.
 libfreemkv = { version = "1.8", features = ["test-util"] }
 
+# KEYDB load/lookup timings: `cargo bench --bench keydb`. Plain `fn main`
+# timing, no bench framework, so no extra dependencies.
+[[bench]]
+name = "keydb"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
