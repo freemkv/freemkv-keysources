@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `KeydbSource::shared(path)` returns a clone of one process-wide source per path, so its cached keydb survives a caller that builds a fresh source for every key acquisition. Callers that build a keydb source per lookup should switch from `KeydbSource::new(path)` to `KeydbSource::shared(path)`. Writers (`save`, `update`) can keep using `new`.
+- `KeydbSource` is `Clone`. Clones share one cache.
+- A `keydb` bench (`cargo bench --bench keydb`) times keydb parsing and lookups over a synthetic 181k-row keydb.
+
+### Changed
+
+- `KeydbSource` caches an index of the keydb instead of the fully parsed map. The index holds the device keys, processing keys, host certs and, for each disc row, its hash and line offset (about 4.3 MB for the 181k-row public keydb, down from about 65 MB). A lookup reads and parses only the matching row. Results are unchanged, including last-row-wins for duplicated hashes and the error for an oversized or non-UTF-8 file.
+- `save()` also drops the cache of the shared source for the same path.
+
 ## [1.8.10] — 2026-11-17
 
 ### Changed

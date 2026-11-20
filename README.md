@@ -10,7 +10,8 @@ and hands libfreemkv its terminal Unit Keys via `get_unit_keys`. The library
 does all key derivation.
 
 - `KeydbSource` reads a local `keydb.cfg`. It can also save and update the file
-  from a downloaded `.zip` or `.gz`.
+  from a downloaded `.zip` or `.gz`. `KeydbSource::shared(path)` gives every
+  caller in a process one cached index of the file.
 - `OnlineSource` queries a remote key service over HTTP.
 - `MultiSource` tries several sources in order.
 - `keydb_format` exposes the `keydb.cfg` parser (`KeyDb`, `DiscEntry`).
