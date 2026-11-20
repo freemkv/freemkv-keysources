@@ -1825,11 +1825,9 @@ fn write_atomic_named_does_not_retry_other_errors() {
     assert_eq!(calls, 1);
 }
 
-// ── The index: one row read per lookup ──────────────────────────────────────
-
-// The narrow exception of the stamp check: an in-place rewrite that keeps inode, length and
-// mtime is served from cache. With the index the cached offsets then point at other rows; the
-// lookup must notice, rebuild ONCE and answer from the new file, not misread a neighbour.
+// The index reads one row per lookup. An in-place rewrite keeping inode, length and mtime is
+// served from cache, so the cached offsets point at other rows; the lookup must notice,
+// rebuild ONCE and answer from the new file, not misread a neighbour.
 #[cfg(unix)]
 #[test]
 fn a_row_moved_under_an_unchanged_stamp_is_re_indexed() {

@@ -321,12 +321,12 @@ fn a_row_that_moved_is_reported_stale() {
 
 // Same bytes, same error (kind AND text) as `KeyDb::load_counted`.
 fn assert_same_error(path: &Path) {
-    let want = KeyDb::load_counted(File::open(path).unwrap(), path)
-        .err()
-        .expect("the loader rejects this file");
-    let got = KeydbIndex::build(&File::open(path).unwrap(), path)
-        .err()
-        .expect("the index rejects this file");
+    let Err(want) = KeyDb::load_counted(File::open(path).unwrap(), path) else {
+        panic!("the loader rejects this file");
+    };
+    let Err(got) = KeydbIndex::build(&File::open(path).unwrap(), path) else {
+        panic!("the index rejects this file");
+    };
     assert_eq!(got.kind(), want.kind());
     assert_eq!(got.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(got.to_string(), want.to_string());

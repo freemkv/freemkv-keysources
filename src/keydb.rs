@@ -116,22 +116,12 @@ impl CacheEntry {
 
 /// A [`KeySource`] backed by a local `keydb.cfg` file.
 ///
-/// The parsed database is CACHED behind the file's identity stamp: a single AACS-cert rip calls
-/// `host_certs()`, the trait `host_certs(mkb)`, and `get_unit_keys`, and each used to re-read +
-/// re-parse the whole ~62 MiB file. A replaced keydb is picked up on the next call, with one
-/// narrow exception.
-///
-/// The cache is an INDEX, not the parsed map: the global rows (device keys, processing keys,
-/// host certs) plus, per disc row, its 20-byte hash and the byte offset of its line (~24 B a
-/// row, ~4.3 MB for the 181k-row public keydb, against ~65 MB for a full [`crate::KeyDb`]). A
-/// lookup binary-searches the hash and parses that one line from the file, with the same results
-/// as [`crate::KeyDb::find_disc`] (a duplicated hash resolves to its last row). If the line no longer
-/// holds the hash (the file changed under a stamp that looked unchanged), the index is rebuilt.
-///
-/// The cache lives behind an `Arc`, so a clone is cheap and SHARES it: every clone sees one
-/// parse. [`KeydbSource::new`] makes a source with its own cache;
-/// [`KeydbSource::shared`] hands out clones of one process-wide source per path, so a caller
-/// that builds a fresh source per key acquisition still parses the file once.
+/// The cache is an index, not the parsed map: the global rows plus each disc row's 20-byte
+/// hash and line offset (~4.3 MB for the public keydb against ~65 MB for a [`crate::KeyDb`]).
+/// A lookup binary-searches the hash and parses that one line, matching
+/// [`crate::KeyDb::find_disc`] (a duplicated hash resolves to its last row). The file's
+/// identity stamp is re-checked per call; a line that no longer holds its hash rebuilds the
+/// index. Clones share the cache; [`KeydbSource::shared`] shares one source per path.
 #[derive(Clone)]
 pub struct KeydbSource {
     inner: Arc<Inner>,
@@ -200,20 +190,11 @@ impl KeydbSource {
     /// The process-wide keydb source for `path`: every call with the same path returns a
     /// clone of ONE source, so its parsed keydb survives the caller dropping each handle.
     ///
-    /// The registry is keyed by the path exactly as given (no canonicalisation), so pass
-    /// the same path every time; it holds each source for the process lifetime. The file
-    /// is still re-checked on every lookup, so a replaced keydb is re-read exactly as with
-    /// [`Self::new`], and [`Self::save`] / [`Self::update`] through ANY source for the same
-    /// path also drop the shared cache.
-    ///
-    /// How the engine should call it: wherever it builds a keydb source for a lookup (the
-    /// per-acquire key-source factory and the scan-time host-cert lookup), replace
-    /// `Box::new(KeydbSource::new(path.clone()))` with
-    /// `Box::new(KeydbSource::shared(path.clone()))`, and
-    /// `KeydbSource::new(path).host_certs()` with `KeydbSource::shared(path).host_certs()`.
-    /// Nothing else changes: the boxed handle is still dropped after each acquisition, only
-    /// the cache behind it is kept. Writers (`save` / `update` from a settings or CLI
-    /// updater) can keep using [`Self::new`].
+    /// The registry is keyed by the path exactly as given (no canonicalisation) and holds
+    /// each source for the process lifetime. Every lookup still re-checks the file, and
+    /// [`Self::save`] / [`Self::update`] through any source for the path drop the shared
+    /// cache. Use it for lookups (per-acquire key sources, scan-time host certs); writers
+    /// can keep using [`Self::new`].
     pub fn shared(path: impl Into<PathBuf>) -> Self {
         let mut registry = SHARED.lock().unwrap_or_else(|e| e.into_inner());
         let inner = registry

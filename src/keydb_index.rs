@@ -59,7 +59,7 @@ fn hash20(digits: &[u8]) -> Option<[u8; 20]> {
     }
     let nibble = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let mut out = [0u8; 20];
-    for (slot, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(digits.as_chunks::<2>().0) {
         *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(out)
