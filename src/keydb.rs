@@ -479,11 +479,9 @@ impl KeydbSource {
         )
     }
 
-    // De-conflated resolution: the keys PLUS whether the disc matched and — on a
-    // keyless match — WHY nothing derived, so a matched-but-underivable disc is
-    // never reported as a flat "no entry" (issue #46). Pure (no I/O): `entry` is the
-    // disc's row (already looked up), `entries_loaded` the keydb's disc-entry count,
-    // and the PK/DK pools the keydb's global keys.
+    // De-conflated resolution (issue #46): the keys PLUS whether the disc matched and,
+    // on a keyless match, WHY nothing derived. Pure (no I/O): `entry` is the disc's
+    // already-looked-up row; the PK/DK pools are the keydb's global keys.
     fn resolve_entry(
         entry: Option<&DiscEntry>,
         entries_loaded: usize,
