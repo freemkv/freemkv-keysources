@@ -528,8 +528,7 @@ fn is_settled_falls_back_when_mtime_is_absent_or_in_the_future() {
             modified,
         },
         stamped_at,
-        db: Arc::new(KeyDb::empty()),
-        stats: crate::keydb_format::ParseStats::default(),
+        index: Arc::new(KeydbIndex::default()),
     };
     let gran = Duration::from_secs(2);
     let now = SystemTime::now();
@@ -1824,4 +1823,69 @@ fn write_atomic_named_does_not_retry_other_errors() {
     });
     assert!(matches!(r, Err(Error::KeydbWrite { .. })));
     assert_eq!(calls, 1);
+}
+
+// ── The index: one row read per lookup ──────────────────────────────────────
+
+// The narrow exception of the stamp check: an in-place rewrite that keeps inode, length and
+// mtime is served from cache. With the index the cached offsets then point at other rows; the
+// lookup must notice, rebuild ONCE and answer from the new file, not misread a neighbour.
+#[cfg(unix)]
+#[test]
+fn a_row_moved_under_an_unchanged_stamp_is_re_indexed() {
+    use std::io::Write as _;
+    let dir = scratch("index-moved");
+    let path = dir.join("keydb.cfg");
+    let row = |h: &str, k: &str| format!("{h} = T | U | 1-0x{}\n", k.repeat(16));
+    let a = format!("{}{}", row("0xaabb", "01"), row("0xccdd", "02"));
+    let b = format!("{}{}", row("0xccdd", "02"), row("0xaabb", "01"));
+    assert_eq!(a.len(), b.len());
+    std::fs::write(&path, &a).unwrap();
+    pin_mtime(&path);
+    let src = KeydbSource::new(&path).with_mtime_granularity(std::time::Duration::ZERO);
+    assert_eq!(
+        src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16]
+    );
+
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.write_all(b.as_bytes()).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    pin_mtime(&path);
+
+    assert_eq!(
+        src.get_unit_keys(&ctx(HASH, Vec::new(), None)).unwrap()[0].key,
+        [0x01u8; 16],
+        "a moved row must be found at its new offset"
+    );
+    assert_eq!(src.parse_count(), 2, "the stale index is rebuilt once");
+    assert_eq!(
+        src.get_unit_keys(&ctx("0xccdd", Vec::new(), None)).unwrap()[0].key,
+        [0x02u8; 16]
+    );
+    assert_eq!(src.parse_count(), 2, "the rebuilt index is cached");
+}
+
+// `store_entries` counts distinct disc entries (duplicates once), like `KeyDb::disc_entries`.
+#[test]
+fn store_entries_counts_distinct_disc_entries() {
+    let dir = scratch("index-entries");
+    let path = dir.join("keydb.cfg");
+    let k = "01".repeat(16);
+    std::fs::write(
+        &path,
+        format!(
+            "0xaabb = T | U | 1-0x{k}\n0XAABB = T2 | U | 1-0x{k}\n0x{h} = T3\n0x{h} = T4\n0x{g} = T5\n",
+            h = "ab".repeat(20),
+            g = "cd".repeat(20)
+        ),
+    )
+    .unwrap();
+    let src = KeydbSource::new(&path);
+    let r = KeySource::resolve_unit_keys(&src, &ctx("0xffff", Vec::new(), None)).unwrap();
+    assert!(!r.matched);
+    assert_eq!(r.store_entries, Some(3));
+    let r = KeySource::resolve_unit_keys(&src, &ctx("AABB", Vec::new(), None)).unwrap();
+    assert!(r.matched, "a bare uppercase hash matches like find_disc");
 }

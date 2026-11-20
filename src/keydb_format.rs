@@ -255,6 +255,152 @@ pub(crate) fn is_parseable_entry_line(line: &str) -> bool {
     is_disc_entry_line(line) && KeyDb::parse_disc_entry(line).is_some()
 }
 
+/// The keydb's global (non-disc) rows: device keys, processing keys, host certs.
+/// A few hundred rows at most, unlike the ~181k disc rows.
+#[derive(Default)]
+pub(crate) struct GlobalKeys {
+    pub device_keys: Vec<DeviceKey>,
+    pub processing_keys: Vec<[u8; 16]>,
+    pub host_certs: Vec<KeydbHostCert>,
+}
+
+/// One keydb line, as `str::lines` yields it (a leading BOM already stripped):
+/// DK/PK/HC/HC2 rows go into `keys` (rejections counted in `stats`), comments
+/// and blank lines are skipped, and a `0x`/`0X` row is returned trimmed for the
+/// caller's disc-row handling. The ONE dispatch [`KeyDb::parse_counted`] and the
+/// keydb index both run, so the two cannot drift.
+pub(crate) fn dispatch_line<'a>(
+    line: &'a str,
+    keys: &mut GlobalKeys,
+    stats: &mut ParseStats,
+) -> Option<&'a str> {
+    let line = line.trim();
+
+    // Skip comments and empty lines
+    if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+        return None;
+    }
+
+    // Device Key: positioned rows -> `device_keys` (tree walk); orphan
+    // rows (no position fields) -> `processing_keys` (brute walker).
+    // Per AACS a "PK" IS a DK at terminal position, so both are DKs here.
+    if line.starts_with("| DK") {
+        if let Some(dk) = KeyDb::parse_device_key(line) {
+            keys.device_keys.push(dk);
+        } else if let Some(key) = KeyDb::parse_orphan_dk(line) {
+            keys.processing_keys.push(key);
+        } else {
+            stats.dk_rejected += 1;
+        }
+        return None;
+    }
+
+    // Processing Key
+    if line.starts_with("| PK") {
+        if let Some(pk) = KeyDb::parse_processing_key(line) {
+            keys.processing_keys.push(pk);
+        } else {
+            stats.pk_rejected += 1;
+        }
+        return None;
+    }
+
+    // Host Certificate (AACS 2.0). Normally augments the preceding HC
+    // (AACS 1.0) row, but an HC2 row may appear first (third-party line
+    // ordering); then it's carried on a fresh HostCert with an empty v1 cert.
+    if line.starts_with("| HC2") {
+        if let Some((pk, cert, revoked_at_mkb)) = KeyDb::parse_host_cert_v2(line) {
+            if let Some(hc) = keys.host_certs.last_mut() {
+                hc.cert.private_key_v2 = Some(pk);
+                hc.cert.certificate_v2 = Some(cert);
+                // The revocation annotation can live on the HC2 line
+                // instead of the HC line; carry it onto the combined
+                // cert if the HC line had none, so it isn't lost.
+                if hc.revoked_at_mkb.is_none() {
+                    hc.revoked_at_mkb = revoked_at_mkb;
+                }
+            } else {
+                keys.host_certs.push(KeydbHostCert {
+                    cert: HostCert {
+                        private_key: [0u8; 20],
+                        certificate: Vec::new(),
+                        private_key_v2: Some(pk),
+                        certificate_v2: Some(cert),
+                    },
+                    revoked_at_mkb,
+                });
+            }
+        } else {
+            stats.hc2_rejected += 1;
+        }
+        return None;
+    }
+
+    // Host Certificate (AACS 1.0)
+    if line.starts_with("| HC") {
+        if let Some(hc) = KeyDb::parse_host_cert(line) {
+            keys.host_certs.push(hc);
+        } else {
+            stats.hc_rejected += 1;
+        }
+        return None;
+    }
+
+    // Gate on the `0x` PREFIX alone (not `is_disc_entry_line`, which also
+    // needs " = "): the caller COUNTS a malformed `0x…` row as rejected, never
+    // silently dropping it.
+    (line.starts_with("0x") || line.starts_with("0X")).then_some(line)
+}
+
+/// The trimmed `0x…` hash field of a disc row, exactly when
+/// [`KeyDb::parse_disc_entry`] accepts the row (its only failure modes are a
+/// missing ` = ` and a bad hash). Allocation-free. The hash keeps its original
+/// case; the stored form is its ASCII lowercase.
+pub(crate) fn disc_row_hash(line: &str) -> Option<&str> {
+    let (hash_part, _) = line.split_once(" = ")?;
+    // The hash must be `0x` + hex digits and nothing else. Anything looser
+    // (whitespace, a stray `=`) would load here but re-parse under a
+    // different hash after `to_keydb_cfg`, colliding with another row.
+    let hash = hash_part.trim();
+    let digits = hash
+        .strip_prefix("0x")
+        .or_else(|| hash.strip_prefix("0X"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hash)
+}
+
+/// Every host cert, best first (see [`KeyDb::host_certs_ranked`]).
+pub(crate) fn rank_host_certs(certs: &[KeydbHostCert]) -> Vec<HostCert> {
+    let mut ranked: Vec<&KeydbHostCert> = certs.iter().collect();
+    // Stable sort: ties (every unannotated cert, equal revocations) keep file order.
+    ranked.sort_by_key(|hc| {
+        let r = hc.revoked_at_mkb;
+        (r.is_some(), std::cmp::Reverse(r.unwrap_or(0)))
+    });
+    ranked.into_iter().map(|hc| hc.cert.clone()).collect()
+}
+
+/// The over-the-cap load error (the same text from every loader).
+pub(crate) fn over_cap_error(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "keydb.cfg exceeds {MAX_KEYDB_BYTES} byte cap: {}",
+            path.display()
+        ),
+    )
+}
+
+/// The not-UTF-8 load error (the same text from every loader).
+pub(crate) fn not_utf8_error(path: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("keydb.cfg is not valid UTF-8: {}", path.display()),
+    )
+}
+
 impl KeyDb {
     /// Construct an empty KeyDb. Used by unit tests; production code
     /// reaches a populated KeyDb via [`KeyDb::load`] or [`KeyDb::parse`].
@@ -282,12 +428,8 @@ impl KeyDb {
     /// a count, and the count is the thing under test, not its formatting).
     pub(crate) fn parse_counted(data: &str) -> (Self, ParseStats) {
         let mut stats = ParseStats::default();
-        let mut db = KeyDb {
-            device_keys: Vec::new(),
-            processing_keys: Vec::new(),
-            host_certs: Vec::new(),
-            disc_entries: HashMap::new(),
-        };
+        let mut keys = GlobalKeys::default();
+        let mut disc_entries: HashMap<Arc<str>, DiscEntry> = HashMap::new();
 
         // Strip a leading UTF-8 BOM (U+FEFF): it is NOT trim()-able whitespace, so
         // it would cling to line 1's `0x…` hash and silently drop the first disc
@@ -295,99 +437,32 @@ impl KeyDb {
         let data = data.strip_prefix('\u{feff}').unwrap_or(data);
 
         for line in data.lines() {
-            let line = line.trim();
-
-            // Skip comments and empty lines
-            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            // A malformed `0x…` row is COUNTED as rejected, never silently
+            // dropped. No entry cap — a keydb must hold every row.
+            let Some(line) = dispatch_line(line, &mut keys, &mut stats) else {
                 continue;
-            }
-
-            // Device Key: positioned rows -> `device_keys` (tree walk); orphan
-            // rows (no position fields) -> `processing_keys` (brute walker).
-            // Per AACS a "PK" IS a DK at terminal position, so both are DKs here.
-            if line.starts_with("| DK") {
-                if let Some(dk) = Self::parse_device_key(line) {
-                    db.device_keys.push(dk);
-                } else if let Some(key) = Self::parse_orphan_dk(line) {
-                    db.processing_keys.push(key);
-                } else {
-                    stats.dk_rejected += 1;
-                }
-                continue;
-            }
-
-            // Processing Key
-            if line.starts_with("| PK") {
-                if let Some(pk) = Self::parse_processing_key(line) {
-                    db.processing_keys.push(pk);
-                } else {
-                    stats.pk_rejected += 1;
-                }
-                continue;
-            }
-
-            // Host Certificate (AACS 2.0). Normally augments the preceding HC
-            // (AACS 1.0) row, but an HC2 row may appear first (third-party line
-            // ordering); then it's carried on a fresh HostCert with an empty v1 cert.
-            if line.starts_with("| HC2") {
-                if let Some((pk, cert, revoked_at_mkb)) = Self::parse_host_cert_v2(line) {
-                    if let Some(hc) = db.host_certs.last_mut() {
-                        hc.cert.private_key_v2 = Some(pk);
-                        hc.cert.certificate_v2 = Some(cert);
-                        // The revocation annotation can live on the HC2 line
-                        // instead of the HC line; carry it onto the combined
-                        // cert if the HC line had none, so it isn't lost.
-                        if hc.revoked_at_mkb.is_none() {
-                            hc.revoked_at_mkb = revoked_at_mkb;
-                        }
-                    } else {
-                        db.host_certs.push(KeydbHostCert {
-                            cert: HostCert {
-                                private_key: [0u8; 20],
-                                certificate: Vec::new(),
-                                private_key_v2: Some(pk),
-                                certificate_v2: Some(cert),
-                            },
-                            revoked_at_mkb,
-                        });
+            };
+            match Self::parse_disc_entry(line) {
+                // The map key IS the entry's own `disc_hash` allocation
+                // (`Arc` clone, no second copy of the string).
+                Some(entry) => {
+                    if disc_entries
+                        .insert(entry.disc_hash.clone(), entry)
+                        .is_some()
+                    {
+                        stats.disc_duplicate += 1;
                     }
-                } else {
-                    stats.hc2_rejected += 1;
                 }
-                continue;
-            }
-
-            // Host Certificate (AACS 1.0)
-            if line.starts_with("| HC") {
-                if let Some(hc) = Self::parse_host_cert(line) {
-                    db.host_certs.push(hc);
-                } else {
-                    stats.hc_rejected += 1;
-                }
-                continue;
-            }
-
-            // Gate on the `0x` PREFIX alone (not `is_disc_entry_line`, which also
-            // needs " = "): a malformed `0x…` row is COUNTED as rejected, never
-            // silently dropped. No entry cap — a keydb must hold every row.
-            if line.starts_with("0x") || line.starts_with("0X") {
-                match Self::parse_disc_entry(line) {
-                    // The map key IS the entry's own `disc_hash` allocation
-                    // (`Arc` clone, no second copy of the string).
-                    Some(entry) => {
-                        if db
-                            .disc_entries
-                            .insert(entry.disc_hash.clone(), entry)
-                            .is_some()
-                        {
-                            stats.disc_duplicate += 1;
-                        }
-                    }
-                    None => stats.disc_rejected += 1,
-                }
+                None => stats.disc_rejected += 1,
             }
         }
 
+        let db = KeyDb {
+            device_keys: keys.device_keys,
+            processing_keys: keys.processing_keys,
+            host_certs: keys.host_certs,
+            disc_entries,
+        };
         (db, stats)
     }
 
@@ -417,20 +492,9 @@ impl KeyDb {
         let mut buf = Vec::new();
         f.take(MAX_KEYDB_BYTES + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_KEYDB_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "keydb.cfg exceeds {MAX_KEYDB_BYTES} byte cap: {}",
-                    path.display()
-                ),
-            ));
+            return Err(over_cap_error(path));
         }
-        let data = String::from_utf8(buf).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("keydb.cfg is not valid UTF-8: {}", path.display()),
-            )
-        })?;
+        let data = String::from_utf8(buf).map_err(|_| not_utf8_error(path))?;
         Ok(Self::parse_counted(&data))
     }
 
@@ -494,13 +558,7 @@ impl KeyDb {
     /// MKBv<N>` note in file order, then revoked ones by latest revocation (a later
     /// revocation is the better bet without knowing the disc's generation).
     pub fn host_certs_ranked(&self) -> Vec<HostCert> {
-        let mut ranked: Vec<&KeydbHostCert> = self.host_certs.iter().collect();
-        // Stable sort: ties (every unannotated cert, equal revocations) keep file order.
-        ranked.sort_by_key(|hc| {
-            let r = hc.revoked_at_mkb;
-            (r.is_some(), std::cmp::Reverse(r.unwrap_or(0)))
-        });
-        ranked.into_iter().map(|hc| hc.cert.clone()).collect()
+        rank_host_certs(&self.host_certs)
     }
 
     /// Standalone keydb accessor: the disc's Volume ID (the keydb `I` token),
@@ -772,18 +830,13 @@ impl KeyDb {
         Some((pk, cert, parse_revoked_at_mkb(line)))
     }
 
-    fn parse_disc_entry(line: &str) -> Option<DiscEntry> {
+    // `pub(crate)`: the keydb index re-parses one row with it at lookup time.
+    pub(crate) fn parse_disc_entry(line: &str) -> Option<DiscEntry> {
         // 0x<hash> = <title> | D | <date> | M | 0x<mk> | I | 0x<id> | V | 0x<vuk> | U | <unit_keys> ; <comment>
-        let (hash_part, rest) = line.split_once(" = ")?;
-        // The hash must be `0x` + hex digits and nothing else. Anything looser
-        // (whitespace, a stray `=`) would load here but re-parse under a
-        // different hash after `to_keydb_cfg`, colliding with another row.
-        let hash = hash_part.trim().to_lowercase();
-        let digits = hash.strip_prefix("0x")?;
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let disc_hash: Arc<str> = Arc::from(hash);
+        let (_, rest) = line.split_once(" = ")?;
+        // `disc_row_hash` is the whole accept/reject decision (the rest of this
+        // parse cannot fail); it guarantees an ASCII `0x`/`0X` + hex digits hash.
+        let disc_hash: Arc<str> = Arc::from(disc_row_hash(line)?.to_ascii_lowercase());
 
         // The trailing `;` comment (e.g. "; MKBv76/BEE/FindVUK 1.74 -
         // VolumeSize: 81309007872 (UHD)") carries metadata the key fields

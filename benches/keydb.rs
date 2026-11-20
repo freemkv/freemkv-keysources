@@ -1,5 +1,10 @@
 //! KEYDB load and lookup timings over a synthetic, real-sized keydb.cfg.
 //!
+//! `KeyDb::parse` / `KeyDb::load` build the full in-memory map. `KeydbSource` caches a
+//! line-offset index instead: its cold lookup is the index build plus one row read, a warm
+//! lookup is an open + fstat, a binary search and one row read. The RSS lines (Linux only)
+//! show what each holds.
+//!
 //! Run with `cargo bench --bench keydb`. `KEYDB_BENCH_ROWS` overrides the disc
 //! row count (default 181 000, the size of the public UHD keydb). Plain
 //! `fn main` timing with `std::time::Instant`; no bench framework.
@@ -173,6 +178,10 @@ fn main() {
     time("KeyDb::load (open + read + parse)", 3, || {
         KeyDb::load(&path).expect("load")
     });
+    let full = KeyDb::load(&path).expect("load");
+    show_rss("one full KeyDb held");
+    drop(full);
+    show_rss("full KeyDb dropped");
 
     // What the engine does today: a fresh source per acquire, so every first
     // lookup pays the full load.

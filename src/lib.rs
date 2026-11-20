@@ -11,6 +11,7 @@ mod keydb;
 /// is not secret — freemkv uses it, and so do tools that build a disc registry
 /// from it (e.g. a per-disc Volume-ID index).
 pub mod keydb_format;
+mod keydb_index;
 mod online;
 mod paths;
 

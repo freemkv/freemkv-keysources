@@ -15,11 +15,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::uks_from_vuk;
 use libfreemkv::aacs::derive::{derive_media_key_from_dk, derive_media_key_from_pk, derive_vuk};
 use libfreemkv::aacs::trace::{KeyNode, MatchedEntry};
-use libfreemkv::aacs::types::{HostCert, MediaKey, UnitKey, Vid};
+use libfreemkv::aacs::types::{DeviceKey, HostCert, MediaKey, UnitKey, Vid};
 use libfreemkv::keysource::{ResolveCtx, UnitKeyResolution};
 use libfreemkv::{Error, KeySource};
 
+#[cfg(test)]
 use crate::keydb_format::KeyDb;
+use crate::keydb_format::{DiscEntry, rank_host_certs};
+use crate::keydb_index::{KeydbIndex, Lookup};
 // Decompression-bomb cap on decompressed keydb size: a tiny zip/gz could
 // inflate to GiB and OOM the refresh thread. Same constant `KeyDb::load`
 // uses on-disk, defined once in keydb_format so the two can't drift.
@@ -75,17 +78,16 @@ impl FileStamp {
 }
 
 /// One cached parse: the file identity it came from, WHEN that identity was
-/// observed, the parsed database, and the parser's rejection counts.
+/// observed, and the index built from it. The index keeps the parser's
+/// rejection counts: [`KeydbSource::cached_index`] re-emits the summary on
+/// every hit, because a cache hit skips the parse and with it the one warning
+/// that a corrupt keydb is being served.
 struct CacheEntry {
     stamp: FileStamp,
     /// Wall-clock time at which `stamp` was read off the open handle. The whole
     /// point of storing it is [`Self::is_settled`].
     stamped_at: std::time::SystemTime,
-    db: Arc<KeyDb>,
-    /// Retained, not just logged: [`KeydbSource::cached_db`] re-emits the
-    /// summary on every hit, because a cache hit skips `KeyDb::parse` and with
-    /// it the one warning that a corrupt keydb is being served.
-    stats: crate::keydb_format::ParseStats,
+    index: Arc<KeydbIndex>,
 }
 
 impl CacheEntry {
@@ -118,6 +120,13 @@ impl CacheEntry {
 /// `host_certs()`, the trait `host_certs(mkb)`, and `get_unit_keys`, and each used to re-read +
 /// re-parse the whole ~62 MiB file. A replaced keydb is picked up on the next call, with one
 /// narrow exception.
+///
+/// The cache is an INDEX, not the parsed map: the global rows (device keys, processing keys,
+/// host certs) plus, per disc row, its 20-byte hash and the byte offset of its line (~24 B a
+/// row, ~4.3 MB for the 181k-row public keydb, against ~65 MB for a full [`crate::KeyDb`]). A
+/// lookup binary-searches the hash and parses that one line from the file, with the same results
+/// as [`crate::KeyDb::find_disc`] (a duplicated hash resolves to its last row). If the line no longer
+/// holds the hash (the file changed under a stamp that looked unchanged), the index is rebuilt.
 ///
 /// The cache lives behind an `Arc`, so a clone is cheap and SHARES it: every clone sees one
 /// parse. [`KeydbSource::new`] makes a source with its own cache;
@@ -216,7 +225,7 @@ impl KeydbSource {
 
     // Log the parser's rejection summary and count the emission — the count
     // is the only way to assert, without a `tracing` dev-dependency, that the
-    // corruption warning is NOT swallowed by the cache. See `cached_db`.
+    // corruption warning is NOT swallowed by the cache. See `cached_index`.
     fn emit_parse_stats(&self, stats: &crate::keydb_format::ParseStats) {
         if stats.log() {
             self.inner.warnings.fetch_add(1, Ordering::Relaxed);
@@ -241,31 +250,31 @@ impl KeydbSource {
         self
     }
 
-    // The parsed keydb, from cache when unchanged (errors mirror KeyDb::load). ONE OPEN, ONE
-    // IDENTITY: stamp (fstat) and bytes share one handle.
-    fn cached_db(&self) -> std::io::Result<Arc<KeyDb>> {
+    // The keydb index, from cache when unchanged (errors mirror KeyDb::load), plus the open
+    // handle it describes. ONE OPEN, ONE IDENTITY: the stamp (fstat), the indexed bytes and the
+    // row a lookup later reads all come from that one handle.
+    fn cached_index(&self) -> std::io::Result<(Arc<KeydbIndex>, std::fs::File)> {
         let inner = &*self.inner;
         let file = std::fs::File::open(&inner.path)?;
         let stamp = FileStamp::of(&file.metadata()?);
         let stamped_at = std::time::SystemTime::now();
         // Fast path: a settled cache hit under a brief lock (stamp compare +
         // Arc clone). Re-emit the rejection summary on EVERY hit — a hit skips
-        // `KeyDb::parse`, else a corrupt keydb warns once then serves silently.
+        // the parse, else a corrupt keydb warns once then serves silently.
         {
             let guard = inner.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref()
                 && entry.stamp == stamp
                 && entry.is_settled(inner.mtime_granularity)
             {
-                self.emit_parse_stats(&entry.stats);
-                return Ok(entry.db.clone());
+                self.emit_parse_stats(&entry.index.stats);
+                return Ok((entry.index.clone(), file));
             }
         }
-        // Miss: parse the ~62 MiB file OUTSIDE the lock so a reparse can't stall
+        // Miss: index the ~62 MiB file OUTSIDE the lock so a rebuild can't stall
         // every other worker. Stamp (fstat) and bytes still come from the ONE
         // open handle, preserving the one-open-one-identity invariant.
-        let (db, stats) = KeyDb::load_counted(file, &inner.path)?;
-        let db = Arc::new(db);
+        let index = Arc::new(KeydbIndex::build(&file, &inner.path)?);
         // Re-acquire and double-check: a peer may have installed the same
         // settled stamp while we parsed — adopt theirs and drop our redundant
         // parse rather than racing a lost update.
@@ -274,18 +283,57 @@ impl KeydbSource {
             && entry.stamp == stamp
             && entry.is_settled(inner.mtime_granularity)
         {
-            self.emit_parse_stats(&entry.stats);
-            return Ok(entry.db.clone());
+            self.emit_parse_stats(&entry.index.stats);
+            return Ok((entry.index.clone(), file));
         }
-        self.emit_parse_stats(&stats);
+        self.emit_parse_stats(&index.stats);
         inner.parses.fetch_add(1, Ordering::Relaxed);
         *guard = Some(CacheEntry {
             stamp,
             stamped_at,
-            db: db.clone(),
-            stats,
+            index: index.clone(),
         });
-        Ok(db)
+        Ok((index, file))
+    }
+
+    // The disc row for `hash` (None on a miss) and the index it was found in. A row that no
+    // longer holds the hash means the file changed under a stamp that looked unchanged: drop
+    // that index and rebuild ONCE; a second mismatch (the file keeps changing) is a read error.
+    fn lookup(&self, hash: &str) -> std::io::Result<(Arc<KeydbIndex>, Option<DiscEntry>)> {
+        for _ in 0..2 {
+            let (index, file) = self.cached_index()?;
+            match index.find(&file, hash)? {
+                Lookup::Found(entry) => return Ok((index, Some(entry))),
+                Lookup::Missing => return Ok((index, None)),
+                Lookup::Stale => self.drop_cached(&index),
+            }
+        }
+        Err(std::io::Error::other(
+            "keydb.cfg changed while a disc row was being read",
+        ))
+    }
+
+    // Drop the cache if it still holds `stale` (a peer may already have replaced it).
+    fn drop_cached(&self, stale: &Arc<KeydbIndex>) {
+        let mut guard = self.inner.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|entry| Arc::ptr_eq(&entry.index, stale))
+        {
+            *guard = None;
+        }
+    }
+
+    // Resolve `ctx` against the keydb file (see `resolve_entry`).
+    fn resolve_indexed(&self, ctx: &dyn ResolveCtx) -> std::io::Result<KeydbResolution> {
+        let (index, entry) = self.lookup(ctx.disc_hash())?;
+        Ok(Self::resolve_entry(
+            entry.as_ref(),
+            index.entries(),
+            &index.keys.processing_keys,
+            &index.keys.device_keys,
+            ctx,
+        ))
     }
 
     /// Drop the cached parse, and the shared source's for the same path when that is a
@@ -301,7 +349,7 @@ impl KeydbSource {
     }
 
     /// Cache misses so far — the number of real file reads + parses. Test-only
-    /// observability for the cache (see [`Self::cached_db`]).
+    /// observability for the cache (see [`Self::cached_index`]).
     #[cfg(test)]
     fn parse_count(&self) -> usize {
         self.inner.parses.load(Ordering::Relaxed)
@@ -398,11 +446,11 @@ impl KeydbSource {
     /// live-drive scan as `DriveCredentials` for the AACS handshake. Empty if
     /// the keydb is missing/unreadable or carries no host cert.
     ///
-    /// Best first ([`KeyDb::host_certs_ranked`]): this is what the scan-options
+    /// Best first ([`crate::KeyDb::host_certs_ranked`]): this is what the scan-options
     /// builder hands the live-drive handshake as `DriveCredentials`.
     pub fn host_certs(&self) -> Vec<HostCert> {
-        match self.cached_db() {
-            Ok(db) => db.host_certs_ranked(),
+        match self.cached_index() {
+            Ok((index, _)) => rank_host_certs(&index.keys.host_certs),
             // No error channel here (the scan-options builder wants a list), so
             // the failure can only be LOGGED — but it must not be invisible.
             Err(e) => {
@@ -414,18 +462,38 @@ impl KeydbSource {
 
     // Return terminal Unit Keys from a parsed keydb without I/O.
     // CPS unit numbers are one-based; the returned vector uses zero-based indexes.
+    #[cfg(test)]
     fn unit_keys_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> Vec<UnitKey> {
         Self::resolve_from(db, ctx).keys
     }
 
+    // `resolve_entry` over a whole parsed `KeyDb` (the unit tests' seam).
+    #[cfg(test)]
+    fn resolve_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> KeydbResolution {
+        Self::resolve_entry(
+            db.find_disc(ctx.disc_hash()),
+            db.disc_entries.len(),
+            &db.processing_keys,
+            &db.device_keys,
+            ctx,
+        )
+    }
+
     // De-conflated resolution: the keys PLUS whether the disc matched and — on a
     // keyless match — WHY nothing derived, so a matched-but-underivable disc is
-    // never reported as a flat "no entry" (issue #46). Pure (no I/O).
-    fn resolve_from(db: &KeyDb, ctx: &dyn ResolveCtx) -> KeydbResolution {
-        // Per-disc hit (most specific); find_disc normalizes the hash form. Without a match
+    // never reported as a flat "no entry" (issue #46). Pure (no I/O): `entry` is the
+    // disc's row (already looked up), `entries_loaded` the keydb's disc-entry count,
+    // and the PK/DK pools the keydb's global keys.
+    fn resolve_entry(
+        entry: Option<&DiscEntry>,
+        entries_loaded: usize,
+        processing_keys: &[[u8; 16]],
+        device_keys: &[DeviceKey],
+        ctx: &dyn ResolveCtx,
+    ) -> KeydbResolution {
+        // Per-disc hit (most specific); the lookup normalized the hash form. Without a match
         // there is no per-disc anchor, so the global PK/DK pools are never consulted.
-        let entries_loaded = db.disc_entries.len();
-        let Some(entry) = db.find_disc(ctx.disc_hash()) else {
+        let Some(entry) = entry else {
             return KeydbResolution::miss(entries_loaded);
         };
 
@@ -487,10 +555,10 @@ impl KeydbSource {
                 let mk: Option<MediaKey> = entry
                     .media_key
                     .map(MediaKey)
-                    .or_else(|| derive_media_key_from_pk(mkb, &db.processing_keys).map(MediaKey))
+                    .or_else(|| derive_media_key_from_pk(mkb, processing_keys).map(MediaKey))
                     // DK pool: the real Subset-Difference MKB walk. No VID at the MK
                     // step (it enters at the VUK step below); the VID guard follows.
-                    .or_else(|| derive_media_key_from_dk(mkb, &db.device_keys).map(MediaKey));
+                    .or_else(|| derive_media_key_from_dk(mkb, device_keys).map(MediaKey));
                 match (mk, vid) {
                     // VUK = derive_vuk(MK, VID), then boil the disc's encrypted
                     // title keys to the terminal Unit Keys.
@@ -730,8 +798,8 @@ impl KeySource for KeydbSource {
     // Resolve this disc's base per-CPS-unit Unit Keys from the keydb. A MISSING keydb yields no
     // keys (Ok(empty)); an UNUSABLE one is a source failure (Err) — never conflated.
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<Vec<UnitKey>, Error> {
-        match self.cached_db() {
-            Ok(db) => Ok(Self::unit_keys_from(&db, ctx)),
+        match self.resolve_indexed(ctx) {
+            Ok(r) => Ok(r.keys),
             Err(e) => match self.load_failure(&e) {
                 // Missing keydb: the documented benign miss.
                 None => Ok(Vec::new()),
@@ -745,17 +813,14 @@ impl KeySource for KeydbSource {
     // disc MATCHED, why nothing derived on a keyless match, and the matched
     // entry's shape to log — so a matched-no-key disc is not a mute "no entry".
     fn resolve_unit_keys(&self, ctx: &dyn ResolveCtx) -> Result<UnitKeyResolution, Error> {
-        match self.cached_db() {
-            Ok(db) => {
-                let r = Self::resolve_from(&db, ctx);
-                Ok(UnitKeyResolution {
-                    keys: r.keys,
-                    matched: r.matched,
-                    miss_path: r.miss_path,
-                    matched_entry: r.shape,
-                    store_entries: Some(r.entries_loaded),
-                })
-            }
+        match self.resolve_indexed(ctx) {
+            Ok(r) => Ok(UnitKeyResolution {
+                keys: r.keys,
+                matched: r.matched,
+                miss_path: r.miss_path,
+                matched_entry: r.shape,
+                store_entries: Some(r.entries_loaded),
+            }),
             Err(e) => match self.load_failure(&e) {
                 // Missing keydb: the documented benign miss (nothing matched).
                 None => Ok(UnitKeyResolution::default()),
@@ -767,8 +832,8 @@ impl KeySource for KeydbSource {
 
     // The keydb's host certs, best first. `mkb` is ignored: cert selection takes no disc input.
     fn host_certs(&self, _mkb: Option<u32>) -> Vec<HostCert> {
-        match self.cached_db() {
-            Ok(db) => db.host_certs_ranked(),
+        match self.cached_index() {
+            Ok((index, _)) => rank_host_certs(&index.keys.host_certs),
             // Vec-returning trait method: log the failure, return nothing.
             Err(e) => {
                 let _ = self.load_failure(&e);
