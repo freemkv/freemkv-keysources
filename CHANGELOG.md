@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.8.11] — UNRELEASED
+
+### Fixed
+
+- Disc rows whose hash is not `0x` followed by hex digits are rejected.
 
 ### Added
 
